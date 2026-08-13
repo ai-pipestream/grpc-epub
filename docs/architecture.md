@@ -24,6 +24,15 @@ memory, spine in order, HTML fragments to the HTML collector.
 This process is deliberately thin. It owns packaging, not HTML
 semantics.
 
+## Live results (vs Docling)
+
+Docling unpacks the EPUB, runs every chapter through the HTML backend,
+then returns one document. We emit `EpubInfo` (title, spine length)
+immediately, then **each chapter's XHTML as that zip entry is read**,
+so a UI can show chapter 1 while chapter 12 is still in the archive.
+Images stream as `Resource` events when their entries are hit, not at
+the end. `ParseStatus` is a trailer.
+
 ## What this process owns
 
 - ZIP bomb limits (entry count, uncompressed cap, nested zip

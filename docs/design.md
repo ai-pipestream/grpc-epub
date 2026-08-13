@@ -8,7 +8,9 @@
 - Preserve spine order. Chapters become `GroupItem`s in that order
   after the HTML collector returns.
 - Stream chapter HTML as soon as that zip entry is read, so a 50 MB
-  EPUB does not wait for the last image.
+  EPUB does not wait for the last image. Live UI is the contract:
+  Docling's EPUB backend is batch; we paint spine order as it unzips.
+  A unary Document convenience RPC is not the path UIs use.
 
 ## 2. Non-goals (v1)
 
