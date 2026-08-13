@@ -79,3 +79,43 @@ items keep `html` as well so merge stays additive.
 - Missing OPF / empty spine → `INVALID_ARGUMENT`.
 - Chapter HTML with a relative image resolves after the `Resource`
   event, not before (ordering test).
+
+## 7. What the implementation did differently
+
+Recorded here rather than by editing the sketch above, so the reasoning
+survives review.
+
+- **`ParseEpubEvent` is `ParseEpubResponse`.** buf's `STANDARD` lint set
+  requires an RPC's response type to be named `<Rpc>Response`, and the
+  fleet rule is that lint runs clean without comment ignores. The oneof
+  inside is unchanged. `GetServiceInfo` returns
+  `GetServiceInfoResponse` for the same reason, wrapping the fields
+  §3 called `ServiceInfo`.
+- **Two more options than §3 lists.** `max_compression_ratio`, because
+  a total cap alone lets an attacker sit just under it and still buy a
+  thousandfold amplification, and `include_all_resources`, so fonts and
+  media are reachable without a boolean per kind.
+- **`include_images` and `include_stylesheets` are `optional bool`.**
+  §3 wants images on by default, and proto3 gives a bare bool no way to
+  tell "the caller said false" from "the caller said nothing".
+- **Non-spine markup is always emitted.** A nav document or an NCX is
+  small and is what a reader needs to build navigation, so it is not
+  gated behind the image or stylesheet options. Fonts, audio, video and
+  everything else are off unless `include_all_resources` is set.
+- **Broken spine references fail before the first event.** §5 does not
+  say when. The central directory lists every file up front, so a
+  dangling `idref` or a missing chapter is diagnosed before the stream
+  opens rather than after three chapters have been delivered.
+- **Resource ordering is by archive position.** §3 allows a resource to
+  arrive after the chapter referencing it. The implementation emits
+  each resource at the point its archive entry is reached during the
+  spine walk, which is deterministic per file and is what
+  `architecture.md` means by "when their entries are hit". The
+  `tests/parse_epub.rs` ordering test pins it by packing the same book
+  two ways.
+- **The DRM split.** `META-INF/encryption.xml`, or an entry with the
+  encryption bit set, is `UNIMPLEMENTED`, matching the ownership table
+  in `architecture.md`. A ZIP that never claimed to be an EPUB is also
+  `UNIMPLEMENTED`; a file that says `application/epub+zip` and then has
+  no container is `INVALID_ARGUMENT`, because that is a broken book
+  rather than an unsupported format.
