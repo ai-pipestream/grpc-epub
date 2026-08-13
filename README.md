@@ -2,6 +2,12 @@
 
 gRPC EPUB collector that unpacks the spine and projects chapters into the gRParse Document data plane
 
+
+## Docs
+
+- [Architecture](docs/architecture.md) — where this sits in the collector fleet
+- [Design](docs/design.md) — wire API, Document mapping, tests
+
 ## Remotes
 
 - **Forgejo** (`git.rokkon.com/ai-pipestream/grpc-epub`) is the source of truth. `main` lives here.
