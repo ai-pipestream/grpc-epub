@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// gRPC service contract for the EPUB collector.
+//
+// The server takes an EPUB archive, opens it in memory, and streams the spine
+// back chapter by chapter as each entry is inflated. It is a packager, not a
+// document parser: it owns the ZIP, `META-INF/container.xml`, the OPF package
+// document and the spine, and it hands XHTML on untouched to whatever reads
+// HTML.
+//
+// The stream is the product. Docling's EPUB backend unpacks to a temp
+// directory, runs every chapter through an HTML backend, and returns one
+// document at the end; here `info` arrives before a single chapter has been
+// inflated and each `chapter` arrives as its entry comes off the archive, so a
+// reader can paint chapter 1 while chapter 12 is still compressed. `status` is
+// a trailer carrying counts, never the payload. There is deliberately no unary
+// "give me the whole book" RPC: it would be a batch API wearing this one's
+// clothes, and it is the shape this service exists to avoid.
+//
+// Nothing is written to disk at any point, including the images.
+
+syntax = "proto3";
+
+package ai.pipestream.epub.v1;
+
+import "ai/pipestream/epub/v1/types.proto";
+
+option java_multiple_files = true;
+option java_outer_classname = "EpubServiceProto";
+
+// EpubParseService unpacks EPUB archives and streams their spine.
+//
+// Named for the format rather than for `ParseEpub`, because a service name is
+// baked into every method path and is the one thing here that cannot be
+// changed additively later.
+service EpubParseService {
+  // Unpacks an EPUB and streams its spine, chunks in and events out.
+  //
+  // The first request message must carry `options`; every subsequent message
+  // carries a `chunk` of archive bytes, in order. Half-close the request
+  // stream to signal the end of the upload.
+  //
+  // The upload is fully received before the first event, and that is a
+  // property of ZIP rather than a choice: the central directory lives at the
+  // end of the file, so nothing in an archive can be located until its last
+  // byte has arrived. Streaming begins the moment it is possible to begin,
+  // which is why this is `info`-then-chapters rather than one big response.
+  //
+  // A successful stream is exactly: one `info`, then `chapter` events in
+  // spine order interleaved with `resource` events in archive order, then one
+  // `status`. A failed stream ends with a gRPC status and no `status` event:
+  //
+  //   RESOURCE_EXHAUSTED  the upload, entry count, total decompressed size or
+  //                       an entry's compression ratio exceeded its cap
+  //   INVALID_ARGUMENT    not a ZIP, truncated, path traversal in an entry
+  //                       name, or an EPUB whose container.xml, OPF or spine
+  //                       is missing or unusable
+  //   UNIMPLEMENTED       a ZIP that is not an EPUB, or an EPUB the server
+  //                       cannot open: DRM, entry encryption, or a
+  //                       compression method outside store and deflate
+  //   INTERNAL            a bug here; the parser panicked
+  //
+  // Events already delivered before a failure remain valid. They describe
+  // what was really in the archive, and a partial book is still worth what
+  // was paid for it.
+  rpc ParseEpub(stream ParseEpubRequest) returns (stream ParseEpubResponse);
+
+  // Reports the build and the limits this server enforces.
+  //
+  // Cheap and side-effect free. Call it to learn the ceilings before choosing
+  // ParseOptions, since a limit above the server's own is clamped silently
+  // rather than refused.
+  rpc GetServiceInfo(GetServiceInfoRequest) returns (GetServiceInfoResponse);
+}
+
+// ParseEpubRequest is one frame of the request stream.
+message ParseEpubRequest {
+  // Exactly one per message, in the order given.
+  oneof frame {
+    // Must be the first frame. Sending it twice is an error.
+    ParseOptions options = 1;
+
+    // A chunk of archive bytes, in order. Chunks are concatenated; where the
+    // boundaries fall has no effect on the events produced. Chunk size is a
+    // throughput knob, bounded by `ServerLimits.max_chunk_bytes`.
+    bytes chunk = 2;
+  }
+}
+
+// ParseEpubResponse is one event of the response stream.
+message ParseEpubResponse {
+  // Exactly one per message.
+  //
+  // Unknown variants must be ignored rather than treated as failures: this
+  // oneof is the extension point, and a later server may add events an older
+  // client has no name for.
+  oneof event {
+    // Always the first event: book metadata and the spine length.
+    EpubInfo info = 1;
+
+    // One spine item, in spine order.
+    Chapter chapter = 2;
+
+    // One non-spine manifest entry, at the point its archive entry was
+    // reached. May arrive before or after the chapters that reference it.
+    Resource resource = 3;
+
+    // Always the last event of a successful stream. Counts and warnings.
+    ParseStatus status = 4;
+  }
+}
+
+// GetServiceInfoRequest asks for the server's build and limits. It carries no
+// arguments; the message exists so the RPC can gain them additively.
+message GetServiceInfoRequest {}
+
+// GetServiceInfoResponse describes the running server.
+message GetServiceInfoResponse {
+  // Service name, always `grpc-epub`.
+  string name = 1;
+
+  // Crate version of the running binary, for example `0.1.0`.
+  string version = 2;
+
+  // The limits this server enforces on every ParseEpub call.
+  ServerLimits limits = 3;
+
+  // Optional capability tokens, for clients that need to branch on what this
+  // build can do. Unrecognized tokens must be ignored.
+  repeated string features = 4;
+}

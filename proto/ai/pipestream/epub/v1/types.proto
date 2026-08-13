@@ -1,0 +1,352 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Shared types for the EPUB collector: the per-call options, the four event
+// payloads that make up the response stream, and the server's advertised
+// limits.
+//
+// An EPUB is a ZIP holding an OPF package document (metadata, a manifest of
+// every file, and a *spine* giving reading order) plus the XHTML and images
+// the manifest names. This service owns that packaging layer and nothing
+// above it: chapter bytes go out as they come off the archive, and what those
+// bytes *mean* is the HTML collector's job.
+
+syntax = "proto3";
+
+package ai.pipestream.epub.v1;
+
+option java_multiple_files = true;
+option java_outer_classname = "EpubTypesProto";
+
+// ParseOptions configures a single ParseEpub call.
+//
+// Every limit is a request to be *no more permissive* than the server's own
+// configured ceiling. A value of zero means "use the server default"; a value
+// above the server's ceiling is clamped down to it, never up. Call
+// GetServiceInfo to see the ceilings actually in force.
+message ParseOptions {
+  // Largest accepted upload, in MiB, measured on the compressed archive as it
+  // is received. Exceeding it fails the call with RESOURCE_EXHAUSTED before
+  // the archive is opened. Zero means the server default.
+  uint32 max_document_mib = 1;
+
+  // Total decompressed bytes this call may produce, in MiB, summed across
+  // every entry the server extracts.
+  //
+  // This is the zip-bomb ceiling. It is enforced while inflating, not from the
+  // sizes the archive declares about itself, so an entry whose central
+  // directory understates it is caught anyway. Exceeding it fails the call
+  // with RESOURCE_EXHAUSTED partway through the extract, by design: the point
+  // is to stop before the memory is spent. Zero means the server default.
+  uint32 max_uncompressed_mib = 2;
+
+  // Largest number of entries the archive may contain, counted from the
+  // central directory before anything is inflated. Exceeding it fails the call
+  // with RESOURCE_EXHAUSTED. Zero means the server default.
+  uint32 max_entries = 3;
+
+  // Largest decompressed-to-compressed ratio a single entry may have.
+  //
+  // The total cap alone is not enough: an attacker who knows it can stay just
+  // under it and still make the server do far more work than the upload paid
+  // for. The ratio is only applied to entries whose decompressed size passes a
+  // floor (see ServerLimits.compression_ratio_floor_bytes), because small,
+  // highly repetitive files such as an OPF legitimately compress hundreds of
+  // times over. Exceeding it fails the call with RESOURCE_EXHAUSTED. Zero
+  // means the server default.
+  uint32 max_compression_ratio = 4;
+
+  // Emit image resources as `resource` events. Absent means true.
+  //
+  // Presence is explicit here rather than a bare bool because the useful
+  // default is on, and proto3 gives a bare bool no way to distinguish "the
+  // caller asked for false" from "the caller said nothing".
+  optional bool include_images = 5;
+
+  // Emit stylesheet resources as `resource` events. Absent means false.
+  //
+  // Off by default because this service does not do layout and neither does
+  // anything downstream of it: EPUB is reflowable and CSS paged media is out
+  // of scope. Ask for them if you are archiving the book rather than reading
+  // it.
+  optional bool include_stylesheets = 6;
+
+  // Emit every manifest resource, whatever its kind, including fonts, audio
+  // and video. Absent means false.
+  //
+  // Overrides `include_images` and `include_stylesheets` when true. This can
+  // multiply the bytes on the wire by a large factor for an illustrated or
+  // media-overlaid book, so it is opt-in.
+  optional bool include_all_resources = 7;
+}
+
+// ResourceKind classifies a manifest entry that is not a spine chapter.
+//
+// Derived from the manifest's declared media type, not from the file
+// extension, and never from sniffing the bytes.
+enum ResourceKind {
+  // The media type was missing or matched nothing below.
+  RESOURCE_KIND_UNSPECIFIED = 0;
+
+  // XHTML, HTML, or the NCX/nav table of contents: markup that is content but
+  // is not in the spine. Always emitted, since it is small and is what a
+  // reader needs to build navigation.
+  RESOURCE_KIND_DOCUMENT = 1;
+
+  // A raster or vector image. Emitted unless `include_images` is false.
+  RESOURCE_KIND_IMAGE = 2;
+
+  // A CSS stylesheet. Emitted only when `include_stylesheets` is true.
+  RESOURCE_KIND_STYLESHEET = 3;
+
+  // An embedded font. Emitted only when `include_all_resources` is true.
+  RESOURCE_KIND_FONT = 4;
+
+  // Audio, typically an EPUB 3 media overlay narration track. Emitted only
+  // when `include_all_resources` is true.
+  RESOURCE_KIND_AUDIO = 5;
+
+  // Video. Emitted only when `include_all_resources` is true.
+  RESOURCE_KIND_VIDEO = 6;
+
+  // Anything else the manifest names, including SMIL and JavaScript. Emitted
+  // only when `include_all_resources` is true.
+  RESOURCE_KIND_OTHER = 7;
+}
+
+// DublinCoreIdentifier is one `dc:identifier` from the OPF metadata.
+message DublinCoreIdentifier {
+  // The identifier itself, for example `urn:isbn:9780000000000`.
+  string value = 1;
+
+  // The `id` attribute, empty when the element had none. The package's
+  // unique-identifier attribute points at one of these.
+  string id = 2;
+
+  // The identifier scheme, from EPUB 2's `opf:scheme` attribute. Empty for
+  // EPUB 3, which carries the scheme in a refining `<meta>` instead.
+  string scheme = 3;
+}
+
+// EpubInfo is the opening event of every successful stream.
+//
+// It is sent as soon as `container.xml` and the OPF have been parsed, which is
+// long before the chapters have been inflated. A UI can title the book and
+// draw an empty progress bar of the right length from this event alone.
+message EpubInfo {
+  // `dc:title`, or empty when the OPF declared none. Only the first title is
+  // reported; EPUB 3 allows several with refinements naming their roles, and
+  // that structure is not modelled in v1.
+  string title = 1;
+
+  // Every `dc:creator`, in document order.
+  repeated string creators = 2;
+
+  // Every `dc:contributor`, in document order.
+  repeated string contributors = 3;
+
+  // `dc:language`, a BCP 47 tag such as `en-GB`. Empty when absent.
+  string language = 4;
+
+  // Every `dc:identifier`, in document order.
+  repeated DublinCoreIdentifier identifiers = 5;
+
+  // The value of the identifier named by the package's `unique-identifier`
+  // attribute. Empty when the attribute is missing or dangles.
+  string unique_identifier = 6;
+
+  // `dc:publisher`. Empty when absent.
+  string publisher = 7;
+
+  // `dc:description`. Empty when absent.
+  string description = 8;
+
+  // `dc:date`, verbatim as written. Not normalized: EPUB 2 permits any W3CDTF
+  // profile and real books are looser still.
+  string date = 9;
+
+  // Every `dc:subject`, in document order.
+  repeated string subjects = 10;
+
+  // How many `chapter` events this stream will contain, one per spine
+  // itemref. The length of the progress bar.
+  uint32 spine_item_count = 11;
+
+  // Archive path of the OPF package document, as named by `container.xml`.
+  // Manifest hrefs are relative to this file's directory; the server has
+  // already resolved them, so this is for provenance rather than for
+  // resolution.
+  string opf_href = 12;
+
+  // The package `version` attribute, `2.0` or `3.0` in practice. Empty when
+  // the attribute is missing.
+  string epub_version = 13;
+
+  // Archive path of the cover image, from the EPUB 3 `cover-image` manifest
+  // property or the EPUB 2 `<meta name="cover">` convention. Empty when
+  // neither is present. The bytes arrive as an ordinary `resource` event.
+  string cover_href = 14;
+}
+
+// Chapter is one spine item: the reading-order unit of an EPUB.
+//
+// Emitted in spine order, one event per itemref, as that entry comes off the
+// archive. `content` is handed over exactly as it was stored — this service
+// does not parse, sanitize, or rewrite XHTML.
+message Chapter {
+  // Zero-based position in the spine. Runs 0..spine_item_count.
+  uint32 spine_index = 1;
+
+  // The spine itemref's `idref`, which is the manifest item's `id`.
+  string idref = 2;
+
+  // Archive path of the chapter, resolved against the OPF directory and
+  // normalized. Use it as the base href when resolving the chapter's own
+  // relative links against `resource` events.
+  string href = 3;
+
+  // The manifest's declared media type, normally `application/xhtml+xml`.
+  string media_type = 4;
+
+  // The chapter bytes, verbatim. Character encoding is whatever the document
+  // declares; this service does not transcode.
+  bytes content = 5;
+
+  // The spine itemref's `linear` attribute. False marks auxiliary content
+  // (pop-up notes, ads) that a linear read should skip. Defaults to true when
+  // the attribute is absent, per the EPUB spec.
+  bool linear = 6;
+
+  // EPUB 3 manifest `properties` tokens on this item, such as `nav` or
+  // `scripted`. Empty for EPUB 2.
+  repeated string properties = 7;
+}
+
+// Resource is one manifest entry that is not a spine chapter.
+//
+// Emitted at the point its archive entry is reached during the spine walk, so
+// a resource stored before the chapters arrives before them and one stored
+// after arrives between later chapters or after the last one. A client must
+// therefore tolerate a chapter that references a resource it has not seen yet:
+// buffer by href and resolve when the stream ends.
+message Resource {
+  // Archive path, resolved against the OPF directory and normalized. This is
+  // the key a chapter's relative links resolve to.
+  string href = 1;
+
+  // The manifest's declared media type.
+  string media_type = 2;
+
+  // The kind this media type was classified as, which is what the include
+  // options select on.
+  ResourceKind kind = 3;
+
+  // The resource bytes, verbatim.
+  bytes content = 4;
+
+  // The manifest item's `id`.
+  string manifest_id = 5;
+
+  // EPUB 3 manifest `properties` tokens on this item, such as `cover-image`.
+  repeated string properties = 6;
+}
+
+// ParseWarningCode names a condition that did not stop the parse.
+enum ParseWarningCode {
+  // Never sent. Present because proto3 requires a zero value.
+  PARSE_WARNING_CODE_UNSPECIFIED = 0;
+
+  // A manifest item was not emitted because its kind was not selected by the
+  // include options. Ordinary, not a defect.
+  PARSE_WARNING_CODE_RESOURCE_KIND_EXCLUDED = 1;
+
+  // A manifest item names a file the archive does not contain, and it is not
+  // a spine item. A missing *spine* item fails the call instead.
+  PARSE_WARNING_CODE_MISSING_MANIFEST_ENTRY = 2;
+
+  // A nested archive was found inside the EPUB and was not opened. ZIP-in-ZIP
+  // is a non-goal, and recursing into one is how a decompression bomb hides
+  // from a single-level cap.
+  PARSE_WARNING_CODE_NESTED_ARCHIVE = 3;
+
+  // OPF metadata was present but could not be interpreted, so a field on
+  // EpubInfo is empty that should not have been.
+  PARSE_WARNING_CODE_METADATA = 4;
+}
+
+// ParseWarning is one non-fatal observation, carried on ParseStatus.
+message ParseWarning {
+  // What happened.
+  ParseWarningCode code = 1;
+
+  // Human-readable detail, for logs. Not a stable contract; switch on `code`.
+  string message = 2;
+
+  // Archive path the warning concerns, empty when it concerns none.
+  string href = 3;
+}
+
+// ParseStatus is the trailer that closes every successful stream.
+//
+// It is a receipt, not the payload: everything worth having has already been
+// delivered by the time it arrives. A client that needs no counts can stop
+// reading at the last `chapter`.
+message ParseStatus {
+  // How many `chapter` events were emitted. Equals
+  // `EpubInfo.spine_item_count` on a complete stream.
+  uint32 chapters_emitted = 1;
+
+  // How many `resource` events were emitted.
+  uint32 resources_emitted = 2;
+
+  // How many manifest resources were skipped, whether by the include options
+  // or because the archive did not contain them.
+  uint32 resources_skipped = 3;
+
+  // Total bytes inflated during this call, across chapters and resources.
+  // Compare against the effective `max_uncompressed_mib` to see how close the
+  // book came to the cap.
+  uint64 uncompressed_bytes = 4;
+
+  // How many archive entries were inflated. Lower than the archive's entry
+  // count whenever resources were skipped.
+  uint32 entries_read = 5;
+
+  // Non-fatal observations, in the order they occurred.
+  repeated ParseWarning warnings = 6;
+}
+
+// ServerLimits reports the ceilings a server actually enforces.
+//
+// A ParseOptions field may lower any of these for one call; none of them can
+// be raised from the wire.
+message ServerLimits {
+  // Ceiling for `ParseOptions.max_document_mib`, and the value used when the
+  // caller passes zero.
+  uint32 max_document_mib = 1;
+
+  // Ceiling for `ParseOptions.max_uncompressed_mib`, and the value used when
+  // the caller passes zero.
+  uint32 max_uncompressed_mib = 2;
+
+  // Ceiling for `ParseOptions.max_entries`, and the value used when the caller
+  // passes zero.
+  uint32 max_entries = 3;
+
+  // Ceiling for `ParseOptions.max_compression_ratio`, and the value used when
+  // the caller passes zero.
+  uint32 max_compression_ratio = 4;
+
+  // Decompressed size an entry must exceed before the compression ratio is
+  // applied to it at all. Below this, a large ratio is normal rather than
+  // hostile.
+  uint64 compression_ratio_floor_bytes = 5;
+
+  // Largest single `chunk` frame the server will accept on the request
+  // stream. A larger upload is legal; split it across more frames.
+  uint64 max_chunk_bytes = 6;
+
+  // How many ParseEpub calls may inflate concurrently. Further calls wait
+  // rather than being refused, because the bound exists to cap heap, not to
+  // shed load.
+  uint32 max_concurrent_parses = 7;
+}

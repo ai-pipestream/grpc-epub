@@ -1,0 +1,11 @@
+version: v2
+# Code generation is driven by `buf generate` (never protoc directly).
+# Install the plugins with:
+#   cargo install protoc-gen-prost protoc-gen-tonic
+# Then, after any change under proto/:
+#   buf lint && buf generate && buf build -o src/gen/file_descriptor_set.binpb
+plugins:
+  - local: protoc-gen-prost
+    out: src/gen
+  - local: protoc-gen-tonic
+    out: src/gen

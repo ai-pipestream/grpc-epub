@@ -1,0 +1,16 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  # Strictest built-in rule set plus mandatory documentation comments on
+  # every message, enum, enum value, field, oneof, rpc, and service.
+  use:
+    - STANDARD
+    - COMMENTS
+  # A `buf:lint:ignore` comment in a .proto file is not a waiver anyone
+  # reviewed; if a rule is wrong for this module it belongs in `except` here,
+  # in the open.
+  disallow_comment_ignores: true
+breaking:
+  use:
+    - FILE
