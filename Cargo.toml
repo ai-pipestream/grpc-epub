@@ -1,0 +1,42 @@
+[package]
+name = "grpc-epub"
+version = "0.1.0"
+description = "A gRPC server that unpacks EPUB archives in memory and streams the spine chapter by chapter"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["epub", "grpc", "streaming", "zip", "opf"]
+categories = ["parsing", "network-programming"]
+edition = "2024"
+# tonic 0.14 and tonic-prost 0.14 both declare 1.88; nothing else here is
+# newer, so the transport sets the floor.
+rust-version = "1.88"
+publish = false # Server binary; not a library for crates.io.
+
+[dependencies]
+prost = "0.14.4"
+# Only `container.xml` and the OPF package document are parsed as XML. Chapter
+# XHTML is passed through as bytes: HTML semantics belong to the HTML
+# collector, not to this packager.
+quick-xml = "0.41.0"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tonic = { version = "0.14.6", features = ["gzip", "zstd"] }
+tonic-health = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-reflection = "0.14.6"
+# `default-features = false` plus `deflate` is the zip policy from
+# docs/design.md expressed as a build flag: store and deflate are decodable,
+# and every other method (bzip2, lzma, xz, zstd, ppmd, deflate64) plus AES
+# entry encryption is refused by the decoder rather than by a check that can be
+# forgotten. `time`/`chrono` are dropped with it; entry timestamps are not on
+# the wire.
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+# Tests author every EPUB fixture in memory with the same crate that reads
+# them; nothing binary is committed.
+tokio-stream = { version = "0.1.19", features = ["net"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
