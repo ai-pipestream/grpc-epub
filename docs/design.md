@@ -119,7 +119,13 @@ Two conventions worth restating:
 - `GroupItem` has no `source` field in this schema, so a chapter group
   cannot carry a `CollectorSource` the way a picture does; the same
   attribution rides in the group's meta under `epub.collector` as
-  `{collector, version}`. Pictures carry the real thing:
+  `{collector, version}`. Checked against upstream docling-core: this
+  matches its model exactly (`source` exists only on `DocItem`;
+  `NodeItem` forbids extra fields, and namespaced custom meta fields are
+  the sanctioned extension point), so this is the blessed shape, not a
+  workaround. The chapter groups themselves are a deliberate improvement
+  over upstream: docling's own EPUB backend concatenates every spine
+  file into one HTML string and loses chapter identity entirely. Pictures carry the real thing:
   `collector = "epub"`, `version` = the running build, no `model` (one
   engine) and no `confidence` (a declarative mapping has none to
   report).
