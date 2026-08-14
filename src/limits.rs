@@ -182,6 +182,7 @@ impl Limits {
             include_images: options.include_images.unwrap_or(true),
             include_stylesheets: options.include_stylesheets.unwrap_or(false),
             include_all_resources: options.include_all_resources.unwrap_or(false),
+            emit_document: options.emit_document,
         }
     }
 
@@ -227,6 +228,11 @@ pub struct Effective {
     pub include_stylesheets: bool,
     /// Whether every manifest resource is emitted regardless of kind.
     pub include_all_resources: bool,
+    /// Whether the events are also folded into a `document` event, sent
+    /// immediately before `status`. Not a limit: it is the one option that
+    /// adds to the stream rather than trimming it, and it lives here because
+    /// this is what one call's settings are.
+    pub emit_document: bool,
 }
 
 impl Default for Effective {

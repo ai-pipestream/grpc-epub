@@ -225,6 +225,7 @@ name = "grpc-epub"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "prost-types",
  "quick-xml",
  "tokio",
  "tokio-stream",

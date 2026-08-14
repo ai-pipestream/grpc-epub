@@ -77,6 +77,24 @@ message ParseOptions {
   // multiply the bytes on the wire by a large factor for an illustrated or
   // media-overlaid book, so it is opt-in.
   optional bool include_all_resources = 7;
+
+  // Also fold this call's events into one
+  // `ai.pipestream.document.v1.Document` and send it as a `document` event,
+  // immediately before `status`. Absent means false, and a false costs
+  // nothing: the fold is not built and no event is added.
+  //
+  // The Document is a *lossy structural projection* of the events, offered so
+  // a client that speaks the Document plane does not have to fold the stream
+  // itself. The typed events remain the lossless wire: the Document carries
+  // no chapter or image bytes, only the skeleton (one chapter group per spine
+  // item, one picture per image resource) and the OPF metadata. Chapter XHTML
+  // is not parsed here — that is the HTML collector's job, and its items merge
+  // into these chapter groups downstream.
+  //
+  // A plain bool rather than an `optional bool`: unlike the include options,
+  // "absent" and "false" mean the same thing here, because the useful default
+  // is off.
+  bool emit_document = 8;
 }
 
 // ResourceKind classifies a manifest entry that is not a spine chapter.

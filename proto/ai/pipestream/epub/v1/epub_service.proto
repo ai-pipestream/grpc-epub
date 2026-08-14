@@ -23,6 +23,7 @@ syntax = "proto3";
 
 package ai.pipestream.epub.v1;
 
+import "ai/pipestream/document/v1/document.proto";
 import "ai/pipestream/epub/v1/types.proto";
 
 option java_multiple_files = true;
@@ -107,6 +108,17 @@ message ParseEpubResponse {
 
     // Always the last event of a successful stream. Counts and warnings.
     ParseStatus status = 4;
+
+    // The whole book folded into one Document: emitted once, immediately
+    // before `status`, only when `ParseOptions.emit_document` was set.
+    //
+    // A lossy structural projection of the events above, not a replacement
+    // for them. It holds the OPF metadata, one `GROUP_LABEL_CHAPTER` group
+    // per spine item in spine order, and one `PictureItem` per emitted image
+    // resource; it holds no bytes. Chapter XHTML is deliberately not parsed
+    // here, so the chapter groups arrive empty and the HTML collector's items
+    // merge into them downstream.
+    ai.pipestream.document.v1.Document document = 5;
   }
 }
 

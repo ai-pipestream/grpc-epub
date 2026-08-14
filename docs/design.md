@@ -63,6 +63,76 @@ drops them.
 `CollectorSource.collector = "epub"` on the groups; HTML-derived
 items keep `html` as well so merge stays additive.
 
+### 4.1 Implemented in this repo (`src/document_fold.rs`)
+
+The mapping above is **implemented here**, behind
+`ParseOptions.emit_document`, rather than only in gRParse. The fold is a
+single pass over the service's own response events — the same messages
+that go on the wire — and the server emits the result as one `document`
+event immediately before `status`. `ai.pipestream.document.v1` is
+vendored byte-identical from gRParse into
+`proto/ai/pipestream/document/v1/document.proto`; it is never edited
+here.
+
+What is mapped:
+
+| Event | Document |
+|---|---|
+| `info` | `Document.name` = title, `schema_name` = `docling_document_v2`, `origin.mimetype` = `application/epub+zip`, and every other OPF field under `epub.*` keys in the **body group's** `meta.custom_fields` (lists as `ListValue`, identifiers as `{value, scheme}` objects) |
+| `chapter` | one `GROUP_LABEL_CHAPTER` group under `#/body`, `name` = resolved href, meta `epub.idref` / `epub.media_type` / `epub.linear` / `epub.spine_index` / `epub.properties` |
+| `resource`, image | one `PictureItem` under `#/body`, `label = DOC_ITEM_LABEL_PICTURE`, `ImageRef{mimetype, uri = "epub:<href>"}`, meta `epub.href` / `epub.manifest_id` / `epub.cover` |
+| `status` | nothing; it is a receipt of counts the items already imply |
+
+What is deliberately **not** mapped, and why:
+
+- **Chapter contents.** The XHTML is never parsed here. The chapter
+  groups are emitted with no children on purpose: they are the sockets
+  the HTML collector's items merge into downstream, and an
+  empty-children group is valid output (the fold's integrity checker
+  accepts it). Reimplementing HTML in the EPUB packager is the thing
+  this service exists not to do.
+- **Non-image resources.** Stylesheets, fonts, audio, video, nav
+  documents, SMIL: no docling slot exists for them, labelling them as
+  something else would be a lie, and they are already on the typed
+  stream in full for anyone who wants them.
+- **Image bytes.** A Document is one gRPC message and clients commonly
+  cap receives at 4 MiB, so `ImageRef.uri` is a pointer —
+  `epub:` + the resolved archive path — naming the `resource` event on
+  this same stream that carries the bytes. Not a data URI, not even for
+  the cover. `ImageRef.size` is left unset because nothing here decodes
+  an image; a `Size` of 0x0 would be a claim rather than a gap.
+- **Provenance.** No `prov` anywhere: an EPUB is reflowable and has no
+  pages and no bounding boxes. Source locators go in
+  `meta.custom_fields` instead.
+- **`DocumentOrigin.filename`.** The server is handed bytes on a gRPC
+  stream and is never told what the file was called.
+- **NCX / nav table of contents.** Still not required for v1 parity, as
+  above. It arrives as an ordinary `resource` event; turning it into a
+  group of links is future work.
+- **Chapter → picture attribution.** Which chapter references an image
+  is a fact about the XHTML, so pictures hang off the body rather than
+  off a chapter group. The coordinator learns it from the HTML
+  collector's own picture items.
+
+Two conventions worth restating:
+
+- `GroupItem` has no `source` field in this schema, so a chapter group
+  cannot carry a `CollectorSource` the way a picture does; the same
+  attribution rides in the group's meta under `epub.collector` as
+  `{collector, version}`. Pictures carry the real thing:
+  `collector = "epub"`, `version` = the running build, no `model` (one
+  engine) and no `confidence` (a declarative mapping has none to
+  report).
+- The `epub.*` book metadata is on the **body** group, and root meta is
+  first-writer-wins in the coordinator's additive merge: if another
+  collector's fragment lands first, those keys can be dropped. Per-item
+  meta does not have that problem.
+
+Ordering is arrival order. Chapters and resources interleave by archive
+position and the fold appends as they come, never buffering or
+reordering; the cover is still recognised because `info` names it and
+`info` is always first.
+
 ## 5. Zip policy
 
 - Refuse encrypted entries.

@@ -66,7 +66,7 @@ async fn the_stream_is_not_a_batch() {
 
     let counters = Arc::clone(&metrics);
     let parser = tokio::task::spawn_blocking(move || {
-        let sink = Sink::new(tx, Duration::from_secs(10));
+        let sink = Sink::new(tx, Duration::from_secs(10), None);
         extract::run(&archive, &Effective::default(), &counters, &sink)
     });
 
@@ -116,6 +116,7 @@ async fn the_stream_is_not_a_batch() {
                 pb::parse_epub_response::Event::Chapter(_) => "chapter",
                 pb::parse_epub_response::Event::Resource(_) => "resource",
                 pb::parse_epub_response::Event::Status(_) => "status",
+                pb::parse_epub_response::Event::Document(_) => "document",
             },
         );
     }

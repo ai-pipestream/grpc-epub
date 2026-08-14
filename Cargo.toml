@@ -14,6 +14,9 @@ publish = false # Server binary; not a library for crates.io.
 
 [dependencies]
 prost = "0.14.4"
+# `google.protobuf.Value` in the vendored Document schema: prost maps the
+# well-known types to this crate rather than regenerating them.
+prost-types = "0.14.4"
 # Only `container.xml` and the OPF package document are parsed as XML. Chapter
 # XHTML is passed through as bytes: HTML semantics belong to the HTML
 # collector, not to this packager.

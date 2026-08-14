@@ -34,6 +34,7 @@
 //! may reference a resource that has not arrived yet. Buffer by href and
 //! resolve when the stream ends.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -41,6 +42,7 @@ use tokio::sync::mpsc;
 use tonic::Status;
 
 use crate::archive::{self, Budget, EntryInfo, MemoryArchive};
+use crate::document_fold::DocumentFold;
 use crate::href::{self, Target};
 use crate::limits::Effective;
 use crate::metrics::Metrics;
@@ -58,7 +60,10 @@ const ENCRYPTION_PATH: &str = "META-INF/encryption.xml";
 const MIMETYPE_PATH: &str = "mimetype";
 
 /// The only value `mimetype` may hold in a conforming EPUB.
-const EPUB_MIMETYPE: &str = "application/epub+zip";
+///
+/// Also what [`DocumentFold`](crate::document_fold::DocumentFold) records as
+/// `DocumentOrigin.mimetype`, so the two cannot drift apart.
+pub const EPUB_MIMETYPE: &str = "application/epub+zip";
 
 /// Largest `mimetype` entry worth reading. The conforming value is 20 bytes;
 /// anything past this is not a marker.
@@ -103,25 +108,61 @@ impl From<Status> for Abort {
 /// consumer that is genuinely behind reaches the waiting path, and that wait
 /// is bounded, because a client that has stopped reading altogether would
 /// otherwise pin a blocking-pool thread forever.
+///
+/// The optional Document fold also lives here, because this is the one place
+/// every outbound event passes through: an event that never reaches the client
+/// must not reach the projection either, and putting the fold anywhere else
+/// would mean remembering to feed it at each `emit` call site.
 pub struct Sink {
     /// The channel feeding the tonic response stream.
     tx: mpsc::Sender<Result<pb::ParseEpubResponse, Status>>,
     /// How long to wait on a full channel before giving the call up.
     stall: Duration,
+    /// The Document projection, present only when the caller asked for one.
+    ///
+    /// `RefCell` rather than a lock: a parse runs on exactly one blocking
+    /// thread, and the whole emission path holds `&Sink`, so this is interior
+    /// mutability without contention rather than shared state.
+    fold: Option<RefCell<DocumentFold>>,
 }
 
 impl Sink {
-    /// Wrap a response channel.
+    /// Wrap a response channel, with a Document fold when one was asked for.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         tx: mpsc::Sender<Result<pb::ParseEpubResponse, Status>>,
         stall: Duration,
+        fold: Option<DocumentFold>,
     ) -> Self {
-        Self { tx, stall }
+        Self {
+            tx,
+            stall,
+            fold: fold.map(RefCell::new),
+        }
     }
 
-    /// Send one event, waiting for the client if the channel is full.
+    /// Send one event, folding it into the Document projection on the way.
+    ///
+    /// The trailer is the trigger: when `status` is emitted the fold has seen
+    /// everything, so the `document` event goes out first and `status` stays
+    /// last. With no fold this is exactly [`Sink::send`] and costs nothing.
     fn emit(&self, event: pb::parse_epub_response::Event) -> Result<(), Abort> {
+        if let Some(fold) = self.fold.as_ref() {
+            let document = {
+                let mut fold = fold.borrow_mut();
+                fold.consume(&event);
+                matches!(event, pb::parse_epub_response::Event::Status(_)).then(|| fold.take())
+            };
+            if let Some(document) = document {
+                self.send(pb::parse_epub_response::Event::Document(document))?;
+            }
+        }
+        self.send(event)
+    }
+
+    /// Put one event on the wire, waiting for the client if the channel is
+    /// full.
+    fn send(&self, event: pb::parse_epub_response::Event) -> Result<(), Abort> {
         let message = Ok(pb::ParseEpubResponse { event: Some(event) });
         let message = match self.tx.try_send(message) {
             Ok(()) => return Ok(()),

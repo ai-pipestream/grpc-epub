@@ -12,6 +12,7 @@ and nothing here touches disk.
 .epub bytes ──► grpc-epub ──► info      (title, creators, spine length)
                           ──► chapter   (spine order, one per itemref)
                           ──► resource  (images and markup, as their entries are hit)
+                          ──► document  (the whole book folded, only if asked for)
                           ──► status    (counts and warnings; a trailer)
 ```
 
@@ -37,7 +38,7 @@ batching one has inflated the whole book.
 
 ```sh
 cargo build --release
-cargo test                 # 77 tests, no network, no fixtures on disk
+cargo test                 # 99 tests and a doc test, no network, no fixtures on disk
 ./target/release/grpc-epub # listens on 0.0.0.0:50051
 ```
 
@@ -91,16 +92,18 @@ only ever be lowered from the wire. Zero means "use the server default".
 | `include_images` | emit image resources (absent = true) |
 | `include_stylesheets` | emit CSS (absent = false) |
 | `include_all_resources` | emit fonts, audio, video and everything else too (absent = false) |
+| `emit_document` | also fold the call into one `Document` event (default false) |
 
 **Response.** A successful stream is exactly one `info`, then `chapter` events
-in spine order interleaved with `resource` events in archive order, then one
-`status`.
+in spine order interleaved with `resource` events in archive order, then — only
+when `emit_document` was set — one `document`, then one `status`.
 
 | Event | Carries |
 |---|---|
 | `info` | title, creators, contributors, language, identifiers, publisher, date, subjects, spine length, OPF path, EPUB version, cover href |
 | `chapter` | spine index, idref, resolved href, media type, **XHTML bytes verbatim**, `linear`, EPUB 3 properties |
 | `resource` | resolved href, media type, kind, bytes, manifest id, properties |
+| `document` | the whole book as one `ai.pipestream.document.v1.Document`; opt-in, and always the event before `status` |
 | `status` | chapters and resources emitted, resources skipped, inflated bytes, entries read, warnings |
 
 Non-spine markup (a nav document, an NCX) is always emitted; images are emitted
@@ -108,6 +111,53 @@ by default; stylesheets, fonts and media are opt-in. A resource is emitted
 **when its archive entry is reached during the spine walk**, so a chapter may
 reference a resource that has not arrived yet — buffer by href and resolve at
 the end of the stream.
+
+## The Document projection
+
+Set `emit_document` and the server folds this call's own events into one
+[`ai.pipestream.document.v1.Document`](proto/ai/pipestream/document/v1/document.proto)
+and sends it as a `document` event immediately before the trailer. The typed
+events stay the lossless wire; the Document is the **lossy structural
+projection** of them, for clients that speak the Document plane and would
+otherwise fold the stream themselves. Off by default, and a false costs
+nothing: the fold is never built.
+
+What it contains is the *skeleton* of the book:
+
+- `Document.name` is the title, `origin.mimetype` is `application/epub+zip`,
+  and the rest of the OPF metadata sits under `epub.*` keys in the body
+  group's `meta.custom_fields`;
+- one `GROUP_LABEL_CHAPTER` group per spine item, in spine order, named by its
+  resolved href, carrying `epub.idref`, `epub.media_type`, `epub.linear`,
+  `epub.spine_index` and `epub.properties`;
+- one `PictureItem` per emitted image resource, carrying `epub.href`,
+  `epub.manifest_id` and, for the cover, `epub.cover`.
+
+The chapter groups have **no children**, on purpose: chapter XHTML is not
+parsed here, and the groups exist so the HTML collector's items can merge into
+them downstream. Non-image resources — stylesheets, fonts, media, the nav
+document — are not projected at all; they have no docling slot and are already
+on the typed stream in full.
+
+**No bytes go inside the Document.** A Document is one gRPC message and clients
+commonly cap receives at 4 MiB, so `ImageRef.uri` is a pointer, not a data URI:
+
+```text
+epub:OEBPS/images/cover.png    the `resource` event with that href carries the bytes
+```
+
+`ImageRef.size` is left unset because nothing here decodes an image, and `prov`
+is empty everywhere because an EPUB is reflowable and has no pages or bounding
+boxes. Items carry `CollectorSource{collector: "epub", version: <build>}` — no
+model, since there is one engine, and no confidence, since the mapping is a
+declarative walk of the OPF. `GetServiceInfo` advertises the capability as the
+`document-fold` feature token.
+
+The fold is a standalone module, `src/document_fold.rs`, testable without a
+server, and it ships with the integrity checker (`integrity_errors`) that every
+fold test asserts is silent: dense `self_ref`s, symmetric parent/children, and
+no reference to anything outside this fragment except `#/body` and
+`#/furniture`.
 
 **Errors.** A failed stream ends with a gRPC status and no `status` event.
 Events already delivered stay valid.
@@ -186,11 +236,13 @@ attack is legible in the source.
 | Path | What lives there |
 |---|---|
 | `proto/ai/pipestream/epub/v1/` | the wire contract; `buf lint` is the gate |
+| `proto/ai/pipestream/document/v1/` | the Document schema, vendored byte-identical from gRParse; never edited here |
 | `src/gen/` | `buf generate` output plus the reflection descriptor — never hand-edited |
 | `src/archive.rs` | ZIP opening, the entry scan, and the zip-bomb budget |
 | `src/opf.rs` | `container.xml` and OPF parsing, and the entity policy |
 | `src/href.rs` | path normalization and the traversal policy |
 | `src/extract.rs` | the parse driver and the emission order |
+| `src/document_fold.rs` | the opt-in Document projection and its integrity checker |
 | `src/service.rs` | tonic wiring, upload handling, concurrency bound, panic supervisor |
 | `src/limits.rs` | the ceilings and how a request is clamped to them |
 | `tests/` | fixtures the tests author in memory; nothing binary is committed |

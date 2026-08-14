@@ -18,12 +18,18 @@
 //!   archive, so a reader can paint chapter 1 while chapter 12 is still
 //!   compressed. `status` is a trailer of counts, never the payload. See
 //!   [`extract`] for why the upload is still buffered and the output is not.
+//! - **The Document is a projection, not the product.** With
+//!   `ParseOptions.emit_document` set, [`document_fold`] folds the same events
+//!   into one `ai.pipestream.document.v1.Document` and the server sends it
+//!   immediately before the trailer. It is the book's skeleton — spine order,
+//!   OPF metadata, image pointers — and never a second copy of the bytes.
 //! - **Hostile input is the normal case.** [`archive`] holds the zip-bomb
 //!   policy, [`href`] holds the path-traversal policy, and [`opf`] holds the
 //!   external-entity policy. Each is tested against an attack the format can
 //!   actually express.
 
 pub mod archive;
+pub mod document_fold;
 pub mod extract;
 pub mod href;
 pub mod limits;
@@ -32,6 +38,7 @@ pub mod opf;
 pub mod proto;
 pub mod service;
 
+pub use document_fold::DocumentFold;
 pub use limits::Limits;
 pub use metrics::Metrics;
 pub use service::EpubGrpc;

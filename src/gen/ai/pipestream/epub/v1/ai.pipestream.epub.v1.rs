@@ -62,6 +62,24 @@ pub struct ParseOptions {
     /// media-overlaid book, so it is opt-in.
     #[prost(bool, optional, tag="7")]
     pub include_all_resources: ::core::option::Option<bool>,
+    /// Also fold this call's events into one
+    /// `ai.pipestream.document.v1.Document` and send it as a `document` event,
+    /// immediately before `status`. Absent means false, and a false costs
+    /// nothing: the fold is not built and no event is added.
+    ///
+    /// The Document is a *lossy structural projection* of the events, offered so
+    /// a client that speaks the Document plane does not have to fold the stream
+    /// itself. The typed events remain the lossless wire: the Document carries
+    /// no chapter or image bytes, only the skeleton (one chapter group per spine
+    /// item, one picture per image resource) and the OPF metadata. Chapter XHTML
+    /// is not parsed here — that is the HTML collector's job, and its items merge
+    /// into these chapter groups downstream.
+    ///
+    /// A plain bool rather than an `optional bool`: unlike the include options,
+    /// "absent" and "false" mean the same thing here, because the useful default
+    /// is off.
+    #[prost(bool, tag="8")]
+    pub emit_document: bool,
 }
 /// DublinCoreIdentifier is one `dc:identifier` from the OPF metadata.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -421,7 +439,7 @@ pub struct ParseEpubResponse {
     /// Unknown variants must be ignored rather than treated as failures: this
     /// oneof is the extension point, and a later server may add events an older
     /// client has no name for.
-    #[prost(oneof="parse_epub_response::Event", tags="1, 2, 3, 4")]
+    #[prost(oneof="parse_epub_response::Event", tags="1, 2, 3, 4, 5")]
     pub event: ::core::option::Option<parse_epub_response::Event>,
 }
 /// Nested message and enum types in `ParseEpubResponse`.
@@ -446,6 +464,17 @@ pub mod parse_epub_response {
         /// Always the last event of a successful stream. Counts and warnings.
         #[prost(message, tag="4")]
         Status(super::ParseStatus),
+        /// The whole book folded into one Document: emitted once, immediately
+        /// before `status`, only when `ParseOptions.emit_document` was set.
+        ///
+        /// A lossy structural projection of the events above, not a replacement
+        /// for them. It holds the OPF metadata, one `GROUP_LABEL_CHAPTER` group
+        /// per spine item in spine order, and one `PictureItem` per emitted image
+        /// resource; it holds no bytes. Chapter XHTML is deliberately not parsed
+        /// here, so the chapter groups arrive empty and the HTML collector's items
+        /// merge into them downstream.
+        #[prost(message, tag="5")]
+        Document(super::super::super::document::v1::Document),
     }
 }
 /// GetServiceInfoRequest asks for the server's build and limits. It carries no

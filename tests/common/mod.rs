@@ -508,6 +508,23 @@ pub fn chapters(events: &[pb::parse_epub_response::Event]) -> Vec<&pb::Chapter> 
         .collect()
 }
 
+/// Every `document` event, in the order received.
+///
+/// A conforming stream has at most one, and only when `emit_document` was set;
+/// the tests assert that by counting rather than by taking the first.
+#[must_use]
+pub fn documents(
+    events: &[pb::parse_epub_response::Event],
+) -> Vec<&grpc_epub::proto::document_v1::Document> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            pb::parse_epub_response::Event::Document(document) => Some(document),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Every `resource` event, in the order received.
 #[must_use]
 pub fn resources(events: &[pb::parse_epub_response::Event]) -> Vec<&pb::Resource> {
@@ -531,6 +548,7 @@ pub fn shape(events: &[pb::parse_epub_response::Event]) -> Vec<&'static str> {
             pb::parse_epub_response::Event::Chapter(_) => "chapter",
             pb::parse_epub_response::Event::Resource(_) => "resource",
             pb::parse_epub_response::Event::Status(_) => "status",
+            pb::parse_epub_response::Event::Document(_) => "document",
         })
         .collect()
 }

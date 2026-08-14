@@ -140,8 +140,14 @@ impl pb::epub_parse_service_server::EpubParseService for EpubGrpc {
         let (tx, rx) = mpsc::channel(OUTBOUND_BUFFER);
         let supervisor = tx.clone();
 
+        // Built here rather than inside the parse so the cost of the option is
+        // visible: no fold, no allocation, and the emission path is unchanged.
+        let fold = effective
+            .emit_document
+            .then(crate::document_fold::DocumentFold::for_this_build);
+
         let handle = tokio::task::spawn_blocking(move || {
-            let sink = Sink::new(tx, CONSUMER_STALL);
+            let sink = Sink::new(tx, CONSUMER_STALL, fold);
             extract::run(&bytes, &effective, &metrics, &sink)
         });
 
@@ -190,6 +196,11 @@ impl pb::epub_parse_service_server::EpubParseService for EpubGrpc {
                 "diskless".to_owned(),
                 "spine-stream".to_owned(),
                 "zip-bomb-guard".to_owned(),
+                // This build can fold a call into an
+                // `ai.pipestream.document.v1.Document`; an older one cannot,
+                // and a client that needs the projection can branch on this
+                // rather than on the version string.
+                "document-fold".to_owned(),
                 "health".to_owned(),
                 "reflection".to_owned(),
             ],
