@@ -1,6 +1,6 @@
 # grpc-epub
 
-A gRPC server that unpacks EPUB archives **in memory** and streams the spine
+A gRPC server that unpacks EPUB archives in memory and streams the spine
 back chapter by chapter, as each entry comes off the ZIP.
 
 It is a packager, not a document parser. It owns the ZIP, `META-INF/container.xml`,
@@ -8,31 +8,30 @@ the OPF package document and the spine; it hands chapter XHTML on as bytes for
 the HTML collector to read. Nothing here parses, sanitizes, or rewrites HTML,
 and nothing here touches disk.
 
-```text
-.epub bytes ──► grpc-epub ──► info      (title, creators, spine length)
-                          ──► chapter   (spine order, one per itemref)
-                          ──► resource  (images and markup, as their entries are hit)
-                          ──► document  (the whole book folded, only if asked for)
-                          ──► status    (counts and warnings; a trailer)
+```mermaid
+flowchart LR
+    client([client]) -->|"ParseEpub: options frame, then chunk frames"| svc[grpc-epub]
+    svc --> walk["in-memory ZIP + OPF walk"]
+    walk --> svc
+    svc -->|"info, chapter, resource, document?, status"| client
+    hc([orchestrator]) -.->|"grpc.health.v1"| svc
 ```
 
 ## Why it streams
 
-Docling's EPUB backend unpacks to a temp directory, runs every chapter through
-an HTML backend, and returns one document at the end. Here `info` goes out
-before a single chapter has been inflated and each `chapter` goes out as its
-entry is read, so a reader can paint chapter 1 while chapter 12 is still
-compressed. `status` is a receipt, not the payload.
+`info` goes out before a single chapter has been inflated, and each `chapter`
+goes out as its entry is read, so a client can render chapter 1 while chapter
+12 is still compressed. `status` is a receipt, not the payload.
 
-The upload itself *is* buffered, and that is the format's doing rather than a
+The upload itself is buffered, and that is the format's doing rather than a
 choice: a ZIP's central directory sits at the end of the file, so nothing in an
 archive can be located until its last byte has arrived. Streaming begins the
 moment it is possible to begin.
 
-`tests/streaming.rs` is the test that fails if someone turns this back into a
-batch API. It watches the server's own counters: at the moment `info` reaches
-the client, a streaming implementation has inflated almost nothing and a
-batching one has inflated the whole book.
+`tests/streaming.rs` fails if someone turns this back into a batch API. It
+watches the server's own counters: at the moment `info` reaches the client, a
+streaming implementation has inflated almost nothing and a batching one has
+inflated the whole book.
 
 ## Build and run
 
@@ -80,13 +79,13 @@ service EpubParseService {
 a `chunk` of archive bytes, in order. Half-close to signal the end of the
 upload.
 
-`ParseOptions` — every limit is clamped to the server's own ceiling and can
+`ParseOptions`. Every limit is clamped to the server's own ceiling and can
 only ever be lowered from the wire. Zero means "use the server default".
 
 | Field | Meaning |
 |---|---|
 | `max_document_mib` | compressed upload cap |
-| `max_uncompressed_mib` | total inflated bytes for the call — the zip-bomb ceiling |
+| `max_uncompressed_mib` | total inflated bytes for the call, the zip-bomb ceiling |
 | `max_entries` | archive entry count |
 | `max_compression_ratio` | per-entry inflated-to-stored ratio |
 | `include_images` | emit image resources (absent = true) |
@@ -95,49 +94,49 @@ only ever be lowered from the wire. Zero means "use the server default".
 | `emit_document` | also fold the call into one `Document` event (default false) |
 
 **Response.** A successful stream is exactly one `info`, then `chapter` events
-in spine order interleaved with `resource` events in archive order, then — only
-when `emit_document` was set — one `document`, then one `status`.
+in spine order interleaved with `resource` events in archive order, then, only
+when `emit_document` was set, one `document`, then one `status`.
 
 | Event | Carries |
 |---|---|
 | `info` | title, creators, contributors, language, identifiers, publisher, date, subjects, spine length, OPF path, EPUB version, cover href |
-| `chapter` | spine index, idref, resolved href, media type, **XHTML bytes verbatim**, `linear`, EPUB 3 properties |
+| `chapter` | spine index, idref, resolved href, media type, XHTML bytes verbatim, `linear`, EPUB 3 properties |
 | `resource` | resolved href, media type, kind, bytes, manifest id, properties |
 | `document` | the whole book as one `ai.pipestream.document.v1.Document`; opt-in, and always the event before `status` |
 | `status` | chapters and resources emitted, resources skipped, inflated bytes, entries read, warnings |
 
 Non-spine markup (a nav document, an NCX) is always emitted; images are emitted
-by default; stylesheets, fonts and media are opt-in. A resource is emitted
-**when its archive entry is reached during the spine walk**, so a chapter may
-reference a resource that has not arrived yet — buffer by href and resolve at
-the end of the stream.
+by default; stylesheets, fonts and media are opt-in. A resource is emitted when
+its archive entry is reached during the spine walk, so a chapter may reference
+a resource that has not arrived yet: buffer by href and resolve at the end of
+the stream.
 
 ## The Document projection
 
 Set `emit_document` and the server folds this call's own events into one
 [`ai.pipestream.document.v1.Document`](proto/ai/pipestream/document/v1/document.proto)
 and sends it as a `document` event immediately before the trailer. The typed
-events stay the lossless wire; the Document is the **lossy structural
-projection** of them, for clients that speak the Document plane and would
-otherwise fold the stream themselves. Off by default, and a false costs
-nothing: the fold is never built.
+events stay the lossless wire; the Document is the lossy structural projection
+of them, for clients that speak the Document plane and would otherwise fold the
+stream themselves. Off by default, and a false costs nothing: the fold is never
+built.
 
-What it contains is the *skeleton* of the book:
+What it contains is the skeleton of the book:
 
 - `Document.name` is the title, `origin.mimetype` is `application/epub+zip`,
   and the rest of the OPF metadata sits under `epub.*` keys in the body
-  group's `meta.custom_fields`;
-- one `GROUP_LABEL_CHAPTER` group per spine item, in spine order, named by its
+  group's `meta.custom_fields`.
+- One `GROUP_LABEL_CHAPTER` group per spine item, in spine order, named by its
   resolved href, carrying `epub.idref`, `epub.media_type`, `epub.linear`,
-  `epub.spine_index` and `epub.properties`;
-- one `PictureItem` per emitted image resource, carrying `epub.href`,
+  `epub.spine_index` and `epub.properties`.
+- One `PictureItem` per emitted image resource, carrying `epub.href`,
   `epub.manifest_id` and, for the cover, `epub.cover`.
 
-The chapter groups have **no children**, on purpose: chapter XHTML is not
-parsed here, and the groups exist so the HTML collector's items can merge into
-them downstream. Non-image resources — stylesheets, fonts, media, the nav
-document — are not projected at all; they have no docling slot and are already
-on the typed stream in full.
+The chapter groups have no children, on purpose: chapter XHTML is not parsed
+here, and the groups exist so the HTML collector's items can merge into them
+downstream. Non-image resources (stylesheets, fonts, media, the nav document)
+are not projected at all; the Document schema has no item kind for them, and
+they are already on the typed stream in full.
 
 **No bytes go inside the Document.** A Document is one gRPC message and clients
 commonly cap receives at 4 MiB, so `ImageRef.uri` is a pointer, not a data URI:
@@ -148,7 +147,7 @@ epub:OEBPS/images/cover.png    the `resource` event with that href carries the b
 
 `ImageRef.size` is left unset because nothing here decodes an image, and `prov`
 is empty everywhere because an EPUB is reflowable and has no pages or bounding
-boxes. Items carry `CollectorSource{collector: "epub", version: <build>}` — no
+boxes. Items carry `CollectorSource{collector: "epub", version: <build>}`: no
 model, since there is one engine, and no confidence, since the mapping is a
 declarative walk of the OPF. `GetServiceInfo` advertises the capability as the
 `document-fold` feature token.
@@ -201,35 +200,36 @@ grpc-epub metrics parses_started=3 parses_succeeded=3 parses_failed=0 \
 
 An EPUB is a ZIP full of XML supplied by whoever made the file, so the
 interesting cases are not malformed books but well-formed hostile ones. Each
-control has a test in `tests/security.rs` built by the test itself, so the
-attack is legible in the source.
+control below has a test in `tests/security.rs` built by the test itself, so
+the attack is legible in the source.
 
-- **Decompression bombs.** Three rules, because each covers a hole the others
-  leave: an entry-count check from the central directory, a running total of
-  inflated bytes, and a per-entry inflated-to-stored ratio above a size floor.
-  The last two are enforced against what actually comes out of the
-  decompressor, not just against the sizes the archive declares, so a lying
-  header is caught too. Over any of them is `RESOURCE_EXHAUSTED`, raised
-  partway through the extract rather than after it.
-- **Path traversal.** Entry names and OPF hrefs are percent-decoded, then
-  normalized, then refused if they escape the archive root, are absolute, or
-  contain a NUL or a backslash. Nothing here writes to disk, but the paths go
-  out on the wire and a client that does write files would otherwise inherit
-  the traversal.
-- **XXE.** quick-xml has no DTD processor, so it cannot fetch an external
-  entity. On top of that, a `<!DOCTYPE>` declaring an `<!ENTITY>` is refused
-  outright, and any other general reference is copied through verbatim —
-  `&xxe;` reaches the client as four literal characters. Both halves are
-  asserted.
-- **Encryption and DRM.** `META-INF/encryption.xml`, or any entry with the
-  encryption bit set, is `UNIMPLEMENTED`.
-- **Compression methods.** The `zip` crate is built without the features that
-  decode anything but store and deflate, so the refusal is a build flag rather
-  than a check that can be forgotten.
-- **Nested archives.** Reported and never opened. Recursing is how a bomb hides
-  from a single-level cap.
-- **Remote resources.** Recorded as a warning and never fetched. There is no
-  network on the parse path.
+Decompression bombs are covered by three rules, because each covers a hole the
+others leave: an entry-count check from the central directory, a running total
+of inflated bytes, and a per-entry inflated-to-stored ratio above a size floor.
+The last two are enforced against what actually comes out of the decompressor,
+not just against the sizes the archive declares, so a lying header is caught
+too. Over any of them is `RESOURCE_EXHAUSTED`, raised partway through the
+extract rather than after it.
+
+Path traversal is refused, not sanitized. Entry names and OPF hrefs are
+percent-decoded, then normalized, then rejected if they escape the archive
+root, are absolute, or contain a NUL or a backslash. Nothing here writes to
+disk, but the paths go out on the wire and a client that does write files would
+otherwise inherit the traversal.
+
+XXE cannot happen by construction: quick-xml has no DTD processor, so it cannot
+fetch an external entity. On top of that, a `<!DOCTYPE>` declaring an
+`<!ENTITY>` is refused outright, and any other general reference is copied
+through verbatim, so `&xxe;` reaches the client as four literal characters.
+Both halves are asserted.
+
+`META-INF/encryption.xml`, or any entry with the encryption bit set, is
+`UNIMPLEMENTED`. The `zip` crate is built without the features that decode
+anything but store and deflate, so the refusal of other compression methods is
+a build flag rather than a check that can be forgotten. Nested archives are
+reported and never opened; recursing is how a bomb hides from a single-level
+cap. Remote resources are recorded as a warning and never fetched; there is no
+network on the parse path.
 
 ## Layout
 
@@ -237,7 +237,7 @@ attack is legible in the source.
 |---|---|
 | `proto/ai/pipestream/epub/v1/` | the wire contract; `buf lint` is the gate |
 | `proto/ai/pipestream/document/v1/` | the Document schema, vendored byte-identical from gRParse; never edited here |
-| `src/gen/` | `buf generate` output plus the reflection descriptor — never hand-edited |
+| `src/gen/` | `buf generate` output plus the reflection descriptor; never hand-edited |
 | `src/archive.rs` | ZIP opening, the entry scan, and the zip-bomb budget |
 | `src/opf.rs` | `container.xml` and OPF parsing, and the entity policy |
 | `src/href.rs` | path normalization and the traversal policy |
@@ -257,10 +257,10 @@ env) is a follow-up in that repo, not here.
 
 ## Docs
 
-- [`AGENTS.md`](AGENTS.md) — read order, definition of done, git
-- [`docs/architecture.md`](docs/architecture.md) — where this sits in the collector fleet
-- [`docs/design.md`](docs/design.md) — wire API, Document mapping, tests
-- [`docs/guidelines.md`](docs/guidelines.md) — fleet rules (streaming, proto, diskless, git)
+- [`AGENTS.md`](AGENTS.md): read order, definition of done, git
+- [`docs/architecture.md`](docs/architecture.md): where this sits in the collector fleet
+- [`docs/design.md`](docs/design.md): wire API, Document mapping, tests
+- [`docs/guidelines.md`](docs/guidelines.md): fleet rules (streaming, proto, diskless, git)
 
 ## Remotes
 
