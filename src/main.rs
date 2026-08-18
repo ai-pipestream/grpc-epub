@@ -21,7 +21,7 @@ use grpc_epub::proto::{self, v1 as pb};
 use grpc_epub::service::EpubGrpc;
 
 /// Default listen address when `GRPC_EPUB_ADDR` is not set.
-const DEFAULT_ADDR: &str = "0.0.0.0:50051";
+const DEFAULT_ADDR: &str = "0.0.0.0:50064";
 
 /// Default HTTP/2 initial window, for both the stream and the connection.
 ///

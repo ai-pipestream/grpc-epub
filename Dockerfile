@@ -31,7 +31,7 @@ RUN cargo build --release --locked
 # disk, so the container can and should run with `--read-only`.
 #
 #   docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
-#     -p 50051:50051 grpc-epub
+#     -p 50064:50064 grpc-epub
 #
 # `:nonroot` runs as uid 65532. Health checking is the orchestrator's job over
 # gRPC (`grpc.health.v1.Health/Check`, which this server registers) rather than
@@ -41,7 +41,7 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /src/target/release/grpc-epub /usr/local/bin/grpc-epub
 
-ENV GRPC_EPUB_ADDR=0.0.0.0:50051
-EXPOSE 50051
+ENV GRPC_EPUB_ADDR=0.0.0.0:50064
+EXPOSE 50064
 USER nonroot
 ENTRYPOINT ["/usr/local/bin/grpc-epub"]

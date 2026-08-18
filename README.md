@@ -38,7 +38,7 @@ inflated the whole book.
 ```sh
 cargo build --release
 cargo test                 # 99 tests and a doc test, no network, no fixtures on disk
-./target/release/grpc-epub # listens on 0.0.0.0:50051
+./target/release/grpc-epub # listens on 0.0.0.0:50064
 ```
 
 Protobuf work goes through `buf`, never `protoc`:
@@ -54,7 +54,7 @@ Container:
 ```sh
 docker build -t grpc-epub .        # the test suite runs inside the build and gates it
 docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
-  -p 50051:50051 grpc-epub
+  -p 50064:50064 grpc-epub
 ```
 
 The runtime image is `distroless/cc` running as uid 65532, with no shell and no
@@ -65,7 +65,7 @@ fact: the hot path never writes anything.
 
 Package `ai.pipestream.epub.v1`, defined in
 [`proto/ai/pipestream/epub/v1/`](proto/ai/pipestream/epub/v1). Server
-reflection is registered, so `grpcurl -plaintext localhost:50051 list` works
+reflection is registered, so `grpcurl -plaintext localhost:50064 list` works
 against a live server without the `.proto` files.
 
 ```protobuf
@@ -175,7 +175,7 @@ Events already delivered stay valid.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GRPC_EPUB_ADDR` | `0.0.0.0:50051` | listen address |
+| `GRPC_EPUB_ADDR` | `0.0.0.0:50064` | listen address |
 | `GRPC_EPUB_WORKERS` | CPU count | tokio worker threads |
 | `GRPC_EPUB_WINDOW_BYTES` | `4194304` | HTTP/2 initial stream and connection window |
 | `GRPC_EPUB_METRICS_INTERVAL_SECS` | `60` | seconds between metrics lines on stdout; `0` disables |
