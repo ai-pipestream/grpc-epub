@@ -498,6 +498,23 @@ pub struct GetServiceInfoResponse {
     /// build can do. Unrecognized tokens must be ignored.
     #[prost(string, repeated, tag="4")]
     pub features: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Frontend advertisement for the shared demo shell.
+    #[prost(message, optional, tag="5")]
+    pub ui: ::core::option::Option<UiInfo>,
+}
+/// Frontend advertisement. Same shape in every ai-pipestream grpc service:
+/// the demo shell reads it to build its tab bar.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UiInfo {
+    /// Tab title.
+    #[prost(string, tag="1")]
+    pub title: ::prost::alloc::string::String,
+    /// Shell mount path.
+    #[prost(string, tag="2")]
+    pub path: ::prost::alloc::string::String,
+    /// One line, used as the tab tooltip.
+    #[prost(string, tag="3")]
+    pub description: ::prost::alloc::string::String,
 }
 include!("ai.pipestream.epub.v1.tonic.rs");
 // @@protoc_insertion_point(module)

@@ -140,4 +140,20 @@ message GetServiceInfoResponse {
   // Optional capability tokens, for clients that need to branch on what this
   // build can do. Unrecognized tokens must be ignored.
   repeated string features = 4;
+
+  // Frontend advertisement for the shared demo shell.
+  UiInfo ui = 5;
+}
+
+// Frontend advertisement. Same shape in every ai-pipestream grpc service:
+// the demo shell reads it to build its tab bar.
+message UiInfo {
+  // Tab title.
+  string title = 1;
+
+  // Shell mount path.
+  string path = 2;
+
+  // One line, used as the tab tooltip.
+  string description = 3;
 }

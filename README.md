@@ -187,7 +187,9 @@ Events already delivered stay valid.
 | `GRPC_EPUB_MAX_CHUNK_BYTES` | `16777216` | largest single inbound `chunk` frame |
 | `GRPC_EPUB_MAX_CONCURRENT_PARSES` | `8` | calls that may inflate at once; further calls wait |
 
-Every limit is also readable at runtime through `GetServiceInfo`.
+Every limit is also readable at runtime through `GetServiceInfo`. The same RPC
+carries a `ui` block (`title`, `path`, `description`) advertising this
+service's tab in the shared demo shell.
 
 Metrics are one line on stdout per interval:
 

@@ -358,4 +358,9 @@ async fn get_service_info_reports_the_limits_in_force() {
         grpc_epub::limits::DEFAULT_MAX_COMPRESSION_RATIO
     );
     assert!(limits.max_chunk_bytes > 0);
+
+    let ui = info.ui.expect("ui advertisement is always reported");
+    assert_eq!(ui.title, "EPUB");
+    assert_eq!(ui.path, "/ui/epub");
+    assert!(!ui.description.is_empty());
 }

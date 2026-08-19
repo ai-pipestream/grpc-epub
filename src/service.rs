@@ -204,6 +204,12 @@ impl pb::epub_parse_service_server::EpubParseService for EpubGrpc {
                 "health".to_owned(),
                 "reflection".to_owned(),
             ],
+            ui: Some(pb::UiInfo {
+                title: "EPUB".to_owned(),
+                path: "/ui/epub".to_owned(),
+                description: "Unpacks EPUB archives in memory and streams the spine"
+                    .to_owned(),
+            }),
         }))
     }
 }
