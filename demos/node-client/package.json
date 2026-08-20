@@ -1,0 +1,20 @@
+{
+  "name": "grpc-epub-node-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js web viewer for the grpc-epub server: watch an EPUB unpack live",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "prestart": "node scripts/make-samples.mjs",
+    "start": "node server.js",
+    "samples": "node scripts/make-samples.mjs"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.0",
+    "@grpc/proto-loader": "^0.8.0"
+  }
+}

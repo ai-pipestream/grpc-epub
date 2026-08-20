@@ -1,0 +1,413 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>grpc-epub: watch a book unpack</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfd;      --panel: #fff;    --ink: #16181d;   --dim: #6a7080;
+    --line: #e2e5ec;    --accent: #2f6df6; --live: #12a150; --warn: #d1442f;
+    --img: #8b5cf6;     --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1014;    --panel: #171a21; --ink: #e6e8ee;   --dim: #949bab;
+      --line: #262b36;  --accent: #6b9bff; --live: #37d67a; --warn: #ff7a63;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { padding: 24px 24px 8px; }
+  h1 { margin: 0; font-size: 20px; letter-spacing: -.01em; }
+  h1 code { font: 600 19px/1 var(--mono); color: var(--accent); }
+  .sub { margin: 6px 0 0; color: var(--dim); max-width: 66ch; }
+  main { padding: 16px 24px 40px; display: grid; gap: 16px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+  label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  select {
+    font: 13px var(--mono); padding: 7px 9px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  .checks { display: flex; gap: 14px; padding-bottom: 6px; }
+  .checks label { display: flex; gap: 5px; align-items: center; margin: 0; font-size: 12.5px; color: var(--ink); }
+  button {
+    font: 600 13px system-ui; padding: 8px 16px; border-radius: 7px; border: 0;
+    background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  .throttle { display: flex; align-items: center; gap: 8px; }
+  .throttle input { width: 130px; }
+  .hint { font-size: 12px; color: var(--dim); }
+
+  /* Upload bar. It always fills before the first event: a ZIP cannot be read
+     until its last byte, so the bar's job is to make that visible. */
+  .track {
+    position: relative; height: 26px; border-radius: 6px;
+    background: var(--bg); border: 1px solid var(--line); overflow: hidden;
+  }
+  .fill { height: 100%; width: 0; background: var(--accent); opacity: .22; transition: width .08s linear; }
+  .fill.done { background: var(--live); }
+  .track-label {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: space-between; padding: 0 10px;
+    font: 11px var(--mono); color: var(--dim);
+  }
+  .verdict { margin-top: 10px; font-size: 14px; }
+  .verdict strong { color: var(--live); }
+  .verdict.idle { color: var(--dim); }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 22px; }
+  .stat b { display: block; font: 600 20px/1.2 var(--mono); }
+  .stat span { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+
+  .split { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 16px; }
+  @media (max-width: 860px) { .split { grid-template-columns: 1fr; } }
+
+  #feed { max-height: 52vh; min-height: 220px; overflow-y: auto; font: 12.5px/1.65 var(--mono); }
+  .ev { padding: 1px 0; }
+  .ev.new { animation: flash .5s ease-out; }
+  @keyframes flash { from { background: color-mix(in srgb, var(--live) 26%, transparent); } }
+  .k { color: var(--dim); }
+  .n { color: var(--accent); font-weight: 600; }
+  .res { color: var(--img); font-weight: 600; }
+  .txt { color: var(--live); }
+  .err { color: var(--warn); font-weight: 600; }
+
+  #book h2 { margin: 0 0 2px; font-size: 15px; }
+  #book .meta { font-size: 12.5px; color: var(--dim); }
+  #book .meta div { padding: 1px 0; }
+  #book .meta b { color: var(--ink); font-weight: 600; }
+  .spine-track {
+    margin-top: 10px; height: 8px; border-radius: 4px;
+    background: var(--bg); border: 1px solid var(--line); overflow: hidden;
+  }
+  .spine-fill { height: 100%; width: 0; background: var(--live); transition: width .15s ease-out; }
+  footer { padding: 0 24px 32px; color: var(--dim); font-size: 12.5px; max-width: 76ch; }
+  footer code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Watching <code>grpc-epub</code> unpack a book</h1>
+  <p class="sub">
+    One HTTP request carries the archive up while events come back down, the
+    same shape as the gRPC call underneath. A ZIP's central directory is its
+    last bytes, so nothing can begin until the upload bar fills &mdash; then
+    <code>info</code> arrives before a single chapter is inflated, and each
+    chapter appears as its entry comes off the archive.
+  </p>
+</header>
+
+<main>
+  <div class="panel controls">
+    <div>
+      <label for="sample">Book</label>
+      <select id="sample"></select>
+    </div>
+    <div>
+      <label for="pick">&hellip;or a local .epub</label>
+      <input id="pick" type="file" accept=".epub,application/epub+zip">
+    </div>
+    <div class="checks">
+      <label><input id="stylesheets" type="checkbox"> stylesheets</label>
+      <label><input id="allResources" type="checkbox"> all resources</label>
+      <label><input id="document" type="checkbox"> document fold</label>
+    </div>
+    <div class="throttle">
+      <div>
+        <label for="delay">Upload throttle</label>
+        <input id="delay" type="range" min="0" max="120" step="10" value="30">
+      </div>
+      <span class="hint"><span id="delayLabel">30 ms / chunk</span><br><span id="chunkLabel"></span></span>
+    </div>
+    <div class="throttle">
+      <div>
+        <label for="pace">Event pace</label>
+        <input id="pace" type="range" min="0" max="500" step="20" value="140">
+      </div>
+      <span class="hint"><span id="paceLabel">140 ms / event</span><br>display only</span>
+    </div>
+    <button id="run">Unpack it</button>
+  </div>
+
+  <div class="panel">
+    <div class="track">
+      <div class="fill" id="fill"></div>
+      <div class="track-label"><span id="fedLabel">idle</span><span id="sizeLabel"></span></div>
+    </div>
+    <p class="verdict idle" id="verdict">Pick a book and press unpack.</p>
+  </div>
+
+  <div class="panel stats">
+    <div class="stat"><b id="sEvents">0</b><span>events</span></div>
+    <div class="stat"><b id="sChapters">0</b><span>chapters</span></div>
+    <div class="stat"><b id="sResources">0</b><span>resources</span></div>
+    <div class="stat"><b id="sBytes">0</b><span>bytes inflated</span></div>
+    <div class="stat"><b id="sMs">&ndash;</b><span>ms, last byte &rarr; first chapter</span></div>
+  </div>
+
+  <div class="split">
+    <div class="panel">
+      <div id="feed"></div>
+    </div>
+    <div class="panel" id="book">
+      <h2 id="bTitle">No book yet</h2>
+      <div class="meta" id="bMeta"></div>
+      <div class="spine-track"><div class="spine-fill" id="spineFill"></div></div>
+      <div class="meta" id="spineLabel" style="margin-top:4px">spine progress</div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  The upload throttle delays the <em>upload</em> only; the event pace delays
+  how fast rows are <em>drawn</em>, by pausing the gRPC stream between events.
+  Neither changes what the server does. Try <code>cover-first.epub</code>
+  against <code>two-chapters.epub</code>: same book, but the cover image is
+  stored before the chapters, so its <code>resource</code> event arrives first
+  &mdash; a resource is emitted when its archive entry is reached, not in
+  spine order.
+</footer>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const feed = $("feed");
+
+// The BFF injects this meta tag when it serves the page under a path prefix
+// (UI_BASE). Empty when the bridge runs at the root, so calls below are
+// unprefixed and nothing changes.
+const BASE = document.querySelector('meta[name="ui-base"]')?.content ?? "";
+
+/// More rows than any real book has chapters.
+const MAX_ROWS = 500;
+
+let sizeBytes = 0;
+
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const clip = (s, n = 110) => (s.length > n ? s.slice(0, n) + "…" : s);
+const num = (n) => n.toLocaleString("en-US");
+const kb = (n) =>
+  n < 1024 ? `${n} B`
+  : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KiB`
+  : `${(n / 1024 / 1024).toFixed(1)} MiB`;
+
+async function loadSamples() {
+  const { files } = await (await fetch(`${BASE}/api/samples`)).json();
+  $("sample").innerHTML = files
+    .map((f) => `<option value="${esc(f.name)}">${esc(f.name)} (${kb(f.size)})</option>`)
+    .join("");
+  if (files.some((f) => f.name === "long-book.epub")) $("sample").value = "long-book.epub";
+}
+
+// A locally picked file wins over the dropdown, so changing the dropdown
+// clears the picker and the two cannot disagree silently.
+$("sample").addEventListener("change", () => { $("pick").value = ""; });
+$("delay").addEventListener("input", (e) => {
+  $("delayLabel").textContent = `${e.target.value} ms / chunk`;
+});
+$("pace").addEventListener("input", (e) => {
+  $("paceLabel").textContent = `${e.target.value} ms / event`;
+});
+
+function row(html) {
+  const div = document.createElement("div");
+  div.className = "ev new";
+  div.innerHTML = html;
+  feed.append(div);
+  while (feed.childElementCount > MAX_ROWS) feed.firstElementChild.remove();
+  feed.scrollTop = feed.scrollHeight;
+}
+
+/** Render one event as a feed row, or null to skip it. */
+function render(kind, d) {
+  switch (kind) {
+    case "info":
+      return `<span class="k">info</span> <b>${esc(d.title || "(untitled)")}</b>`
+        + ` <span class="k">spine of ${d.spineItemCount}, EPUB ${esc(d.epubVersion || "?")}</span>`;
+    case "chapter": {
+      const aux = d.linear === false ? ` <span class="err">non-linear</span>` : "";
+      return `<span class="n">chapter ${d.spineIndex}</span> ${esc(d.href)}`
+        + ` <span class="k">${esc(d.mediaType)} &middot; ${kb(d.sizeBytes)}</span>${aux}`
+        + (d.preview ? `<br><span class="txt">${esc(clip(d.preview))}</span>` : "");
+    }
+    case "resource":
+      return `<span class="res">resource</span> ${esc(d.href)}`
+        + ` <span class="k">${esc(d.mediaType)} &middot; ${kb(d.sizeBytes)}`
+        + ` &middot; ${esc(String(d.kind).replace("RESOURCE_KIND_", ""))}</span>`;
+    case "document":
+      return `<span class="k">document</span> the whole book folded into one Document: <b>${esc(d.name)}</b>`;
+    case "status":
+      return `<span class="k">status</span> ${d.chaptersEmitted} chapters, ${d.resourcesEmitted} resources,`
+        + ` ${num(d.uncompressedBytes)} bytes inflated, ${d.entriesRead} entries read`
+        + (d.warnings?.length ? ` <span class="err">${d.warnings.length} warnings</span>` : "");
+    case "grpc-error":
+      return `<span class="err">rpc failed</span> ${esc(d.message)}`;
+    default:
+      return null; // an arm this page has no name for; the contract says ignore it
+  }
+}
+
+function renderBook(info) {
+  $("bTitle").textContent = info.title || "(untitled)";
+  const lines = [
+    ["by", (info.creators ?? []).join(", ")],
+    ["language", info.language],
+    ["publisher", info.publisher],
+    ["date", info.date],
+    ["id", info.uniqueIdentifier],
+  ].filter(([, v]) => v);
+  $("bMeta").innerHTML = lines.map(([k, v]) => `<div><b>${k}</b> ${esc(v)}</div>`).join("");
+}
+
+function spineProgress(chapters, total) {
+  const pct = total > 0 ? (chapters / total) * 100 : 0;
+  $("spineFill").style.width = `${pct}%`;
+  $("spineLabel").textContent = total > 0 ? `${chapters} of ${total} spine items` : "spine progress";
+}
+
+// ---------------------------------------------------------------------------
+// The run
+// ---------------------------------------------------------------------------
+
+async function run() {
+  const button = $("run");
+  button.disabled = true;
+  feed.innerHTML = "";
+  $("fill").className = "fill";
+  $("fill").style.width = "0";
+  $("verdict").className = "verdict idle";
+  $("verdict").textContent = "uploading…";
+  for (const id of ["sEvents", "sChapters", "sResources"]) $(id).textContent = "0";
+  $("sBytes").textContent = "0";
+  $("sMs").textContent = "–";
+  $("bTitle").textContent = "No book yet";
+  $("bMeta").innerHTML = "";
+  spineProgress(0, 0);
+
+  try {
+    await stream();
+  } catch (err) {
+    row(`<span class="err">page error</span> ${esc(String(err))}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function stream() {
+  const picked = $("pick").files[0];
+  const body = picked
+    ? await picked.arrayBuffer()
+    : await (await fetch(`${BASE}/api/samples/${$("sample").value}`)).arrayBuffer();
+  sizeBytes = body.byteLength;
+  $("sizeLabel").textContent = kb(sizeBytes);
+
+  const params = new URLSearchParams();
+  if ($("stylesheets").checked) params.set("stylesheets", "");
+  if ($("allResources").checked) params.set("allResources", "");
+  if ($("document").checked) params.set("document", "");
+  params.set("delayMs", $("delay").value);
+  params.set("paceMs", $("pace").value);
+
+  // Aim for roughly 40 upload steps whatever the archive size. Chunk size
+  // changes nothing about the events — the server concatenates chunks before
+  // opening the ZIP — only how finely the upload bar moves.
+  const chunkBytes = Math.min(1 << 20, Math.max(64, Math.ceil(sizeBytes / 40)));
+  params.set("chunkBytes", chunkBytes);
+  $("chunkLabel").textContent = `${kb(chunkBytes)} chunks`;
+
+  let events = 0, chapters = 0, resources = 0, spineTotal = 0;
+  let uploadedAt = null, firstChapterAt = null;
+
+  const res = await fetch(`${BASE}/api/parse?${params}`, { method: "POST", body });
+  if (!res.ok) {
+    const problem = await res.json();
+    row(`<span class="err">${esc(problem.error)}</span>`);
+    return;
+  }
+
+  // SSE over a POST response, so it is parsed by hand: EventSource only does
+  // GET, and the whole point is that the upload and the event stream are one
+  // request.
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let split;
+    while ((split = buffer.indexOf("\n\n")) !== -1) {
+      const raw = buffer.slice(0, split);
+      buffer = buffer.slice(split + 2);
+
+      const nl = raw.indexOf("\n");
+      if (nl < 0 || !raw.startsWith("event: ")) continue;
+      const kind = raw.slice(7, nl);
+      const rest = raw.slice(nl + 1);
+      if (!rest.startsWith("data: ")) continue;
+      const data = JSON.parse(rest.slice(6));
+
+      if (kind === "fed") {
+        $("fill").style.width = `${(data.bytes / sizeBytes) * 100}%`;
+        $("fedLabel").textContent = `${kb(data.bytes)} of ${kb(sizeBytes)} uploaded`;
+        if (data.bytes >= sizeBytes && uploadedAt === null) {
+          uploadedAt = performance.now();
+          $("fill").classList.add("done");
+          $("fedLabel").textContent = `${kb(sizeBytes)} uploaded, unpacking…`;
+          $("verdict").textContent =
+            "Last byte sent. The server can only start now: a ZIP's central directory is at the end of the file.";
+        }
+        continue;
+      }
+      if (kind === "done") continue;
+
+      events++;
+      if (kind === "info") {
+        spineTotal = data.spineItemCount;
+        renderBook(data);
+        spineProgress(0, spineTotal);
+      }
+      if (kind === "chapter") {
+        chapters++;
+        spineProgress(chapters, spineTotal);
+        if (firstChapterAt === null) {
+          firstChapterAt = performance.now();
+          if (uploadedAt !== null) {
+            $("sMs").textContent = Math.round(firstChapterAt - uploadedAt);
+            $("verdict").className = "verdict";
+            $("verdict").innerHTML = `First chapter <strong>${Math.round(firstChapterAt - uploadedAt)} ms</strong>`
+              + ` after the last byte landed. Chapters now arrive as their entries are inflated.`;
+          }
+        }
+      }
+      if (kind === "resource") resources++;
+      if (kind === "status") $("sBytes").textContent = num(data.uncompressedBytes);
+
+      $("sEvents").textContent = num(events);
+      $("sChapters").textContent = spineTotal > 0 ? `${chapters} / ${spineTotal}` : num(chapters);
+      $("sResources").textContent = num(resources);
+
+      const html = render(kind, data);
+      if (html) row(html);
+    }
+  }
+}
+
+$("run").addEventListener("click", run);
+await loadSamples();
+</script>
+</body>
+</html>
