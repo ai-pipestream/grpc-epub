@@ -57,9 +57,10 @@ docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
   -p 50064:50064 grpc-epub
 ```
 
-The runtime image is `distroless/cc` running as uid 65532, with no shell and no
-package manager. `--read-only` is not a precaution here but a statement of
-fact: the hot path never writes anything.
+The runtime image is `dhi.io/debian-base:trixie-debian13` (Docker Hardened
+Images) running as uid 65532, with no shell and no package manager.
+`--read-only` is not a precaution here but a statement of fact: the hot path
+never writes anything.
 
 ## Wire API
 

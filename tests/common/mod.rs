@@ -397,6 +397,24 @@ pub async fn start() -> Harness {
 
 /// Start a server on an ephemeral localhost port with the given limits.
 pub async fn start_with(limits: Limits) -> Harness {
+    start_inner(limits, None).await
+}
+
+/// Start a server with the client's HTTP/2 receive windows pinned to
+/// `window` bytes.
+///
+/// The streaming tests use this to turn "how far has the parser run ahead
+/// of the reader" back into a question the wire answers deterministically:
+/// with the window capped, flow control stalls the server once about one
+/// chapter is in flight, and every chapter the client consumes returns
+/// credit for about one more. Left unpinned, the whole book can cross into
+/// transport buffers before anyone reads it — whether that happens depends
+/// on kernel buffers and scheduling, not on the design under test.
+pub async fn start_with_window(window: u32) -> Harness {
+    start_inner(Limits::default(), Some(window)).await
+}
+
+async fn start_inner(limits: Limits, window: Option<u32>) -> Harness {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
@@ -412,11 +430,14 @@ pub async fn start_with(limits: Limits) -> Harness {
             .expect("server failed");
     });
 
-    let channel = Endpoint::from_shared(format!("http://{addr}"))
-        .expect("endpoint")
-        .connect()
-        .await
-        .expect("connect to server");
+    let endpoint = Endpoint::from_shared(format!("http://{addr}")).expect("endpoint");
+    let endpoint = match window {
+        Some(window) => endpoint
+            .initial_stream_window_size(window)
+            .initial_connection_window_size(window),
+        None => endpoint,
+    };
+    let channel = endpoint.connect().await.expect("connect to server");
     Harness {
         client: EpubParseServiceClient::new(channel),
         metrics,

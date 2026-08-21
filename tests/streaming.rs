@@ -19,9 +19,11 @@
 //! [`the_stream_is_not_a_batch`] drives [`grpc_epub::extract`] in-process with
 //! a one-slot channel, so the bound is exact: the parser can be at most one
 //! event ahead of the reader, with no transport buffer in between to blur it.
-//! The socket-level test that follows repeats the question end to end, where
-//! HTTP/2 flow control makes the bound looser but the batch case still stands
-//! out.
+//! The socket-level tests that follow repeat the question end to end, with the
+//! client's HTTP/2 receive windows pinned to about one chapter so flow control
+//! bounds the parser's lead the same way the one-slot channel does. Unpinned,
+//! the whole book can cross into transport buffers before anyone reads it, and
+//! whether that happens is a property of the machine, not of the design.
 
 mod common;
 
@@ -48,6 +50,16 @@ const CHAPTER_BYTES: usize = 256 * 1024;
 /// Total body text across the book, the number a batching implementation would
 /// have inflated before it could send anything at all.
 const BOOK_BYTES: u64 = (CHAPTERS * CHAPTER_BYTES) as u64;
+
+/// HTTP/2 receive window for the socket-level tests, in bytes.
+///
+/// One chapter plus slack: `info` and the chapter being read always fit, but
+/// the whole book cannot be in flight at once, so the server can only run
+/// ahead of the reader by the channel buffer plus a chapter or two of
+/// returned credit. A batching implementation is untouched by this: it has
+/// inflated all twelve chapters before it can send `info`, whatever the
+/// window.
+const WINDOW: u32 = (CHAPTER_BYTES + 64 * 1024) as u32;
 
 /// `info` must reach the client before the book has been inflated.
 ///
@@ -135,13 +147,17 @@ async fn the_stream_is_not_a_batch() {
 
 /// The same question end to end, over a socket.
 ///
-/// Looser than the in-process bound — HTTP/2 flow control lets the server run
-/// a little ahead of the client — but a batch implementation would still show
-/// every chapter already inflated by the time the first one is read, and this
-/// says it must not.
+/// The client's receive windows are pinned to [`WINDOW`], so the parser's
+/// lead over the reader is bounded by flow control rather than by a race:
+/// with an unpinned window the parser can finish the whole book before
+/// chapter 0 is read on a fast machine, which would say nothing about
+/// whether the stream is live. The assertion itself is the one the
+/// in-process test makes exact — when chapter 0 is read, later chapters
+/// are still compressed — and a batch cannot pass it, because a batch has
+/// inflated all twelve chapters before it could send `info`.
 #[tokio::test]
 async fn a_chapter_reaches_the_client_while_later_ones_are_still_compressed() {
-    let harness = common::start().await;
+    let harness = common::start_with_window(WINDOW).await;
     let archive = common::long_book(CHAPTERS, CHAPTER_BYTES);
 
     let mut client = harness.client.clone();
@@ -200,9 +216,13 @@ async fn a_chapter_reaches_the_client_while_later_ones_are_still_compressed() {
 }
 
 /// A client that hangs up mid-stream must not wedge the server.
+///
+/// The window is pinned here as well, so "mid-stream" is a fact of the
+/// fixture rather than of timing: with [`WINDOW`] in force the parser is
+/// still waiting on flow control when the drop lands, whatever the machine.
 #[tokio::test]
 async fn dropping_the_stream_early_frees_the_parser() {
-    let harness = common::start().await;
+    let harness = common::start_with_window(WINDOW).await;
     let archive = common::long_book(CHAPTERS, CHAPTER_BYTES);
 
     let mut client = harness.client.clone();
