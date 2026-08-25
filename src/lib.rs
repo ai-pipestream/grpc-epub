@@ -24,6 +24,12 @@
 //!   immediately before the trailer. It is the book's skeleton — spine order,
 //!   OPF metadata, the table of contents, image pointers — and never a second
 //!   copy of the bytes.
+//! - **Typed slots over strings.** Everything the Document schema types, this
+//!   service fills as that type: a book's dates reach `DocumentMeta` as
+//!   instants ([`datetime`] reads them), its language and subjects as the
+//!   fields the query layer understands. The open-vocabulary remainder of
+//!   Dublin Core is what `extra` and `custom_fields` are for, and nothing that
+//!   has a typed home is written to them as a string as well.
 //! - **Navigation is metadata, not content.** [`nav`] reads the EPUB 3
 //!   navigation document and the EPUB 2 NCX, and [`smil`] reads media-overlay
 //!   cues. Both are lists of links and timings that the book states about
@@ -35,6 +41,7 @@
 //!   actually express.
 
 pub mod archive;
+pub mod datetime;
 pub mod document_fold;
 pub mod extract;
 pub mod href;

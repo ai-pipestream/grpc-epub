@@ -37,7 +37,7 @@ inflated the whole book.
 
 ```sh
 cargo build --release
-cargo test                 # 143 tests and a doc test, no network, no fixtures on disk
+cargo test                 # 158 tests and a doc test, no network, no fixtures on disk
 ./target/release/grpc-epub # listens on 0.0.0.0:50064
 ```
 
@@ -125,8 +125,10 @@ built.
 What it contains is the skeleton of the book:
 
 - `Document.name` is the title, `origin.mimetype` is `application/epub+zip`,
-  and the rest of the OPF metadata sits under `epub.*` keys in the body
-  group's `meta.custom_fields`.
+  and the book's account of itself is in `Document.source_meta`, typed:
+  `title`, `authors`, `language`, `keywords`, and the two dates as instants.
+- The book's table of contents is `Document.outline` and, when the media
+  overlays were parsed, the narration's length is `Document.media.duration_ms`.
 - One `GROUP_LABEL_CHAPTER` group per spine item, in spine order, named by its
   resolved href, carrying `epub.idref`, `epub.media_type`, `epub.linear`,
   `epub.spine_index` and `epub.properties`.
@@ -138,6 +140,24 @@ here, and the groups exist so the HTML collector's items can merge into them
 downstream. Non-image resources (stylesheets, fonts, media, the nav document)
 are not projected at all; the Document schema has no item kind for them, and
 they are already on the typed stream in full.
+
+**Dates are instants, not strings.** `dcterms:created` (or `dc:date`, which is
+what an EPUB 2 book has instead) and `dcterms:modified` are read into
+`DocumentMeta.created` and `.modified` as `google.protobuf.Timestamp`s, with
+`created_raw` and `modified_raw` keeping the book's own spelling beside them.
+A value that is not a date at all, which producers do write, sets the raw twin
+and leaves the typed field unset rather than being guessed at. The reader is
+`src/datetime.rs`: W3CDTF in every truncation the profile allows, no date
+library, and no timezone invented beyond the UTC default the profile itself
+specifies.
+
+`DocumentMeta.extra` and the body group's `meta.custom_fields` carry what
+Dublin Core leaves genuinely open, and only that: `epub.publisher`,
+`epub.rights`, `epub.source`, `epub.type`, `epub.format`, `epub.coverage`,
+`epub.relation`, `epub.description`, the MARC relator roles and sort names,
+subtitles by their `title-type`, and each `dc:identifier` on its own key. A
+fact the schema types is written to its typed field and nowhere else: a string
+copy beside a typed field is a second answer with no tiebreaker.
 
 **No bytes go inside the Document.** A Document is one gRPC message and clients
 commonly cap receives at 4 MiB, so `ImageRef.uri` is a pointer, not a data URI:
@@ -258,6 +278,7 @@ network on the parse path.
 | `proto/ai/pipestream/document/v1/` | the Document schema, vendored byte-identical from gRParse; never edited here |
 | `src/gen/` | `buf generate` output plus the reflection descriptor; never hand-edited |
 | `src/archive.rs` | ZIP opening, the entry scan, and the zip-bomb budget |
+| `src/datetime.rs` | W3CDTF dates read as instants, for the schema's typed date fields |
 | `src/opf.rs` | `container.xml` and OPF parsing, the metadata refinement model, and the entity policy |
 | `src/nav.rs` | the EPUB 3 navigation document and the EPUB 2 NCX |
 | `src/smil.rs` | media-overlay cues and SMIL clock values |

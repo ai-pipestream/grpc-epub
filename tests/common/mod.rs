@@ -223,6 +223,35 @@ pub fn minimal() -> Vec<u8> {
         .build()
 }
 
+/// The default book with the two dates it declares under the caller's control.
+///
+/// `created` is written as `dc:date` and `modified` as the EPUB 3
+/// `<meta property="dcterms:modified">`, which is how a real book spells the
+/// pair. Either may be any string at all, and that is the point: what a
+/// producer writes into a date field is not always a date, and the projection
+/// has to be able to say so.
+#[must_use]
+pub fn dated(created: &str, modified: &str) -> Vec<u8> {
+    let opf = opf_xml(
+        &[("ch1", "text/chap1.xhtml"), ("ch2", "text/chap2.xhtml")],
+        &[("cover-img", "images/cover.png", "image/png", "cover-image")],
+    )
+    .replace(
+        "<dc:date>1843-10-01</dc:date>",
+        &format!(
+            "<dc:date>{created}</dc:date>\n    \
+             <meta property=\"dcterms:modified\">{modified}</meta>"
+        ),
+    );
+
+    shell()
+        .add(OPF_PATH, opf)
+        .add(CHAP1, chapter_xhtml("Chapter One", "The first chapter."))
+        .add(CHAP2, chapter_xhtml("Chapter Two", "The second chapter."))
+        .add(COVER, IMAGE)
+        .build()
+}
+
 /// The same book with the cover image stored **before** the chapters.
 ///
 /// The pair exists to pin emission order: a resource is emitted when its

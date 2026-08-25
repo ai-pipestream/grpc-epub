@@ -106,21 +106,29 @@ async fn the_document_matches_the_typed_events_it_was_folded_from() {
         "info names the cover before the resource arrives, so the match works in one pass"
     );
 
-    // The metadata the OPF carried, on the body group.
-    let body = &document
+    // The metadata the OPF carried. What the schema types is on the typed
+    // field; the body group's custom fields hold only what it does not.
+    let meta = document
         .body
         .as_ref()
         .expect("a body")
         .meta
         .as_ref()
-        .expect("body meta")
-        .custom_fields;
+        .expect("body meta");
     assert_eq!(
-        body["epub.language"].kind,
-        Some(Kind::StringValue(info.language.clone()))
+        meta.language
+            .as_ref()
+            .expect("a typed language")
+            .code_raw
+            .as_deref(),
+        Some(info.language.as_str())
+    );
+    assert!(
+        !meta.custom_fields.contains_key("epub.language"),
+        "the language has a typed home, so it is not a string beside it too"
     );
     assert_eq!(
-        body["epub.opf_href"].kind,
+        meta.custom_fields["epub.opf_href"].kind,
         Some(Kind::StringValue(info.opf_href.clone()))
     );
 }
@@ -147,6 +155,10 @@ async fn the_source_stamp_names_this_collector_and_build() {
     );
     assert!(collector.model.is_none());
     assert!(collector.confidence.is_none());
+    assert!(
+        collector.raw_score.is_none() && collector.raw_score_kind.is_none(),
+        "a raw score is the signal behind a confidence there is none of"
+    );
 }
 
 #[tokio::test]

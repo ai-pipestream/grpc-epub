@@ -107,6 +107,17 @@ pub struct Document {
     /// Media stream metadata for audio and video sources.
     #[prost(message, optional, tag="21")]
     pub media: ::core::option::Option<MediaMeta>,
+    /// Tracked changes the source records (insertions, deletions, format
+    /// edits), each anchored to the content it touches.
+    #[prost(message, repeated, tag="22")]
+    pub changes: ::prost::alloc::vec::Vec<ChangeRecord>,
+    /// Named anchors the source declares (bookmarks, reference marks), the
+    /// targets its own cross-references point at.
+    #[prost(message, repeated, tag="23")]
+    pub anchors: ::prost::alloc::vec::Vec<NamedAnchor>,
+    /// Message envelope for mail sources.
+    #[prost(message, optional, tag="24")]
+    pub email: ::core::option::Option<EmailMeta>,
 }
 /// DocumentOrigin contains metadata about the source document file.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -230,6 +241,13 @@ pub struct CollectorSource {
     /// reports one.
     #[prost(double, optional, tag="4")]
     pub confidence: ::core::option::Option<f64>,
+    /// The engine's own uncalibrated signal behind that confidence, verbatim,
+    /// with its kind named (avg_logprob, softmax, distance) so consumers never
+    /// mistake it for a probability.
+    #[prost(double, optional, tag="5")]
+    pub raw_score: ::core::option::Option<f64>,
+    #[prost(string, optional, tag="6")]
+    pub raw_score_kind: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// SourceType is a union of possible source descriptors.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -421,6 +439,10 @@ pub struct TextItemBase {
     /// Raw label fallback for forward-compatibility with newer label vocabularies.
     #[prost(string, optional, tag="16")]
     pub label_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// The source's own named style for the item (a word processor's
+    /// paragraph style), verbatim; extension beyond the upstream dialect.
+    #[prost(string, optional, tag="17")]
+    pub style_name: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// TitleItem represents a document title or major heading.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1041,6 +1063,10 @@ pub struct TableData {
     /// rows); extension beyond the upstream dialect.
     #[prost(message, repeated, tag="8")]
     pub row_prov: ::prost::alloc::vec::Vec<ProvenanceItem>,
+    /// The fixed-record layout this table was decoded with; extension beyond
+    /// the upstream dialect.
+    #[prost(message, optional, tag="10")]
+    pub record_layout: ::core::option::Option<RecordLayoutMeta>,
 }
 /// TableRow represents a single row in the table.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1243,6 +1269,31 @@ pub struct PageItem {
     pub image: ::core::option::Option<ImageRef>,
     #[prost(int32, tag="3")]
     pub page_no: i32,
+    /// The coordinate unit this page's size and its items' boxes are measured
+    /// in (px, pt, twip); unset keeps the producer's historical space.
+    /// Extension beyond the upstream dialect.
+    #[prost(string, optional, tag="4")]
+    pub unit: ::core::option::Option<::prost::alloc::string::String>,
+    /// Extraction diagnostics for the page, when the producer measures them.
+    #[prost(message, optional, tag="5")]
+    pub quality: ::core::option::Option<PageQuality>,
+}
+/// PageQuality carries a page's extraction diagnostics as the measurements
+/// they are, not booleans.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct PageQuality {
+    /// Letter-frequency garble score for the page's text layer, 0.0 clean.
+    #[prost(double, optional, tag="1")]
+    pub garble_score: ::core::option::Option<f64>,
+    /// Count of replacement-character runs in the text layer.
+    #[prost(int32, optional, tag="2")]
+    pub replacement_runs: ::core::option::Option<i32>,
+    /// The producer's verdict that raster OCR would beat this text layer.
+    #[prost(bool, optional, tag="3")]
+    pub ocr_recommended: ::core::option::Option<bool>,
+    /// Rotation the producer detected and applied, degrees clockwise.
+    #[prost(double, optional, tag="4")]
+    pub rotation_degrees: ::core::option::Option<f64>,
 }
 // ============================================================================
 // Model extensions
@@ -1297,7 +1348,7 @@ pub struct Point {
 /// InlineSpan is one formatting or link run inside an item's text. Ranges are
 /// code points into `text`, half-open, and may overlap (bold and linked at
 /// once arrives as two spans or one span carrying both).
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InlineSpan {
     #[prost(message, optional, tag="1")]
     pub range: ::core::option::Option<IntSpan>,
@@ -1308,6 +1359,22 @@ pub struct InlineSpan {
     /// Internal cross-reference target (footnote, citation, section).
     #[prost(message, optional, tag="4")]
     pub target: ::core::option::Option<FineRef>,
+    /// Character-run attributes beyond the boolean set: the source's font
+    /// family and size (points), text color as #rrggbb, and the run's own
+    /// language tag when it differs from the item's.
+    #[prost(string, optional, tag="5")]
+    pub font_family: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(double, optional, tag="6")]
+    pub font_size_pt: ::core::option::Option<f64>,
+    #[prost(string, optional, tag="7")]
+    pub color: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="8")]
+    pub language: ::core::option::Option<::prost::alloc::string::String>,
+    /// The source field code a generated run came from (a page number, a
+    /// date, a cross-reference), so resolved field text stays distinguishable
+    /// from authored text.
+    #[prost(string, optional, tag="9")]
+    pub field_code: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// DocumentMeta carries the metadata the source declares about itself.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1316,11 +1383,13 @@ pub struct DocumentMeta {
     pub title: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, repeated, tag="2")]
     pub authors: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// ISO 8601 timestamps, verbatim from the source.
-    #[prost(string, optional, tag="3")]
-    pub created: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag="4")]
-    pub modified: ::core::option::Option<::prost::alloc::string::String>,
+    /// Creation and modification instants. The typed field carries the parsed
+    /// instant; the _raw twin keeps the source's own spelling and is the only
+    /// field set when the source's value does not parse.
+    #[prost(message, optional, tag="3")]
+    pub created: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(message, optional, tag="4")]
+    pub modified: ::core::option::Option<::prost_types::Timestamp>,
     /// BCP 47 language tag.
     #[prost(string, optional, tag="5")]
     pub language: ::core::option::Option<::prost::alloc::string::String>,
@@ -1329,8 +1398,15 @@ pub struct DocumentMeta {
     pub generator: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, repeated, tag="7")]
     pub keywords: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Source metadata with no first-class slot, keyed by a producer-scoped
-    /// name.
+    /// The schema the source declares for itself (an XML xsi:schemaLocation).
+    #[prost(string, optional, tag="8")]
+    pub schema_location: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="9")]
+    pub created_raw: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="10")]
+    pub modified_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// Source metadata that is genuinely open vocabulary. Data whose shape the
+    /// fleet knows gets a typed field, never an entry here.
     #[prost(map="string, string", tag="100")]
     pub extra: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
@@ -1352,9 +1428,10 @@ pub mod cell_value {
         Number(f64),
         #[prost(bool, tag="2")]
         Boolean(bool),
-        /// ISO 8601 date or datetime, verbatim.
-        #[prost(string, tag="3")]
-        Datetime(::prost::alloc::string::String),
+        /// The parsed date or datetime, timezone-honest: spreadsheet dates are
+        /// civil values, not instants.
+        #[prost(message, tag="3")]
+        Datetime(super::CivilDateTime),
         /// The source formula, in the source's own syntax.
         #[prost(string, tag="4")]
         Formula(::prost::alloc::string::String),
@@ -1364,9 +1441,31 @@ pub mod cell_value {
         Error(::prost::alloc::string::String),
     }
 }
+/// CivilDateTime is a wall-clock date or datetime as the source wrote it,
+/// without inventing a timezone the source never stated.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CivilDateTime {
+    #[prost(int32, tag="1")]
+    pub year: i32,
+    #[prost(int32, tag="2")]
+    pub month: i32,
+    #[prost(int32, tag="3")]
+    pub day: i32,
+    #[prost(int32, optional, tag="4")]
+    pub hour: ::core::option::Option<i32>,
+    #[prost(int32, optional, tag="5")]
+    pub minute: ::core::option::Option<i32>,
+    #[prost(int32, optional, tag="6")]
+    pub second: ::core::option::Option<i32>,
+    #[prost(int32, optional, tag="7")]
+    pub nanos: ::core::option::Option<i32>,
+    /// Only when the source itself states an offset.
+    #[prost(int32, optional, tag="8")]
+    pub utc_offset_minutes: ::core::option::Option<i32>,
+}
 /// TableColumnSchema declares one column of a schema-carrying table
 /// (spreadsheet types, fixed-record layouts).
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TableColumnSchema {
     #[prost(string, tag="1")]
     pub name: ::prost::alloc::string::String,
@@ -1387,10 +1486,13 @@ pub struct TableColumnSchema {
     /// columns that occur once.
     #[prost(int32, optional, tag="7")]
     pub occurs_index: ::core::option::Option<i32>,
-    /// Named value conditions declared on the column (copybook level-88),
-    /// each rendered as its literal or "low THRU high" range.
-    #[prost(string, repeated, tag="8")]
-    pub conditions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The column's display width in the page unit, when the source declares
+    /// one.
+    #[prost(double, optional, tag="9")]
+    pub width: ::core::option::Option<f64>,
+    /// Named value conditions declared on the column (copybook level-88).
+    #[prost(message, repeated, tag="8")]
+    pub conditions: ::prost::alloc::vec::Vec<ValueCondition>,
 }
 /// SubDocumentRef registers one nested payload the source carries (a mail
 /// part, an embedded file, a page attachment) so a downstream parser can fan
@@ -1419,16 +1521,20 @@ pub struct WebMeta {
     /// The page's self-declared canonical URI.
     #[prost(string, optional, tag="2")]
     pub canonical_uri: ::core::option::Option<::prost::alloc::string::String>,
-    /// ISO 8601 capture time.
-    #[prost(string, optional, tag="3")]
-    pub crawl_time: ::core::option::Option<::prost::alloc::string::String>,
+    /// Capture instant; the _raw twin keeps the source's spelling and is the
+    /// only field set when it does not parse.
+    #[prost(message, optional, tag="3")]
+    pub crawl_time: ::core::option::Option<::prost_types::Timestamp>,
     #[prost(int32, optional, tag="4")]
     pub http_status: ::core::option::Option<i32>,
     #[prost(string, optional, tag="5")]
     pub content_language: ::core::option::Option<::prost::alloc::string::String>,
-    /// Selected response headers, lower-cased names.
+    /// Response headers, lower-cased names. Header names are an open
+    /// vocabulary; the map is the honest type here.
     #[prost(map="string, string", tag="6")]
     pub headers: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    #[prost(string, optional, tag="7")]
+    pub crawl_time_raw: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// MetaTag is one page-level name/content meta pair.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1489,6 +1595,114 @@ pub struct OutlineEntry {
     /// The item or destination the entry points at, when resolvable.
     #[prost(message, optional, tag="4")]
     pub target: ::core::option::Option<FineRef>,
+}
+/// ChangeRecord is one tracked change the source records.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ChangeRecord {
+    /// Stable id within the document, as the source names it.
+    #[prost(string, tag="1")]
+    pub id: ::prost::alloc::string::String,
+    /// The change kind in the source's own vocabulary (insert, delete,
+    /// format), lower-cased.
+    #[prost(string, tag="2")]
+    pub kind: ::prost::alloc::string::String,
+    #[prost(string, tag="3")]
+    pub author: ::prost::alloc::string::String,
+    /// The change instant; the _raw twin keeps the source's spelling and is
+    /// the only field set when it does not parse.
+    #[prost(message, optional, tag="4")]
+    pub timestamp: ::core::option::Option<::prost_types::Timestamp>,
+    /// The item and span the change touches.
+    #[prost(message, optional, tag="5")]
+    pub target: ::core::option::Option<FineRef>,
+    /// The text the change removed or replaced, when the source keeps it.
+    #[prost(string, optional, tag="6")]
+    pub content: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="7")]
+    pub timestamp_raw: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// NamedAnchor is one named position the source declares.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NamedAnchor {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="2")]
+    pub target: ::core::option::Option<FineRef>,
+}
+/// ValueRange is one literal or literal range in a value condition; the
+/// bounds are the source's own literals.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ValueRange {
+    #[prost(string, tag="1")]
+    pub low: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="2")]
+    pub high: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// ValueCondition is one named value condition a column declares.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ValueCondition {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag="2")]
+    pub values: ::prost::alloc::vec::Vec<ValueRange>,
+}
+/// EmailParty is one addressee, split as the source states it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EmailParty {
+    #[prost(string, optional, tag="1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag="2")]
+    pub address: ::prost::alloc::string::String,
+}
+/// EmailMeta is the typed message envelope of a mail source.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EmailMeta {
+    #[prost(message, repeated, tag="1")]
+    pub from: ::prost::alloc::vec::Vec<EmailParty>,
+    #[prost(message, repeated, tag="2")]
+    pub to: ::prost::alloc::vec::Vec<EmailParty>,
+    #[prost(message, repeated, tag="3")]
+    pub cc: ::prost::alloc::vec::Vec<EmailParty>,
+    #[prost(message, repeated, tag="4")]
+    pub bcc: ::prost::alloc::vec::Vec<EmailParty>,
+    #[prost(string, optional, tag="5")]
+    pub message_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Every id the reply header names, individually.
+    #[prost(string, repeated, tag="6")]
+    pub in_reply_to: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Every id from every References header instance, in order.
+    #[prost(string, repeated, tag="7")]
+    pub references: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="8")]
+    pub conversation_topic: ::core::option::Option<::prost::alloc::string::String>,
+    /// The source's conversation index, verbatim bytes.
+    #[prost(bytes="vec", optional, tag="9")]
+    pub conversation_index: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// The sent instant; the _raw twin keeps the source's spelling and is the
+    /// only field set when it does not parse.
+    #[prost(message, optional, tag="10")]
+    pub sent: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(string, optional, tag="11")]
+    pub sent_raw: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// RecordLayoutMeta describes the fixed-record layout a table was decoded
+/// with.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RecordLayoutMeta {
+    /// The source byte encoding (an EBCDIC code page name).
+    #[prost(string, optional, tag="1")]
+    pub encoding: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, optional, tag="2")]
+    pub record_length: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag="3")]
+    pub header_bytes: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag="4")]
+    pub footer_bytes: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag="5")]
+    pub prefix_bytes: ::core::option::Option<u64>,
+    /// Rows the producer's row cap dropped; zero means the table is complete.
+    #[prost(uint64, optional, tag="6")]
+    pub rows_truncated: ::core::option::Option<u64>,
 }
 /// BarcodeAnnotation is one decoded machine-readable code payload.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

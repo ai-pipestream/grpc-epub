@@ -193,10 +193,23 @@ async fn the_document_carries_the_books_own_metadata_typed() {
     let meta = document.source_meta.as_ref().expect("source meta");
     assert_eq!(meta.title.as_deref(), Some(info.title.as_str()));
     assert_eq!(meta.authors, info.creators);
-    assert_eq!(meta.created.as_deref(), Some("1843-10-01"));
+    assert_eq!(
+        meta.created,
+        grpc_epub::datetime::parse("1843-10-01"),
+        "the book's dc:date, read as the instant it names"
+    );
+    assert_eq!(
+        meta.created_raw.as_deref(),
+        Some("1843-10-01"),
+        "and its own spelling, kept beside the reading"
+    );
     assert_eq!(meta.language.as_deref(), Some("en-GB"));
     assert_eq!(meta.keywords, ["Computing"]);
+
+    // Dublin Core's open half, which no typed field claims.
     assert_eq!(meta.extra["epub.publisher"], "Analytical Press");
+    assert_eq!(meta.extra["epub.identifier.0"], "urn:isbn:9780000000000");
+    assert_eq!(meta.extra["epub.identifier.0.scheme"], "ISBN");
 
     let body = document
         .body
@@ -212,10 +225,69 @@ async fn the_document_carries_the_books_own_metadata_typed() {
         ["Computing"]
     );
 
-    // Still present under the old key for one release.
+    // The string copies the typed fields replaced are gone from both maps.
+    for typed in [
+        "epub.language",
+        "epub.subjects",
+        "epub.creators",
+        "epub.date",
+    ] {
+        assert!(!body.custom_fields.contains_key(typed), "{typed} is typed");
+        assert!(!meta.extra.contains_key(typed), "{typed} is typed");
+    }
+}
+
+#[tokio::test]
+async fn a_book_whose_dates_parse_reaches_the_document_as_two_instants() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::dated("1843-10-01", "2026-08-25T09:41:07Z"),
+            with_document(),
+        )
+        .await
+        .expect("the book should parse");
+    let meta = common::documents(&events)[0]
+        .source_meta
+        .as_ref()
+        .expect("source meta");
+
     assert_eq!(
-        body.custom_fields["epub.language"].kind,
-        Some(Kind::StringValue("en-GB".to_owned()))
+        meta.created.expect("dc:date parses").seconds,
+        -3_984_163_200
+    );
+    assert_eq!(meta.created_raw.as_deref(), Some("1843-10-01"));
+    assert_eq!(
+        meta.modified.expect("dcterms:modified parses").seconds,
+        1_787_650_867
+    );
+    assert_eq!(meta.modified_raw.as_deref(), Some("2026-08-25T09:41:07Z"));
+}
+
+#[tokio::test]
+async fn a_book_whose_dates_are_prose_reaches_the_document_raw_and_only_raw() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::dated("sometime in the 1840s", "whenever this was last touched"),
+            with_document(),
+        )
+        .await
+        .expect("the book should parse");
+    let meta = common::documents(&events)[0]
+        .source_meta
+        .as_ref()
+        .expect("source meta");
+
+    assert!(
+        meta.created.is_none() && meta.modified.is_none(),
+        "a producer's prose is not an instant and is not turned into one"
+    );
+    assert_eq!(meta.created_raw.as_deref(), Some("sometime in the 1840s"));
+    assert_eq!(
+        meta.modified_raw.as_deref(),
+        Some("whenever this was last touched"),
+        "nothing the book wrote is dropped for failing to parse"
     );
 }
 

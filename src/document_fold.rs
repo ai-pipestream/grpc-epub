@@ -13,8 +13,8 @@
 //! What it projects is the **skeleton of the book**, and nothing below it:
 //!
 //! - the OPF metadata, typed into `Document.source_meta` and the body group's
-//!   `BaseMeta`, and repeated on the body group's `meta.custom_fields` as the
-//!   lossless tail;
+//!   `BaseMeta` wherever the schema types it, and the open-vocabulary
+//!   remainder of Dublin Core on the body group's `meta.custom_fields`;
 //! - the book's own table of contents, as `Document.outline`, with each entry
 //!   pointing at the chapter group it names;
 //! - one `GROUP_LABEL_CHAPTER` group per spine item, in spine order, **with no
@@ -55,10 +55,12 @@
 //! - **Root custom fields are first-writer-wins.** The `epub.*` keys live on
 //!   the *body* group's `meta.custom_fields`, and the coordinator does not
 //!   merge competing root metas: whichever collector's fragment lands first
-//!   keeps its keys. That is why everything with a typed home now has one,
-//!   in `Document.source_meta` and in `BaseMeta`'s own fields, which the merge
-//!   and the query layer understand; the `epub.*` keys stay for one release so
-//!   nothing reading them breaks, and are the lossless tail after that.
+//!   keeps its keys. That is why everything with a typed home is written to
+//!   that home, in `Document.source_meta` and in `BaseMeta`'s own fields,
+//!   which the merge and the query layer understand, and to nothing else:
+//!   the string copies that used to sit beside them under `epub.*` are gone,
+//!   and what remains under those keys is the part of Dublin Core that is
+//!   genuinely open vocabulary.
 //! - **No provenance.** An EPUB is reflowable and has no pages and no
 //!   bounding boxes, so `prov` is left empty everywhere rather than filled
 //!   with invented coordinates. Source locators — spine index, href, manifest
@@ -69,6 +71,7 @@ use std::collections::{HashMap, HashSet};
 use prost_types::value::Kind;
 use prost_types::{ListValue, Struct, Value};
 
+use crate::datetime;
 use crate::extract::EPUB_MIMETYPE;
 use crate::proto::document_v1 as doc;
 use crate::proto::v1 as pb;
@@ -374,14 +377,14 @@ impl DocumentFold {
         });
         self.document.source_meta = Some(self.source_meta(info));
 
-        // Everything the OPF said, under `epub.` keys. The facts that now have
-        // a typed home above are still written here, because consumers were
-        // told to read these keys and get one release to stop; the rest is the
-        // lossless tail and stays indefinitely. Empty fields are omitted rather
-        // than written as empty strings, so a reader can tell "the book did not
-        // say" from "the book said nothing useful".
+        // The OPF facts that have no typed home, under `epub.` keys. A fact
+        // the schema types is NOT written here as well: the title, the
+        // creators, the language, the subjects and the two dates all have
+        // first-class slots now, and a string copy beside a typed field is a
+        // second answer that can disagree with the first. Empty fields are
+        // omitted rather than written as empty strings, so a reader can tell
+        // "the book did not say" from "the book said nothing useful".
         let mut fields = HashMap::new();
-        insert_text(&mut fields, "epub.language", &info.language);
         insert_text(
             &mut fields,
             "epub.unique_identifier",
@@ -389,15 +392,9 @@ impl DocumentFold {
         );
         insert_text(&mut fields, "epub.publisher", &info.publisher);
         insert_text(&mut fields, "epub.description", &info.description);
-        // Verbatim, as the event carries it: EPUB 2 permits any W3CDTF
-        // profile and real books are looser still, so normalizing here would
-        // be guessing.
-        insert_text(&mut fields, "epub.date", &info.date);
         insert_text(&mut fields, "epub.epub_version", &info.epub_version);
         insert_text(&mut fields, "epub.opf_href", &info.opf_href);
-        insert_strings(&mut fields, "epub.creators", &info.creators);
         insert_strings(&mut fields, "epub.contributors", &info.contributors);
-        insert_strings(&mut fields, "epub.subjects", &info.subjects);
         if !info.identifiers.is_empty() {
             fields.insert(
                 "epub.identifiers".to_owned(),
@@ -419,7 +416,6 @@ impl DocumentFold {
             );
         }
 
-        insert_text(&mut fields, "epub.modified", &info.modified);
         insert_text(&mut fields, "epub.nav_href", &info.nav_href);
         insert_text(&mut fields, "epub.ncx_href", &info.ncx_href);
         // The six Dublin Core elements the old allow-list dropped, plus the
@@ -440,8 +436,9 @@ impl DocumentFold {
         }
 
         // `LanguageMetaField` and `KeywordsMetaField` are what the merge and
-        // the query layer understand; `epub.language` and `epub.subjects` were
-        // the same facts with nowhere typed to sit.
+        // the query layer understand, and they are now the only place the
+        // language and the subjects are written: the `epub.language` and
+        // `epub.subjects` custom fields they replaced are gone.
         self.group_mut(BODY_REF).meta = Some(doc::BaseMeta {
             language: (!info.language.is_empty()).then(|| doc::LanguageMetaField {
                 code: language_code(&info.language) as i32,
@@ -466,9 +463,20 @@ impl DocumentFold {
 
     /// The book's own account of itself, typed.
     ///
-    /// Everything with a first-class slot goes in one; everything else goes in
-    /// `extra` under the same `epub.` keys the custom fields use, so a reader
-    /// that knows one naming knows both.
+    /// Everything with a first-class slot goes in one, and *only* in one.
+    /// `extra` is for what Dublin Core leaves genuinely open: a publisher, a
+    /// rights statement, a MARC relator code, a producer-invented `<meta>`
+    /// property. The schema says as much at the field itself, so a value that
+    /// has a typed home and is written here too would be a second answer with
+    /// no tiebreaker.
+    ///
+    /// The two dates are the shape the schema asks for everywhere it carries
+    /// one: the typed instant plus a `_raw` twin holding the source's own
+    /// spelling. The twin is written whenever the book stated a date at all,
+    /// not only when the date failed to parse, because reading `1843-10-01` as
+    /// an instant means choosing a timezone the book never wrote and the twin
+    /// is what makes that choice reversible. A value that does not parse gets
+    /// the twin and nothing else.
     fn source_meta(&self, info: &pb::EpubInfo) -> doc::DocumentMeta {
         let mut extra: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         /// Record a key, skipping it when the book did not supply a value.
@@ -523,18 +531,25 @@ impl DocumentFold {
                 );
             }
         }
-        if info.identifiers.len() > 1 {
+        // One key per identifier, in document order, never one key holding all
+        // of them joined: a reader after the third identifier should not have
+        // to know this fold's separator, and an identifier is free to contain
+        // one. The scheme rides on its own key for the same reason.
+        for (index, identifier) in info.identifiers.iter().enumerate() {
             record(
                 &mut extra,
-                "epub.identifiers",
-                &info
-                    .identifiers
-                    .iter()
-                    .map(|identifier| identifier.value.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" "),
+                &format!("epub.identifier.{index}"),
+                &identifier.value,
+            );
+            record(
+                &mut extra,
+                &format!("epub.identifier.{index}.scheme"),
+                &identifier.scheme,
             );
         }
+
+        let created = declared_creation(info);
+        let modified = info.modified.as_str();
 
         doc::DocumentMeta {
             title: (!info.title.is_empty()).then(|| info.title.clone()),
@@ -542,12 +557,21 @@ impl DocumentFold {
             // marked as authors first: a book that says which creator wrote it
             // and which drew it should not have them read out in file order.
             authors: authors(info),
-            created: (!info.date.is_empty()).then(|| info.date.clone()),
-            modified: (!info.modified.is_empty()).then(|| info.modified.clone()),
+            created: datetime::parse(created),
+            modified: datetime::parse(modified),
             language: (!info.language.is_empty()).then(|| info.language.clone()),
-            // The producing software is not something an OPF states.
+            // The producing software is not something an OPF states. A `bkp`
+            // credit names a book producer, which is as often a person or an
+            // imprint as it is a program, so reading one as a generator would
+            // be an invention rather than a reading.
             generator: None,
             keywords: info.subjects.clone(),
+            // A package document declares no grammar for itself: which one it
+            // follows is fixed by the EPUB version, which is `epub.version`
+            // below, not by an `xsi:schemaLocation`.
+            schema_location: None,
+            created_raw: (!created.is_empty()).then(|| created.to_owned()),
+            modified_raw: (!modified.is_empty()).then(|| modified.to_owned()),
             extra,
         }
     }
@@ -649,7 +673,8 @@ impl DocumentFold {
     /// `model` is unset: there is one engine here and naming it would invent a
     /// distinction. `confidence` is unset too — the mapping is a declarative
     /// walk of the OPF, so a confidence would be noise rather than
-    /// information.
+    /// information, and `raw_score` is the uncalibrated signal behind a
+    /// confidence there is none of.
     fn collector_source(&self) -> doc::SourceType {
         doc::SourceType {
             source: Some(doc::source_type::Source::Collector(doc::CollectorSource {
@@ -657,6 +682,8 @@ impl DocumentFold {
                 model: None,
                 version: Some(self.version.clone()),
                 confidence: None,
+                raw_score: None,
+                raw_score_kind: None,
             })),
         }
     }
@@ -785,6 +812,22 @@ fn first<'a>(info: &'a pb::EpubInfo, element: &str) -> &'a str {
         .iter()
         .find(|entry| entry.element == element)
         .map_or("", |entry| entry.value.as_str())
+}
+
+/// The creation date the book states, whichever way it states it.
+///
+/// EPUB 3 spells it `<meta property="dcterms:created">`, which is a claim
+/// about the work's creation and nothing else, so it wins where a book makes
+/// it. `dc:date` is the older and vaguer spelling, meaning "a date associated
+/// with an event in the life cycle of the resource", and is what every EPUB 2
+/// book has instead; it is the fallback rather than the first choice.
+fn declared_creation(info: &pb::EpubInfo) -> &str {
+    let created = first(info, "dcterms:created");
+    if created.is_empty() {
+        info.date.as_str()
+    } else {
+        created
+    }
 }
 
 /// The value of the first refinement of `entry` with this property, or `""`.
@@ -1195,27 +1238,25 @@ mod tests {
             .custom_fields;
 
         assert_eq!(
-            field(fields, "epub.language"),
-            &Kind::StringValue("en-GB".to_owned())
-        );
-        assert_eq!(
             field(fields, "epub.publisher"),
             &Kind::StringValue("Analytical Press".to_owned())
-        );
-        assert_eq!(
-            field(fields, "epub.date"),
-            &Kind::StringValue("1843-10-01".to_owned()),
-            "the date is verbatim, never normalized"
         );
         assert_eq!(
             field(fields, "epub.opf_href"),
             &Kind::StringValue("OEBPS/content.opf".to_owned())
         );
-
-        let Kind::ListValue(creators) = field(fields, "epub.creators") else {
-            panic!("creators is a list");
-        };
-        assert_eq!(creators.values.len(), 2);
+        for typed in [
+            "epub.language",
+            "epub.subjects",
+            "epub.creators",
+            "epub.date",
+            "epub.modified",
+        ] {
+            assert!(
+                !fields.contains_key(typed),
+                "{typed} has a typed home now, so it is not a string here as well"
+            );
+        }
 
         let Kind::ListValue(identifiers) = field(fields, "epub.identifiers") else {
             panic!("identifiers is a list");
@@ -1597,10 +1638,20 @@ mod tests {
             ["Ada Lovelace", "Charles Babbage"],
             "the creator the book marked `aut` leads, whatever order the OPF listed them in"
         );
-        assert_eq!(meta.created.as_deref(), Some("1843-10-01"));
-        assert_eq!(meta.modified.as_deref(), Some("2026-08-25T00:00:00Z"));
+        assert_eq!(
+            meta.created,
+            datetime::parse("1843-10-01"),
+            "dc:date is the creation date this book states"
+        );
+        assert_eq!(meta.created_raw.as_deref(), Some("1843-10-01"));
+        assert_eq!(meta.modified, datetime::parse("2026-08-25T00:00:00Z"));
+        assert_eq!(meta.modified_raw.as_deref(), Some("2026-08-25T00:00:00Z"));
         assert_eq!(meta.language.as_deref(), Some("en-GB"));
         assert_eq!(meta.keywords, ["Computing", "History"]);
+        assert!(
+            meta.schema_location.is_none(),
+            "a package document declares no grammar for itself"
+        );
 
         // The six elements the old allow-list dropped, and the expression
         // model's roles, in the untyped tail because nothing types them.
@@ -1664,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn the_old_custom_field_keys_are_still_emitted_alongside_the_typed_ones() {
+    fn the_custom_fields_keep_only_what_the_schema_does_not_type() {
         let mut fold = DocumentFold::new("0.1.0");
         fold.consume(&pb::parse_epub_response::Event::Info(expressive_info()));
         let document = fold.take();
@@ -1674,24 +1725,145 @@ mod tests {
             .expect("body meta")
             .custom_fields;
 
-        // Consumers were told to read these; they get one release to stop.
-        assert_eq!(
-            field(fields, "epub.language"),
-            &Kind::StringValue("en-GB".to_owned())
-        );
+        // Open vocabulary, and the map is the honest type for it.
         assert_eq!(
             field(fields, "epub.rights"),
             &Kind::StringValue("Public domain".to_owned())
         );
-        let Kind::ListValue(subjects) = field(fields, "epub.subjects") else {
-            panic!("subjects is a list");
-        };
-        assert_eq!(subjects.values.len(), 2);
-
         let Kind::ListValue(credits) = field(fields, "epub.creator_roles") else {
             panic!("creator roles is a list");
         };
         assert_eq!(credits.values.len(), 2);
+
+        // The facts that have a first-class slot are only in that slot.
+        for typed in [
+            "epub.language",
+            "epub.subjects",
+            "epub.creators",
+            "epub.date",
+            "epub.modified",
+            "epub.title",
+        ] {
+            assert!(
+                !fields.contains_key(typed),
+                "{typed} is typed, not a string"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parseable_date_lands_typed_with_its_spelling_kept_beside_it() {
+        let mut fold = DocumentFold::new("0.1.0");
+        fold.consume(&pb::parse_epub_response::Event::Info(pb::EpubInfo {
+            // A whole-day date and a full instant, the two spellings a real
+            // book uses for the two fields.
+            date: "1843-10-01".to_owned(),
+            modified: "2026-08-25T09:41:07Z".to_owned(),
+            ..Default::default()
+        }));
+        let meta = fold.take().source_meta.expect("source meta");
+
+        let created = meta.created.expect("dc:date parses");
+        assert_eq!(created.seconds, -3_984_163_200);
+        assert_eq!(created.nanos, 0);
+        assert_eq!(
+            meta.created_raw.as_deref(),
+            Some("1843-10-01"),
+            "the twin keeps the book's own spelling, not this fold's reading of it"
+        );
+
+        let modified = meta.modified.expect("dcterms:modified parses");
+        assert_eq!(modified.seconds, 1_787_650_867);
+        assert_eq!(meta.modified_raw.as_deref(), Some("2026-08-25T09:41:07Z"));
+    }
+
+    #[test]
+    fn a_date_that_is_not_a_date_is_kept_raw_and_claimed_as_nothing() {
+        let mut fold = DocumentFold::new("0.1.0");
+        fold.consume(&pb::parse_epub_response::Event::Info(pb::EpubInfo {
+            date: "sometime in the 1840s".to_owned(),
+            modified: "Last Tuesday".to_owned(),
+            ..Default::default()
+        }));
+        let meta = fold.take().source_meta.expect("source meta");
+
+        assert!(
+            meta.created.is_none(),
+            "an unreadable date is not an instant"
+        );
+        assert!(meta.modified.is_none());
+        assert_eq!(meta.created_raw.as_deref(), Some("sometime in the 1840s"));
+        assert_eq!(
+            meta.modified_raw.as_deref(),
+            Some("Last Tuesday"),
+            "the raw twin is the only field set, and nothing is lost"
+        );
+    }
+
+    #[test]
+    fn a_book_that_states_no_date_claims_neither_field() {
+        let mut fold = DocumentFold::new("0.1.0");
+        fold.consume(&pb::parse_epub_response::Event::Info(pb::EpubInfo {
+            title: "Undated".to_owned(),
+            ..Default::default()
+        }));
+        let meta = fold.take().source_meta.expect("source meta");
+
+        assert!(meta.created.is_none() && meta.created_raw.is_none());
+        assert!(meta.modified.is_none() && meta.modified_raw.is_none());
+    }
+
+    #[test]
+    fn dcterms_created_outranks_dc_date_where_a_book_states_both() {
+        let mut info = expressive_info();
+        info.metadata.push(pb::MetadataEntry {
+            element: "dcterms:created".to_owned(),
+            value: "1843-10-15T00:00:00Z".to_owned(),
+            ..Default::default()
+        });
+        let mut fold = DocumentFold::new("0.1.0");
+        fold.consume(&pb::parse_epub_response::Event::Info(info));
+        let meta = fold.take().source_meta.expect("source meta");
+
+        assert_eq!(
+            meta.created_raw.as_deref(),
+            Some("1843-10-15T00:00:00Z"),
+            "dcterms:created is a claim about creation; dc:date is a claim about anything"
+        );
+        assert_eq!(meta.created, datetime::parse("1843-10-15T00:00:00Z"));
+    }
+
+    #[test]
+    fn every_identifier_gets_its_own_key_rather_than_one_joined_string() {
+        let mut fold = DocumentFold::new("0.1.0");
+        fold.consume(&pb::parse_epub_response::Event::Info(pb::EpubInfo {
+            identifiers: vec![
+                pb::DublinCoreIdentifier {
+                    value: "urn:isbn:9780000000000".to_owned(),
+                    id: "bookid".to_owned(),
+                    scheme: "ISBN".to_owned(),
+                },
+                pb::DublinCoreIdentifier {
+                    value: "urn:uuid:0000 0000".to_owned(),
+                    id: String::new(),
+                    scheme: String::new(),
+                },
+            ],
+            ..Default::default()
+        }));
+        let extra = fold.take().source_meta.expect("source meta").extra;
+
+        assert_eq!(extra["epub.identifier.0"], "urn:isbn:9780000000000");
+        assert_eq!(extra["epub.identifier.0.scheme"], "ISBN");
+        assert_eq!(
+            extra["epub.identifier.1"], "urn:uuid:0000 0000",
+            "an identifier may contain a separator, which is why there is no separator"
+        );
+        assert!(!extra.contains_key("epub.identifier.1.scheme"));
+        assert!(
+            !extra.contains_key("epub.identifiers"),
+            "the joined list is gone"
+        );
     }
 
     /// One `navigation` event over the default book's two chapters.
