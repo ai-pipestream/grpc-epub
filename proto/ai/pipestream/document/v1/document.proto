@@ -1329,6 +1329,12 @@ message TableColumnSchema {
   optional uint64 byte_size = 5;
   // Copybook level number.
   optional int32 level = 6;
+  // One-based occurrence for a column inside an OCCURS group; unset for
+  // columns that occur once.
+  optional int32 occurs_index = 7;
+  // Named value conditions declared on the column (copybook level-88),
+  // each rendered as its literal or "low THRU high" range.
+  repeated string conditions = 8;
 }
 
 // SubDocumentRef registers one nested payload the source carries (a mail

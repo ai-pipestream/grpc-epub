@@ -1383,6 +1383,14 @@ pub struct TableColumnSchema {
     /// Copybook level number.
     #[prost(int32, optional, tag="6")]
     pub level: ::core::option::Option<i32>,
+    /// One-based occurrence for a column inside an OCCURS group; unset for
+    /// columns that occur once.
+    #[prost(int32, optional, tag="7")]
+    pub occurs_index: ::core::option::Option<i32>,
+    /// Named value conditions declared on the column (copybook level-88),
+    /// each rendered as its literal or "low THRU high" range.
+    #[prost(string, repeated, tag="8")]
+    pub conditions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// SubDocumentRef registers one nested payload the source carries (a mail
 /// part, an embedded file, a page attachment) so a downstream parser can fan
