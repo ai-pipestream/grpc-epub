@@ -37,7 +37,7 @@ inflated the whole book.
 
 ```sh
 cargo build --release
-cargo test                 # 99 tests and a doc test, no network, no fixtures on disk
+cargo test                 # 143 tests and a doc test, no network, no fixtures on disk
 ./target/release/grpc-epub # listens on 0.0.0.0:50064
 ```
 
@@ -258,7 +258,9 @@ network on the parse path.
 | `proto/ai/pipestream/document/v1/` | the Document schema, vendored byte-identical from gRParse; never edited here |
 | `src/gen/` | `buf generate` output plus the reflection descriptor; never hand-edited |
 | `src/archive.rs` | ZIP opening, the entry scan, and the zip-bomb budget |
-| `src/opf.rs` | `container.xml` and OPF parsing, and the entity policy |
+| `src/opf.rs` | `container.xml` and OPF parsing, the metadata refinement model, and the entity policy |
+| `src/nav.rs` | the EPUB 3 navigation document and the EPUB 2 NCX |
+| `src/smil.rs` | media-overlay cues and SMIL clock values |
 | `src/href.rs` | path normalization and the traversal policy |
 | `src/extract.rs` | the parse driver and the emission order |
 | `src/document_fold.rs` | the opt-in Document projection and its integrity checker |
@@ -270,8 +272,10 @@ network on the parse path.
 
 ## Not in v1
 
-EPUB 3 media overlays and SMIL narration, writing EPUB, CSS paged media,
-ZIP-in-ZIP, and DRM. `docs/design.md` has the reasoning.
+Transcribing narration audio, writing EPUB, CSS paged media, ZIP-in-ZIP, and
+DRM. `docs/design.md` has the reasoning. Media-overlay *alignment* is read, as
+`ParseOptions.parse_media_overlays`: the mapping from text to audio is authored
+into the book and needs no model to recover.
 
 Wiring this collector into gRParse (the `COLLECTOR_*` enum and the endpoint
 env) is a follow-up in that repo, not here.

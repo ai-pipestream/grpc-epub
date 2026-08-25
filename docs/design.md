@@ -11,8 +11,10 @@
 
 ## 2. Non-goals (v1)
 
-- EPUB 3 media overlays / SMIL narration (that is ASR's job if we ever ingest
-  the audio).
+- Transcribing narration audio (that is ASR's job if we ever ingest the audio).
+  The *alignment* is a different question: an EPUB 3 media overlay ships the
+  text-to-audio mapping already authored in the book, so reading it needs no
+  model and is done here, under `ParseOptions.parse_media_overlays`.
 - Writing EPUB.
 - Full CSS paged media.
 - Nested ZIP / ZIP-in-ZIP.
@@ -71,10 +73,23 @@ What is mapped:
 
 | Event | Document |
 |---|---|
-| `info` | `Document.name` = title, `origin.mimetype` = `application/epub+zip`, and every other OPF field under `epub.*` keys in the body group's `meta.custom_fields` (lists as `ListValue`, identifiers as `{value, scheme}` objects) |
-| `chapter` | one `GROUP_LABEL_CHAPTER` group under `#/body`, `name` = resolved href, meta `epub.idref` / `epub.media_type` / `epub.linear` / `epub.spine_index` / `epub.properties` |
+| `info` | `Document.name` = title; `origin.mimetype` = `application/epub+zip`; `origin.binary_hash` = FNV-1a over the archive; `Document.source_meta` = `DocumentMeta{title, authors, created, modified, language, keywords, extra}`; the body group's `BaseMeta.language` and `.keywords`; and every OPF field under `epub.*` keys in the body group's `meta.custom_fields` (lists as `ListValue`, identifiers as `{value, scheme}` objects) |
+| `navigation` | `Document.outline`, one `OutlineEntry{title, level, target}` per nav point, depth-first in reading order; `target` is a `FineRef` at the chapter group the entry names, unset when the href resolves to no spine item |
+| `chapter` | one `GROUP_LABEL_CHAPTER` group under `#/body`, `name` = resolved href, meta `epub.idref` / `epub.media_type` / `epub.linear` / `epub.spine_index` / `epub.properties` / `epub.media_overlay_href` |
+| `media_overlay` | `Document.media.duration_ms` = where the last cue ends, and the cues on the narrated chapter's group as `epub.media_overlay_cues` |
 | `resource`, image | one `PictureItem` under `#/body`, `label = DOC_ITEM_LABEL_PICTURE`, `ImageRef{mimetype, uri = "epub:<href>"}`, meta `epub.href` / `epub.manifest_id` / `epub.cover` |
 | `status` | nothing; it is a receipt of counts the items already imply |
+
+**Typed slots now win, and the old keys stay for one release.** `dc:language`,
+`dc:subject`, the title, the creators and the dates used to exist only as
+`epub.*` custom fields, which the coordinator merges first-writer-wins: a
+competing fragment silently kept its own. They now also fill
+`Document.source_meta` and `BaseMeta.language` / `.keywords`, which the merge
+and the query layer understand. The `epub.*` keys are still emitted so nothing
+reading them breaks; treat them as deprecated for the facts that have a typed
+home, and as the lossless tail for the ones that do not (`epub.rights`,
+`epub.source`, `epub.type`, `epub.format`, `epub.coverage`, `epub.relation`,
+`epub.creator_roles`).
 
 The Document also carries the schema identifier declared by the vendored
 schema, copied through verbatim:
@@ -109,8 +124,26 @@ no bounding boxes. Source locators go in `meta.custom_fields` instead.
 **`DocumentOrigin.filename`.** The server is handed bytes on a gRPC stream and
 is never told what the file was called.
 
-**NCX / nav table of contents.** Not mapped in v1, as above. It arrives as an
-ordinary `resource` event; turning it into a group of links is future work.
+**Navigation beyond the `toc`.** The EPUB 3 navigation document and the EPUB 2
+NCX are now parsed into `Document.outline`; the documents themselves are still
+emitted as ordinary `resource` events carrying their bytes, unchanged. Only the
+`toc` nav is read. `page-list` (printed page numbers, which `Document.pages`
+and `ProvenanceItem.page_no` are shaped for) and `landmarks` are the same shape
+and the same parser away, and are deferred only because neither has a wired-up
+Document slot yet; reading them now would produce facts with nowhere to go.
+
+**Cue-level media provenance.** SMIL overlays are parsed under
+`ParseOptions.parse_media_overlays` and the cues go out in full on the typed
+`media_overlay` event. On the Document plane the cues cannot yet land where
+they belong: `SourceType.track` (`TrackSource{start_time, end_time,
+identifier}`) hangs on text items, a cue addresses a fragment *inside* a
+chapter, and this fold emits chapter groups with no children. Until the HTML
+collector contributes those items downstream, the Document carries the
+narration length in `MediaMeta.duration_ms` (a typed slot, a real fact) and the
+cues as the `epub.media_overlay_cues` tail on the chapter group. Which chapters
+have narration at all is a manifest fact and is reported either way, on
+`Chapter.media_overlay_href` and `epub.media_overlay_href`, whether or not the
+SMIL was parsed.
 
 **Chapter to picture attribution.** Which chapter references an image is a fact
 about the XHTML, so pictures hang off the body rather than off a chapter group.
