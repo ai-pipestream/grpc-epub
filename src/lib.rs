@@ -11,7 +11,7 @@
 //!   parses, sanitizes, or rewrites it.
 //! - **Nothing touches disk.** The upload lives in one `Vec<u8>`, entries are
 //!   inflated into memory one at a time, and the container runs read-only.
-//!   Docling's EPUB backend unpacks to a temp directory; that is the practice
+//!   The usual EPUB reader unpacks to a temp directory; that is the practice
 //!   this service exists to avoid.
 //! - **The stream is the product.** `info` is emitted before a single chapter
 //!   is inflated and each `chapter` is emitted as its entry comes off the
@@ -22,7 +22,13 @@
 //!   `ParseOptions.emit_document` set, [`document_fold`] folds the same events
 //!   into one `ai.pipestream.document.v1.Document` and the server sends it
 //!   immediately before the trailer. It is the book's skeleton — spine order,
-//!   OPF metadata, image pointers — and never a second copy of the bytes.
+//!   OPF metadata, the table of contents, image pointers — and never a second
+//!   copy of the bytes.
+//! - **Navigation is metadata, not content.** [`nav`] reads the EPUB 3
+//!   navigation document and the EPUB 2 NCX, and [`smil`] reads media-overlay
+//!   cues. Both are lists of links and timings that the book states about
+//!   itself, which is why reading them does not breach the thin-packager rule
+//!   the way parsing a chapter would.
 //! - **Hostile input is the normal case.** [`archive`] holds the zip-bomb
 //!   policy, [`href`] holds the path-traversal policy, and [`opf`] holds the
 //!   external-entity policy. Each is tested against an attack the format can
@@ -34,9 +40,11 @@ pub mod extract;
 pub mod href;
 pub mod limits;
 pub mod metrics;
+pub mod nav;
 pub mod opf;
 pub mod proto;
 pub mod service;
+pub mod smil;
 
 pub use document_fold::DocumentFold;
 pub use limits::Limits;
