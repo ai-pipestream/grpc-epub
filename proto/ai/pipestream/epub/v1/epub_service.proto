@@ -8,7 +8,7 @@
 // document and the spine, and it hands XHTML on untouched to whatever reads
 // HTML.
 //
-// The stream is the product. Docling's EPUB backend unpacks to a temp
+// The stream is the product. The usual EPUB reader unpacks to a temp
 // directory, runs every chapter through an HTML backend, and returns one
 // document at the end; here `info` arrives before a single chapter has been
 // inflated and each `chapter` arrives as its entry comes off the archive, so a
@@ -47,9 +47,10 @@ service EpubParseService {
   // byte has arrived. Streaming begins the moment it is possible to begin,
   // which is why this is `info`-then-chapters rather than one big response.
   //
-  // A successful stream is exactly: one `info`, then `chapter` events in
-  // spine order interleaved with `resource` events in archive order, then one
-  // `status`. A failed stream ends with a gRPC status and no `status` event:
+  // A successful stream is exactly: one `info`; then at most one `navigation`
+  // and any `media_overlay` events; then `chapter` events in spine order
+  // interleaved with `resource` events in archive order; then one `status`. A
+  // failed stream ends with a gRPC status and no `status` event:
   //
   //   RESOURCE_EXHAUSTED  the upload, entry count, total decompressed size or
   //                       an entry's compression ratio exceeded its cap
@@ -119,6 +120,16 @@ message ParseEpubResponse {
     // here, so the chapter groups arrive empty and the HTML collector's items
     // merge into them downstream.
     ai.pipestream.document.v1.Document document = 5;
+
+    // The book's own table of contents, parsed from its navigation document
+    // or its NCX. Emitted once, immediately after `info`, unless
+    // `ParseOptions.parse_navigation` turned it off or the book has neither.
+    Navigation navigation = 6;
+
+    // One SMIL media overlay's cues. Emitted after `info` and before the
+    // chapters, one event per narrated chapter, only when
+    // `ParseOptions.parse_media_overlays` is set.
+    MediaOverlay media_overlay = 7;
   }
 }
 

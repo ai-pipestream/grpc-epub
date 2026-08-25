@@ -201,6 +201,13 @@ impl pb::epub_parse_service_server::EpubParseService for EpubGrpc {
                 // and a client that needs the projection can branch on this
                 // rather than on the version string.
                 "document-fold".to_owned(),
+                // This build reads the navigation document and the NCX into a
+                // `navigation` event and the Document's outline, and can read
+                // SMIL media overlays into `media_overlay` events. A client
+                // that needs either can branch on the capability rather than
+                // on the version string.
+                "navigation".to_owned(),
+                "media-overlays".to_owned(),
                 "health".to_owned(),
                 "reflection".to_owned(),
             ],

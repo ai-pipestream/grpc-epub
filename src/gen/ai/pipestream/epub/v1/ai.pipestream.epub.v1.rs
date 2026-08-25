@@ -80,6 +80,25 @@ pub struct ParseOptions {
     /// is off.
     #[prost(bool, tag="8")]
     pub emit_document: bool,
+    /// Parse the EPUB 3 navigation document, or the EPUB 2 NCX, into a
+    /// `navigation` event and into `Document.outline`. Absent means true.
+    ///
+    /// On by default because the cost is one small XML parse of a document the
+    /// server is already inflating in order to emit its bytes, and because a book
+    /// whose table of contents never reaches the Document plane projects as a run
+    /// of identically shaped groups whose only identity is a file path.
+    #[prost(bool, optional, tag="9")]
+    pub parse_navigation: ::core::option::Option<bool>,
+    /// Parse each SMIL media overlay into a `media_overlay` event. Absent means
+    /// false.
+    ///
+    /// Off by default because, unlike the navigation document, a book's overlays
+    /// are one SMIL file per chapter and none of them is inflated otherwise: a
+    /// narrated book would pay for reading every one of them on a call that only
+    /// wanted the text. Which chapters *have* an overlay is reported either way,
+    /// on `Chapter.media_overlay_href`.
+    #[prost(bool, optional, tag="10")]
+    pub parse_media_overlays: ::core::option::Option<bool>,
 }
 /// DublinCoreIdentifier is one `dc:identifier` from the OPF metadata.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -95,6 +114,52 @@ pub struct DublinCoreIdentifier {
     /// EPUB 3, which carries the scheme in a refining `<meta>` instead.
     #[prost(string, tag="3")]
     pub scheme: ::prost::alloc::string::String,
+}
+/// MetadataRefinement is one EPUB 3 `<meta refines="#id" property="p">v</meta>`.
+///
+/// Refinements carry everything interesting the OPF says about a metadata
+/// element: which creator is the author and which the illustrator, how to sort
+/// a name, whether a title is the main one or a subtitle. EPUB 2 spells the
+/// same facts as `opf:role` and `opf:file-as` attributes on the element itself;
+/// the server normalizes both dialects into this shape, so a consumer never has
+/// to know which one the producer used.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MetadataRefinement {
+    /// The property name, for example `role`, `file-as`, `title-type`.
+    #[prost(string, tag="1")]
+    pub property: ::prost::alloc::string::String,
+    /// The refinement's value, verbatim.
+    #[prost(string, tag="2")]
+    pub value: ::prost::alloc::string::String,
+    /// The `scheme` attribute naming the vocabulary `value` is drawn from, for
+    /// example `marc:relators`. Empty when the element declared none.
+    #[prost(string, tag="3")]
+    pub scheme: ::prost::alloc::string::String,
+}
+/// MetadataEntry is one OPF metadata element, verbatim, with its refinements.
+///
+/// The scalar fields on EpubInfo are a reading of these entries; this is the
+/// record they were read from. It exists so a consumer that wants an element
+/// this service has no opinion about does not need this service to grow an
+/// opinion first, the same way EmailInfo carries its full header list.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetadataEntry {
+    /// Local name for a Dublin Core element (`title`, `creator`, `rights`), or
+    /// the `property` for a bare EPUB 3 `<meta>` (`dcterms:modified`).
+    #[prost(string, tag="1")]
+    pub element: ::prost::alloc::string::String,
+    /// The element's text content, trimmed but otherwise verbatim.
+    #[prost(string, tag="2")]
+    pub value: ::prost::alloc::string::String,
+    /// The `id` attribute, empty when absent. Refinements name this.
+    #[prost(string, tag="3")]
+    pub id: ::prost::alloc::string::String,
+    /// EPUB 2's `opf:scheme` attribute, empty when absent.
+    #[prost(string, tag="4")]
+    pub scheme: ::prost::alloc::string::String,
+    /// Everything refining this element, in document order.
+    #[prost(message, repeated, tag="5")]
+    pub refinements: ::prost::alloc::vec::Vec<MetadataRefinement>,
 }
 /// EpubInfo is the opening event of every successful stream.
 ///
@@ -156,6 +221,29 @@ pub struct EpubInfo {
     /// neither is present. The bytes arrive as an ordinary `resource` event.
     #[prost(string, tag="14")]
     pub cover_href: ::prost::alloc::string::String,
+    /// Every metadata element the OPF declared, in document order, with its
+    /// refinements attached. The lossless tail the fields above are a reading of.
+    ///
+    /// The scalar fields keep the first value of a single-valued element, which
+    /// is what a reader wants and what EPUB 2 meant. A book that declares two
+    /// publishers, a subtitle as well as a title, or a `dc:rights` this message
+    /// has no field for is fully described here and only here.
+    #[prost(message, repeated, tag="15")]
+    pub metadata: ::prost::alloc::vec::Vec<MetadataEntry>,
+    /// `<meta property="dcterms:modified">`, verbatim. Mandatory in EPUB 3 and
+    /// the natural freshness signal for anything that re-crawls a book. Empty for
+    /// EPUB 2, which has no equivalent.
+    #[prost(string, tag="16")]
+    pub modified: ::prost::alloc::string::String,
+    /// Archive path of the EPUB 3 navigation document, resolved and normalized.
+    /// Empty when the book ships only an EPUB 2 NCX, or neither.
+    #[prost(string, tag="17")]
+    pub nav_href: ::prost::alloc::string::String,
+    /// Archive path of the EPUB 2 NCX, resolved and normalized, found through the
+    /// `<spine toc="…">` attribute. Empty when the book ships only an EPUB 3
+    /// navigation document, or neither.
+    #[prost(string, tag="18")]
+    pub ncx_href: ::prost::alloc::string::String,
 }
 /// Chapter is one spine item: the reading-order unit of an EPUB.
 ///
@@ -191,6 +279,15 @@ pub struct Chapter {
     /// `scripted`. Empty for EPUB 2.
     #[prost(string, repeated, tag="7")]
     pub properties: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Archive path of this chapter's SMIL media overlay, resolved from the
+    /// manifest's `media-overlay` attribute. Empty when the chapter has no
+    /// recorded narration.
+    ///
+    /// This is the only link an EPUB draws between a chapter and the reading of
+    /// it. The cues inside the SMIL arrive as a separate `media_overlay` event
+    /// when `ParseOptions.parse_media_overlays` is set.
+    #[prost(string, tag="8")]
+    pub media_overlay_href: ::prost::alloc::string::String,
 }
 /// Resource is one manifest entry that is not a spine chapter.
 ///
@@ -221,6 +318,96 @@ pub struct Resource {
     /// EPUB 3 manifest `properties` tokens on this item, such as `cover-image`.
     #[prost(string, repeated, tag="6")]
     pub properties: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Archive path of this resource's SMIL media overlay, resolved from the
+    /// manifest's `media-overlay` attribute. Empty when it has none, which is
+    /// every resource that is not narrated markup.
+    #[prost(string, tag="7")]
+    pub media_overlay_href: ::prost::alloc::string::String,
+}
+/// NavPoint is one entry of a book's own navigation, with its children.
+///
+/// Navigation is *metadata about* the content rather than the content itself,
+/// which is why parsing it does not break this service's rule against reading
+/// XHTML: a nav document is a well-specified list of links, and the alternative
+/// is that everything downstream re-opens markup the server already held.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NavPoint {
+    /// The entry's link text, with markup stripped and whitespace collapsed.
+    #[prost(string, tag="1")]
+    pub label: ::prost::alloc::string::String,
+    /// Archive path the entry points at, resolved and normalized, with the
+    /// fragment preserved: `OEBPS/text/chap1.xhtml#part2`. Empty when the entry
+    /// is a heading with no link of its own, which EPUB 3 permits.
+    #[prost(string, tag="2")]
+    pub href: ::prost::alloc::string::String,
+    /// Zero-based nesting depth. A top-level entry is 0.
+    #[prost(uint32, tag="3")]
+    pub depth: u32,
+    /// Entries nested under this one, in document order.
+    #[prost(message, repeated, tag="4")]
+    pub children: ::prost::alloc::vec::Vec<NavPoint>,
+}
+/// Navigation is a book's table of contents, parsed.
+///
+/// Emitted once, immediately after `info`, when `ParseOptions.parse_navigation`
+/// leaves navigation parsing on. The document it was read from is still emitted
+/// as an ordinary `resource` event carrying its bytes; this event does not
+/// replace it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Navigation {
+    /// Archive path of the document this was read from, resolved and normalized.
+    #[prost(string, tag="1")]
+    pub source_href: ::prost::alloc::string::String,
+    /// The table of contents, in document order.
+    #[prost(message, repeated, tag="2")]
+    pub toc: ::prost::alloc::vec::Vec<NavPoint>,
+    /// True when the entries came from an EPUB 2 NCX rather than an EPUB 3
+    /// navigation document. A book carrying both is read from the nav document,
+    /// which is the richer of the two.
+    #[prost(bool, tag="3")]
+    pub from_ncx: bool,
+}
+/// MediaOverlayCue is one `<par>` of a SMIL media overlay: a span of narration
+/// audio and the piece of text it reads aloud.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MediaOverlayCue {
+    /// Archive path and fragment of the text the cue narrates, resolved and
+    /// normalized: `OEBPS/text/chap1.xhtml#sentence3`.
+    #[prost(string, tag="1")]
+    pub text_href: ::prost::alloc::string::String,
+    /// Archive path of the audio resource, resolved and normalized. The bytes
+    /// arrive as a `resource` event only under `include_all_resources`.
+    #[prost(string, tag="2")]
+    pub audio_href: ::prost::alloc::string::String,
+    /// Offset into `audio_href` where the cue starts, in seconds. Parsed from
+    /// SMIL `clipBegin`, whose clock values this server normalizes.
+    #[prost(double, tag="3")]
+    pub start_time: f64,
+    /// Offset into `audio_href` where the cue ends, in seconds.
+    #[prost(double, tag="4")]
+    pub end_time: f64,
+    /// The `<par>` element's `id`, empty when it had none.
+    #[prost(string, tag="5")]
+    pub identifier: ::prost::alloc::string::String,
+}
+/// MediaOverlay is one SMIL document's worth of cues.
+///
+/// Emitted once per overlay, after `info` and before the chapters, and only
+/// when `ParseOptions.parse_media_overlays` is set. The alignment is authored
+/// into the book by hand, so reading it costs one small XML parse and needs no
+/// speech recognition.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MediaOverlay {
+    /// Archive path of the SMIL document, resolved and normalized.
+    #[prost(string, tag="1")]
+    pub source_href: ::prost::alloc::string::String,
+    /// Archive path of the chapter this overlay narrates, taken from the manifest
+    /// item whose `media-overlay` attribute names it.
+    #[prost(string, tag="2")]
+    pub chapter_href: ::prost::alloc::string::String,
+    /// Every cue, in document order.
+    #[prost(message, repeated, tag="3")]
+    pub cues: ::prost::alloc::vec::Vec<MediaOverlayCue>,
 }
 /// ParseWarning is one non-fatal observation, carried on ParseStatus.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -439,7 +626,7 @@ pub struct ParseEpubResponse {
     /// Unknown variants must be ignored rather than treated as failures: this
     /// oneof is the extension point, and a later server may add events an older
     /// client has no name for.
-    #[prost(oneof="parse_epub_response::Event", tags="1, 2, 3, 4, 5")]
+    #[prost(oneof="parse_epub_response::Event", tags="1, 2, 3, 4, 5, 6, 7")]
     pub event: ::core::option::Option<parse_epub_response::Event>,
 }
 /// Nested message and enum types in `ParseEpubResponse`.
@@ -475,6 +662,16 @@ pub mod parse_epub_response {
         /// merge into them downstream.
         #[prost(message, tag="5")]
         Document(super::super::super::document::v1::Document),
+        /// The book's own table of contents, parsed from its navigation document
+        /// or its NCX. Emitted once, immediately after `info`, unless
+        /// `ParseOptions.parse_navigation` turned it off or the book has neither.
+        #[prost(message, tag="6")]
+        Navigation(super::Navigation),
+        /// One SMIL media overlay's cues. Emitted after `info` and before the
+        /// chapters, one event per narrated chapter, only when
+        /// `ParseOptions.parse_media_overlays` is set.
+        #[prost(message, tag="7")]
+        MediaOverlay(super::MediaOverlay),
     }
 }
 /// GetServiceInfoRequest asks for the server's build and limits. It carries no

@@ -265,6 +265,151 @@ pub fn with_stylesheet() -> Vec<u8> {
         .build()
 }
 
+/// Archive path of the EPUB 3 navigation document.
+pub const NAV: &str = "OEBPS/nav.xhtml";
+
+/// Archive path of the EPUB 2 NCX.
+pub const NCX: &str = "OEBPS/toc.ncx";
+
+/// Archive path of the first chapter's media overlay.
+pub const OVERLAY: &str = "OEBPS/overlays/chap1.smil";
+
+/// An EPUB 3 navigation document over the default book's two chapters.
+///
+/// The second chapter is nested under the first, so a test can tell a flat
+/// reading of the table of contents from a nested one.
+#[must_use]
+pub fn nav_xhtml() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Contents</title></head>
+<body>
+  <nav epub:type="toc">
+    <h1>Contents</h1>
+    <ol>
+      <li><a href="text/chap1.xhtml">Chapter One</a>
+        <ol><li><a href="text/chap2.xhtml#part2">Chapter Two</a></li></ol>
+      </li>
+    </ol>
+  </nav>
+</body></html>"#
+        .to_owned()
+}
+
+/// An EPUB 2 NCX over the same two chapters, nested the same way.
+#[must_use]
+pub fn ncx_xml() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <docTitle><text>A Tale of Two Chapters</text></docTitle>
+  <navMap>
+    <navPoint id="np1" playOrder="1">
+      <navLabel><text>Chapter One</text></navLabel>
+      <content src="text/chap1.xhtml"/>
+      <navPoint id="np2" playOrder="2">
+        <navLabel><text>Chapter Two</text></navLabel>
+        <content src="text/chap2.xhtml#part2"/>
+      </navPoint>
+    </navPoint>
+  </navMap>
+</ncx>"#
+        .to_owned()
+}
+
+/// A SMIL media overlay narrating the first chapter.
+#[must_use]
+pub fn smil_xml() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<smil xmlns="http://www.w3.org/ns/SMIL" version="3.0">
+  <body>
+    <seq id="s1">
+      <par id="p1">
+        <text src="../text/chap1.xhtml#s1"/>
+        <audio src="../audio/chap1.mp3" clipBegin="0:00:00.000" clipEnd="0:00:12.500"/>
+      </par>
+      <par id="p2">
+        <text src="../text/chap1.xhtml#s2"/>
+        <audio src="../audio/chap1.mp3" clipBegin="12.5s" clipEnd="20s"/>
+      </par>
+    </seq>
+  </body>
+</smil>"#
+        .to_owned()
+}
+
+/// The default book plus an EPUB 3 navigation document.
+#[must_use]
+pub fn with_nav() -> Vec<u8> {
+    shell()
+        .add(
+            OPF_PATH,
+            opf_xml(
+                &[("ch1", "text/chap1.xhtml"), ("ch2", "text/chap2.xhtml")],
+                &[
+                    ("cover-img", "images/cover.png", "image/png", "cover-image"),
+                    ("nav", "nav.xhtml", "application/xhtml+xml", "nav"),
+                ],
+            ),
+        )
+        .add(NAV, nav_xhtml())
+        .add(CHAP1, chapter_xhtml("Chapter One", "The first chapter."))
+        .add(CHAP2, chapter_xhtml("Chapter Two", "The second chapter."))
+        .add(COVER, IMAGE)
+        .build()
+}
+
+/// The default book plus an EPUB 2 NCX, found through `<spine toc="ncx">`.
+///
+/// No `nav` property anywhere, so this is the fallback path: a book that
+/// predates the navigation document entirely.
+#[must_use]
+pub fn with_ncx() -> Vec<u8> {
+    let manifest = "\
+    <item id=\"ch1\" href=\"text/chap1.xhtml\" media-type=\"application/xhtml+xml\"/>\n\
+    <item id=\"ch2\" href=\"text/chap2.xhtml\" media-type=\"application/xhtml+xml\"/>\n\
+    <item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>\n";
+    let opf = package(
+        manifest,
+        "    <itemref idref=\"ch1\"/>\n    <itemref idref=\"ch2\"/>\n",
+    )
+    .replace("<spine>", "<spine toc=\"ncx\">");
+
+    shell()
+        .add(OPF_PATH, opf)
+        .add(NCX, ncx_xml())
+        .add(CHAP1, chapter_xhtml("Chapter One", "The first chapter."))
+        .add(CHAP2, chapter_xhtml("Chapter Two", "The second chapter."))
+        .build()
+}
+
+/// The default book with the first chapter narrated by a media overlay.
+///
+/// The audio itself is a manifest entry the default options exclude, which is
+/// the point: the *alignment* is available without asking for the recording.
+#[must_use]
+pub fn narrated() -> Vec<u8> {
+    let manifest = "\
+    <item id=\"ch1\" href=\"text/chap1.xhtml\" media-type=\"application/xhtml+xml\" \
+     media-overlay=\"ov1\"/>\n\
+    <item id=\"ch2\" href=\"text/chap2.xhtml\" media-type=\"application/xhtml+xml\"/>\n\
+    <item id=\"ov1\" href=\"overlays/chap1.smil\" media-type=\"application/smil+xml\"/>\n\
+    <item id=\"aud1\" href=\"audio/chap1.mp3\" media-type=\"audio/mpeg\"/>\n";
+
+    shell()
+        .add(
+            OPF_PATH,
+            package(
+                manifest,
+                "    <itemref idref=\"ch1\"/>\n    <itemref idref=\"ch2\"/>\n",
+            ),
+        )
+        .add(OVERLAY, smil_xml())
+        .add(CHAP1, chapter_xhtml("Chapter One", "The first chapter."))
+        .add(CHAP2, chapter_xhtml("Chapter Two", "The second chapter."))
+        .add("OEBPS/audio/chap1.mp3", b"not really an mp3".to_vec())
+        .build()
+}
+
 /// A book of `count` chapters, each padded to roughly `size` bytes.
 ///
 /// Used by the streaming tests, where the point is that a chapter reaches the
@@ -546,6 +691,27 @@ pub fn documents(
         .collect()
 }
 
+/// The `navigation` event, when the stream carried one.
+#[must_use]
+pub fn navigation(events: &[pb::parse_epub_response::Event]) -> Option<&pb::Navigation> {
+    events.iter().find_map(|event| match event {
+        pb::parse_epub_response::Event::Navigation(navigation) => Some(navigation),
+        _ => None,
+    })
+}
+
+/// Every `media_overlay` event, in the order received.
+#[must_use]
+pub fn overlays(events: &[pb::parse_epub_response::Event]) -> Vec<&pb::MediaOverlay> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            pb::parse_epub_response::Event::MediaOverlay(overlay) => Some(overlay),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Every `resource` event, in the order received.
 #[must_use]
 pub fn resources(events: &[pb::parse_epub_response::Event]) -> Vec<&pb::Resource> {
@@ -570,6 +736,8 @@ pub fn shape(events: &[pb::parse_epub_response::Event]) -> Vec<&'static str> {
             pb::parse_epub_response::Event::Resource(_) => "resource",
             pb::parse_epub_response::Event::Status(_) => "status",
             pb::parse_epub_response::Event::Document(_) => "document",
+            pb::parse_epub_response::Event::Navigation(_) => "navigation",
+            pb::parse_epub_response::Event::MediaOverlay(_) => "media_overlay",
         })
         .collect()
 }

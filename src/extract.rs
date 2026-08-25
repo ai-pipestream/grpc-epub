@@ -9,8 +9,8 @@
 //! upload is therefore forced by the format, and no amount of protocol design
 //! removes it.
 //!
-//! What is not forced is buffering the *output*, and that is where Docling's
-//! EPUB backend and this one part company. Docling unpacks to a temp
+//! What is not forced is buffering the *output*, and that is where the usual
+//! EPUB reader and this one part company. That reader unpacks to a temp
 //! directory, runs every chapter through an HTML backend, and returns one
 //! document at the end. Here, `info` goes out as soon as the OPF is parsed —
 //! before a single chapter has been inflated — and each `chapter` goes out as
@@ -33,6 +33,14 @@
 //! The consequence for clients is stated on the `Resource` message: a chapter
 //! may reference a resource that has not arrived yet. Buffer by href and
 //! resolve when the stream ends.
+//!
+//! Two documents break that walk, and only those two: the navigation document
+//! and each media overlay have to be *read* before the chapters, because
+//! `navigation` and `media_overlay` are contracted to arrive before them. They
+//! are inflated once, held in [`Preread`], and handed back rather than
+//! re-inflated when the resource walk reaches their entries, so the budget
+//! counts each of them exactly once and their `resource` events still arrive
+//! in archive order like everything else.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -48,6 +56,7 @@ use crate::limits::Effective;
 use crate::metrics::Metrics;
 use crate::opf::{self, ManifestItem, Package};
 use crate::proto::v1 as pb;
+use crate::{nav, smil};
 
 /// Archive path of the container document, fixed by the EPUB specification.
 const CONTAINER_PATH: &str = "META-INF/container.xml";
@@ -141,6 +150,17 @@ impl Sink {
         }
     }
 
+    /// Tell the projection what the archive's bytes hash to.
+    ///
+    /// The hash is a fact about the upload rather than about any event, so it
+    /// reaches the fold here rather than riding on one. Called before the
+    /// first event; with no fold it does nothing.
+    pub fn set_source_hash(&self, hash: u64) {
+        if let Some(fold) = self.fold.as_ref() {
+            fold.borrow_mut().set_source_hash(hash);
+        }
+    }
+
     /// Send one event, folding it into the Document projection on the way.
     ///
     /// The trailer is the trigger: when `status` is emitted the fold has seen
@@ -209,6 +229,45 @@ struct Resolved<'a> {
     entry: Option<usize>,
     /// Whether the href was an absolute URI rather than an archive path.
     remote: bool,
+}
+
+/// Entries inflated ahead of the spine walk, held so they are not inflated
+/// twice.
+///
+/// The navigation document and the media overlays have to be read before the
+/// chapters in order to be emitted before them, but they are also ordinary
+/// manifest resources whose bytes go out when their archive entry is reached.
+/// Without this, each would be inflated once for parsing and once for
+/// emission, which would double what the book charges against the total
+/// decompression budget and make `ParseStatus.uncompressed_bytes` a number
+/// that answers no question.
+#[derive(Default)]
+struct Preread {
+    /// Inflated bytes by entry position.
+    entries: HashMap<usize, Vec<u8>>,
+}
+
+impl Preread {
+    /// Inflate an entry now, keeping the bytes for the walk that follows.
+    fn read(
+        &mut self,
+        archive: &mut MemoryArchive<'_>,
+        entries: &[EntryInfo],
+        entry: usize,
+        limits: &Effective,
+        budget: &mut Budget,
+        metrics: &Metrics,
+    ) -> Result<&[u8], Status> {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.entries.entry(entry) {
+            slot.insert(read_at(archive, &entries[entry], limits, budget, metrics)?);
+        }
+        Ok(&self.entries[&entry])
+    }
+
+    /// Hand back bytes already inflated for this entry, if there are any.
+    fn take(&mut self, entry: usize) -> Option<Vec<u8>> {
+        self.entries.remove(&entry)
+    }
 }
 
 /// Collects the non-fatal observations that end up on `ParseStatus`.
@@ -333,6 +392,10 @@ fn lookup(
 /// The whole parse, with every failure as a `?`.
 #[allow(clippy::too_many_lines)] // A pipeline; splitting it would hide the order.
 fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Result<(), Abort> {
+    // The whole archive is already in memory, so the integrity key costs one
+    // pass over bytes that have been paid for.
+    sink.set_source_hash(crate::document_fold::source_hash(bytes));
+
     let mut archive = archive::open(bytes, limits)?;
     let entries = archive::scan(&mut archive)?;
     let index: HashMap<String, usize> = entries
@@ -494,10 +557,11 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     // --- info ---------------------------------------------------------------
     let spine_ids: HashSet<usize> = spine.iter().map(|(position, _)| *position).collect();
     let cover_href = cover(&resolved, &package);
+    let navigation_source = navigation_source(&resolved, &by_id, &package);
     let info = pb::EpubInfo {
         title: package.metadata.title.clone(),
-        creators: package.metadata.creators.clone(),
-        contributors: package.metadata.contributors.clone(),
+        creators: names(&package.metadata.creators),
+        contributors: names(&package.metadata.contributors),
         language: package.metadata.language.clone(),
         identifiers: package
             .metadata
@@ -527,8 +591,119 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
         opf_href: opf_path.clone(),
         epub_version: package.version.clone(),
         cover_href,
+        metadata: package
+            .metadata
+            .entries
+            .iter()
+            .map(|entry| pb::MetadataEntry {
+                element: entry.element.clone(),
+                value: entry.value.clone(),
+                id: entry.id.clone(),
+                scheme: entry.scheme.clone(),
+                refinements: entry
+                    .refinements
+                    .iter()
+                    .map(|refinement| pb::MetadataRefinement {
+                        property: refinement.property.clone(),
+                        value: refinement.value.clone(),
+                        scheme: refinement.scheme.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        modified: package.metadata.modified.clone(),
+        nav_href: match &navigation_source {
+            Some(source) if !source.from_ncx => resolved[source.position].path.clone(),
+            _ => String::new(),
+        },
+        ncx_href: match &navigation_source {
+            Some(source) if source.from_ncx => resolved[source.position].path.clone(),
+            _ => String::new(),
+        },
     };
     sink.emit(pb::parse_epub_response::Event::Info(info))?;
+
+    // --- navigation and media overlays ---------------------------------------
+    //
+    // Both are contracted to arrive before the chapters, so both are inflated
+    // here and held in `preread` for the resource walk below to reuse.
+    let mut preread = Preread::default();
+    if limits.parse_navigation
+        && let Some(source) = &navigation_source
+    {
+        let target = &resolved[source.position];
+        let bytes = preread.read(
+            &mut archive,
+            &entries,
+            source.entry,
+            limits,
+            &mut budget,
+            metrics,
+        )?;
+        let parsed = if source.from_ncx {
+            nav::parse_ncx(bytes, &target.path)
+        } else {
+            nav::parse_nav(bytes, &target.path)
+        };
+        if parsed.is_empty() {
+            warnings.push(
+                pb::ParseWarningCode::Metadata,
+                &target.path,
+                "the navigation document named no entries this server could read",
+            );
+        } else {
+            sink.emit(pb::parse_epub_response::Event::Navigation(pb::Navigation {
+                source_href: parsed.source_href.clone(),
+                toc: parsed.toc.iter().map(nav_point).collect(),
+                from_ncx: parsed.from_ncx,
+            }))?;
+        }
+    }
+
+    let overlays = overlay_links(&resolved, &by_id);
+    if limits.parse_media_overlays {
+        for (position, overlay) in &overlays {
+            let Some(entry) = resolved[*overlay].entry else {
+                continue;
+            };
+            let path = resolved[*overlay].path.clone();
+            let bytes =
+                preread.read(&mut archive, &entries, entry, limits, &mut budget, metrics)?;
+            let parsed = smil::parse_overlay(bytes, &path);
+            if parsed.is_empty() {
+                warnings.push(
+                    pb::ParseWarningCode::Metadata,
+                    &path,
+                    "the media overlay declared no cues this server could read",
+                );
+                continue;
+            }
+            sink.emit(pb::parse_epub_response::Event::MediaOverlay(
+                pb::MediaOverlay {
+                    source_href: parsed.source_href.clone(),
+                    chapter_href: resolved[*position].path.clone(),
+                    cues: parsed
+                        .cues
+                        .iter()
+                        .map(|cue| pb::MediaOverlayCue {
+                            text_href: cue.text_href.clone(),
+                            audio_href: cue.audio_href.clone(),
+                            start_time: cue.start_time,
+                            end_time: cue.end_time,
+                            identifier: cue.identifier.clone(),
+                        })
+                        .collect(),
+                },
+            ))?;
+        }
+    }
+    let overlay_href = |position: usize| -> String {
+        overlays
+            .iter()
+            .find(|(owner, _)| *owner == position)
+            .map(|(_, overlay)| resolved[*overlay].path.clone())
+            .unwrap_or_default()
+    };
 
     // --- Plan the resource interleave ---------------------------------------
     let mut pending: Vec<usize> = Vec::new();
@@ -591,10 +766,13 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
 
         while pending.peek().is_some_and(|entry| *entry < chapter_entry) {
             let entry = pending.next().expect("peeked");
+            let position = position_of_entry[&entry];
             emit_resource(
                 &mut archive,
                 &entries[entry],
-                &resolved[position_of_entry[&entry]],
+                &resolved[position],
+                &overlay_href(position),
+                preread.take(entry),
                 limits,
                 &mut budget,
                 metrics,
@@ -618,16 +796,20 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             content,
             linear: itemref.linear,
             properties: target.item.properties.clone(),
+            media_overlay_href: overlay_href(*position),
         }))?;
         metrics.chapter_emitted();
         chapters += 1;
     }
 
     for entry in pending {
+        let position = position_of_entry[&entry];
         emit_resource(
             &mut archive,
             &entries[entry],
-            &resolved[position_of_entry[&entry]],
+            &resolved[position],
+            &overlay_href(position),
+            preread.take(entry),
             limits,
             &mut budget,
             metrics,
@@ -646,6 +828,88 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
         warnings: warnings.entries,
     }))?;
     Ok(())
+}
+
+/// Where a book's navigation lives, and which dialect it is written in.
+struct NavigationSource {
+    /// Position in the resolved manifest.
+    position: usize,
+    /// Position in the archive's entry list.
+    entry: usize,
+    /// Whether this is an EPUB 2 NCX rather than an EPUB 3 nav document.
+    from_ncx: bool,
+}
+
+/// Locate the book's navigation document.
+///
+/// The EPUB 3 nav document wins over the NCX when a book ships both, which
+/// most EPUB 3 books do for backward compatibility: the nav document is the
+/// richer of the two and the NCX in those books is generated from it.
+fn navigation_source(
+    resolved: &[Resolved<'_>],
+    by_id: &HashMap<&str, usize>,
+    package: &Package,
+) -> Option<NavigationSource> {
+    let nav = resolved.iter().position(|target| {
+        target
+            .item
+            .properties
+            .iter()
+            .any(|property| property == "nav")
+    });
+    if let Some(position) = nav
+        && let Some(entry) = resolved[position].entry
+    {
+        return Some(NavigationSource {
+            position,
+            entry,
+            from_ncx: false,
+        });
+    }
+
+    // EPUB 2 gives the NCX no manifest property; `<spine toc="…">` is the only
+    // pointer to it.
+    let position = *by_id.get(package.toc_idref.as_str())?;
+    let entry = resolved[position].entry?;
+    Some(NavigationSource {
+        position,
+        entry,
+        from_ncx: true,
+    })
+}
+
+/// Every `(narrated item, its overlay)` pair the manifest declares.
+///
+/// Both halves are manifest positions. The `media-overlay` attribute names an
+/// item `id`, so an attribute pointing at nothing yields no pair rather than a
+/// dangling one.
+fn overlay_links(resolved: &[Resolved<'_>], by_id: &HashMap<&str, usize>) -> Vec<(usize, usize)> {
+    resolved
+        .iter()
+        .enumerate()
+        .filter_map(|(position, target)| {
+            let overlay = *by_id.get(target.item.media_overlay.as_str())?;
+            Some((position, overlay))
+        })
+        .collect()
+}
+
+/// The display names of a list of credited contributors.
+fn names(contributors: &[opf::Contributor]) -> Vec<String> {
+    contributors
+        .iter()
+        .map(|contributor| contributor.name.clone())
+        .collect()
+}
+
+/// One navigation entry, and everything under it, on the wire.
+fn nav_point(point: &nav::NavPoint) -> pb::NavPoint {
+    pb::NavPoint {
+        label: point.label.clone(),
+        href: point.href.clone(),
+        depth: u32::try_from(point.depth).unwrap_or(u32::MAX),
+        children: point.children.iter().map(nav_point).collect(),
+    }
 }
 
 /// Find the cover image's archive path, if the book names one.
@@ -672,16 +936,26 @@ fn cover(resolved: &[Resolved<'_>], package: &Package) -> String {
 }
 
 /// Inflate an entry and send it as a `resource` event.
+///
+/// `preread` carries bytes already inflated for this entry, if the navigation
+/// or media-overlay pass needed them before the walk reached it. Reusing them
+/// keeps every entry charged to the decompression budget exactly once.
+#[allow(clippy::too_many_arguments)] // One call site; each argument is a distinct concern.
 fn emit_resource(
     archive: &mut MemoryArchive<'_>,
     entry: &EntryInfo,
     target: &Resolved<'_>,
+    media_overlay_href: &str,
+    preread: Option<Vec<u8>>,
     limits: &Effective,
     budget: &mut Budget,
     metrics: &Metrics,
     sink: &Sink,
 ) -> Result<(), Abort> {
-    let content = read_at(archive, entry, limits, budget, metrics)?;
+    let content = match preread {
+        Some(bytes) => bytes,
+        None => read_at(archive, entry, limits, budget, metrics)?,
+    };
     sink.emit(pb::parse_epub_response::Event::Resource(pb::Resource {
         href: target.path.clone(),
         media_type: target.item.media_type.clone(),
@@ -689,6 +963,7 @@ fn emit_resource(
         content,
         manifest_id: target.item.id.clone(),
         properties: target.item.properties.clone(),
+        media_overlay_href: media_overlay_href.to_owned(),
     }))?;
     metrics.resource_emitted();
     Ok(())

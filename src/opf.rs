@@ -81,6 +81,15 @@ pub struct ManifestItem {
     pub media_type: String,
     /// EPUB 3 `properties` tokens, whitespace-split. Empty for EPUB 2.
     pub properties: Vec<String>,
+    /// The `media-overlay` attribute: the `id` of the manifest item holding
+    /// this item's SMIL narration. Empty when the item has no overlay.
+    ///
+    /// This attribute is the *only* link an EPUB draws between a chapter and
+    /// the recorded reading of it. Dropping it severs the connection at the
+    /// packaging layer, before anything downstream gets to decide what to do
+    /// with the alignment, so it is read here even though the SMIL itself is
+    /// parsed elsewhere.
+    pub media_overlay: String,
 }
 
 /// One `<itemref>` of the OPF spine: a position in reading order.
@@ -103,17 +112,97 @@ pub struct Identifier {
     pub scheme: String,
 }
 
+/// One EPUB 3 `<meta refines="#id" property="p">v</meta>`, or the EPUB 2
+/// attribute that plays the same role.
+///
+/// Refinements are how EPUB 3 says everything interesting about a metadata
+/// element: which creator is the author and which the illustrator, how to sort
+/// a name, whether a title is the main one or a subtitle. The two dialects
+/// spell it differently (`opf:role` on the element in EPUB 2, a refining
+/// `<meta>` in EPUB 3) and both land here, so consumers never have to know
+/// which one the producer used.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Refinement {
+    /// The `property` name: `role`, `file-as`, `title-type`, `identifier-type`.
+    pub property: String,
+    /// The refinement's value.
+    pub value: String,
+    /// The `scheme` attribute, naming the vocabulary `value` is drawn from.
+    pub scheme: String,
+}
+
+/// One metadata element, verbatim, with whatever refines it.
+///
+/// The typed fields on [`Metadata`] are a reading of these; this is the record
+/// they were read from. Keeping it means a consumer that wants an element this
+/// service has no opinion about does not need this service to grow an opinion
+/// first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MetaEntry {
+    /// Local name for a Dublin Core element (`title`, `rights`), or the
+    /// `property` for a bare EPUB 3 `<meta>` (`dcterms:modified`).
+    pub element: String,
+    /// The element's text content, verbatim and trimmed.
+    pub value: String,
+    /// The `id` attribute, empty when absent. Refinements name this.
+    pub id: String,
+    /// EPUB 2's `opf:scheme` attribute, empty when absent.
+    pub scheme: String,
+    /// Everything refining this element, in document order.
+    pub refinements: Vec<Refinement>,
+}
+
+impl MetaEntry {
+    /// The value of the first refinement with this property, or `""`.
+    #[must_use]
+    pub fn refined(&self, property: &str) -> &str {
+        self.refinements
+            .iter()
+            .find(|refinement| refinement.property == property)
+            .map_or("", |refinement| refinement.value.as_str())
+    }
+}
+
+/// A person or organization the OPF credits, with the role it credits them in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Contributor {
+    /// The element's text content: the name as the book displays it.
+    pub name: String,
+    /// MARC relator code from a `role` refinement (`aut`, `ill`, `trl`), or
+    /// EPUB 2's `opf:role`. Empty when the book did not say.
+    pub role: String,
+    /// Sort form from a `file-as` refinement or EPUB 2's `opf:file-as`
+    /// (`Lovelace, Ada`). Empty when the book did not say.
+    pub file_as: String,
+}
+
+/// One `<dc:title>` with the role EPUB 3 gives it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Title {
+    /// The title text.
+    pub value: String,
+    /// A `title-type` refinement: `main`, `subtitle`, `collection`, `edition`.
+    /// Empty when the book did not say, which is every EPUB 2 book.
+    pub title_type: String,
+}
+
 /// The Dublin Core metadata of an OPF package document.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Metadata {
-    /// The first `dc:title`.
+    /// The title marked `main` by a refinement, or the first `dc:title` when
+    /// none is marked.
     pub title: String,
-    /// Every `dc:creator`, in document order.
-    pub creators: Vec<String>,
-    /// Every `dc:contributor`, in document order.
-    pub contributors: Vec<String>,
+    /// Every `dc:title`, in document order, with its declared type.
+    pub titles: Vec<Title>,
+    /// Every `dc:creator`, in document order, with role and sort name.
+    pub creators: Vec<Contributor>,
+    /// Every `dc:contributor`, in document order, with role and sort name.
+    pub contributors: Vec<Contributor>,
     /// The first `dc:language`.
     pub language: String,
+    /// Every `dc:language`, in document order. A bilingual edition declares
+    /// more than one and the first alone misrepresents it.
+    pub languages: Vec<String>,
     /// Every `dc:identifier`, in document order.
     pub identifiers: Vec<Identifier>,
     /// The first `dc:publisher`.
@@ -122,10 +211,29 @@ pub struct Metadata {
     pub description: String,
     /// The first `dc:date`, verbatim.
     pub date: String,
+    /// `<meta property="dcterms:modified">`, verbatim. Mandatory in EPUB 3 and
+    /// the natural freshness signal for anything that re-crawls a book.
+    pub modified: String,
     /// Every `dc:subject`, in document order.
     pub subjects: Vec<String>,
+    /// The first `dc:rights`.
+    pub rights: String,
+    /// The first `dc:source`.
+    pub source: String,
+    /// The first `dc:type`.
+    pub resource_type: String,
+    /// The first `dc:format`.
+    pub format: String,
+    /// The first `dc:coverage`.
+    pub coverage: String,
+    /// The first `dc:relation`.
+    pub relation: String,
     /// The manifest item id from EPUB 2's `<meta name="cover" content="…">`.
     pub cover_id: String,
+    /// Every metadata element the parser kept, in document order, with its
+    /// refinements attached. The lossless tail the typed fields above are a
+    /// reading of.
+    pub entries: Vec<MetaEntry>,
 }
 
 /// A parsed OPF package document.
@@ -141,6 +249,9 @@ pub struct Package {
     pub manifest: Vec<ManifestItem>,
     /// Every spine itemref, in reading order.
     pub spine: Vec<SpineItem>,
+    /// The `<spine toc="…">` attribute: the manifest `id` of the EPUB 2 NCX.
+    /// Empty for a book that ships only an EPUB 3 nav document.
+    pub toc_idref: String,
 }
 
 /// Build a reader with the settings both documents are parsed under.
@@ -295,6 +406,11 @@ enum Section {
 }
 
 /// The Dublin Core elements whose text content is worth keeping.
+///
+/// All fifteen of the Dublin Core Metadata Element Set that an OPF may carry.
+/// The list used to stop at nine, which dropped rights, source, type, format,
+/// coverage and relation on the floor; `dc:rights` in particular is the one an
+/// ingest pipeline is asked about, and keeping an element costs a match arm.
 const DUBLIN_CORE: &[&[u8]] = &[
     b"title",
     b"creator",
@@ -305,13 +421,30 @@ const DUBLIN_CORE: &[&[u8]] = &[
     b"description",
     b"date",
     b"subject",
+    b"rights",
+    b"source",
+    b"type",
+    b"format",
+    b"coverage",
+    b"relation",
 ];
+
+/// A metadata element whose text is still being collected.
+struct Pending {
+    /// Local name of the element, so the matching end tag can be recognized.
+    local: Vec<u8>,
+    /// The entry as far as its start tag described it.
+    entry: MetaEntry,
+    /// The `refines` target with its leading `#` removed. Non-empty only for a
+    /// refining `<meta>`, which becomes a [`Refinement`] rather than an entry.
+    refines: String,
+}
 
 /// Streaming state for one package document.
 ///
 /// A struct rather than a pile of locals because the event loop has to hand
-/// the same six pieces of state to the start, end and text arms, and threading
-/// them through free functions reads worse than owning them.
+/// the same state to the start, end and text arms, and threading it through
+/// free functions reads worse than owning it.
 #[derive(Default)]
 struct PackageParser {
     /// What has been recognized so far.
@@ -324,11 +457,17 @@ struct PackageParser {
     depth: usize,
     /// The depth of the element that opened the current section.
     section_depth: usize,
-    /// Local name of the metadata element currently collecting text, with the
-    /// attributes read from its start tag.
-    collecting: Option<(Vec<u8>, Identifier)>,
+    /// The metadata element currently collecting text.
+    collecting: Option<Pending>,
     /// Text collected for `collecting`.
     text: Text,
+    /// Refinements as `(refines target, refinement)`, held until the whole
+    /// metadata block has been read.
+    ///
+    /// A refinement may appear before or after the element it names, so they
+    /// cannot be attached while streaming; the EPUB specification puts no
+    /// ordering constraint on them and real books use both orders.
+    refinements: Vec<(String, Refinement)>,
 }
 
 impl PackageParser {
@@ -354,7 +493,12 @@ impl PackageParser {
             Section::Outside if !empty => match name {
                 b"metadata" => self.enter(Section::Metadata),
                 b"manifest" => self.enter(Section::Manifest),
-                b"spine" => self.enter(Section::Spine),
+                b"spine" => {
+                    // `toc` names the NCX, which is the only way to find it in
+                    // an EPUB 2 book: the manifest gives it no property.
+                    self.package.toc_idref = attribute(start, "toc");
+                    self.enter(Section::Spine);
+                }
                 _ => {}
             },
             Section::Outside => {}
@@ -369,6 +513,7 @@ impl PackageParser {
                             .split_whitespace()
                             .map(str::to_owned)
                             .collect(),
+                        media_overlay: attribute(start, "media-overlay"),
                     });
                 }
             }
@@ -394,7 +539,7 @@ impl PackageParser {
 
     /// Handle a start tag inside `<metadata>`.
     fn open_metadata(&mut self, start: &BytesStart<'_>, name: &[u8], empty: bool) {
-        if name == b"meta" {
+        let pending = if name == b"meta" {
             // EPUB 2's cover convention. EPUB 3 uses a manifest property
             // instead, which the manifest arm already collects.
             if attribute(start, "name").eq_ignore_ascii_case("cover") {
@@ -402,23 +547,55 @@ impl PackageParser {
                 if !content.is_empty() && self.package.metadata.cover_id.is_empty() {
                     self.package.metadata.cover_id = content;
                 }
+                return;
             }
+            // EPUB 3's `<meta property="…">`, which is both the refinement
+            // mechanism and the home of package-level properties such as
+            // `dcterms:modified`. A `<meta>` with neither `name` nor
+            // `property` says nothing anyone can read.
+            let property = attribute(start, "property");
+            if property.is_empty() {
+                return;
+            }
+            Pending {
+                local: name.to_vec(),
+                entry: MetaEntry {
+                    element: property,
+                    id: attribute(start, "id"),
+                    scheme: attribute(start, "scheme"),
+                    ..MetaEntry::default()
+                },
+                refines: attribute(start, "refines")
+                    .trim_start_matches('#')
+                    .to_owned(),
+            }
+        } else if DUBLIN_CORE.contains(&name) {
+            Pending {
+                local: name.to_vec(),
+                entry: MetaEntry {
+                    element: String::from_utf8_lossy(name).into_owned(),
+                    id: attribute(start, "id"),
+                    scheme: attribute(start, "scheme"),
+                    // EPUB 2 spells role and sort name as attributes on the
+                    // element rather than as refining `<meta>` elements. Both
+                    // dialects land in `refinements` so nothing downstream has
+                    // to know which one the producer used.
+                    refinements: epub2_refinements(start),
+                    ..MetaEntry::default()
+                },
+                refines: String::new(),
+            }
+        } else {
             return;
-        }
-        if !DUBLIN_CORE.contains(&name) {
-            return;
-        }
-        let identifier = Identifier {
-            value: String::new(),
-            id: attribute(start, "id"),
-            scheme: attribute(start, "scheme"),
         };
+
         self.text.take();
         if empty {
-            // `<dc:title/>`: no text will follow, so close it now.
-            self.store(name, identifier, String::new());
+            // `<dc:title/>` or `<meta property="…"/>`: no text will follow, so
+            // close it now.
+            self.store(pending, String::new());
         } else {
-            self.collecting = Some((name.to_vec(), identifier));
+            self.collecting = Some(pending);
         }
     }
 
@@ -427,11 +604,11 @@ impl PackageParser {
         let closes_collection = self
             .collecting
             .as_ref()
-            .is_some_and(|(element, _)| element.as_slice() == name);
+            .is_some_and(|pending| pending.local.as_slice() == name);
         if closes_collection {
-            let (element, identifier) = self.collecting.take().expect("just matched");
+            let pending = self.collecting.take().expect("just matched");
             let value = self.text.take();
-            self.store(&element, identifier, value);
+            self.store(pending, value);
         }
         if self.section != Section::Outside && self.depth == self.section_depth {
             self.section = Section::Outside;
@@ -439,29 +616,147 @@ impl PackageParser {
         self.depth = self.depth.saturating_sub(1);
     }
 
-    /// File one Dublin Core value.
-    ///
-    /// Repeatable elements append; single-valued ones keep the first, because
-    /// EPUB 3 permits several titles with `<meta refines>` naming their roles
-    /// and picking the last would silently prefer a subtitle over a title.
-    fn store(&mut self, element: &[u8], mut identifier: Identifier, value: String) {
-        let metadata = &mut self.package.metadata;
-        match element {
-            b"title" if metadata.title.is_empty() => metadata.title = value,
-            b"creator" => metadata.creators.push(value),
-            b"contributor" => metadata.contributors.push(value),
-            b"language" if metadata.language.is_empty() => metadata.language = value,
-            b"identifier" => {
-                identifier.value = value;
-                metadata.identifiers.push(identifier);
-            }
-            b"publisher" if metadata.publisher.is_empty() => metadata.publisher = value,
-            b"description" if metadata.description.is_empty() => metadata.description = value,
-            b"date" if metadata.date.is_empty() => metadata.date = value,
-            b"subject" => metadata.subjects.push(value),
-            _ => {}
+    /// File one finished metadata element, or hold it as a refinement.
+    fn store(&mut self, pending: Pending, value: String) {
+        let Pending {
+            entry,
+            refines,
+            local: _,
+        } = pending;
+        if refines.is_empty() {
+            self.package
+                .metadata
+                .entries
+                .push(MetaEntry { value, ..entry });
+        } else {
+            self.refinements.push((
+                refines,
+                Refinement {
+                    property: entry.element,
+                    value,
+                    scheme: entry.scheme,
+                },
+            ));
         }
     }
+
+    /// Attach refinements to what they refine, then read the typed fields out.
+    ///
+    /// Deferred to the end because a refinement may precede or follow its
+    /// target, so no single-pass reading of `<metadata>` can resolve one as it
+    /// arrives.
+    fn finish_metadata(&mut self) {
+        for (target, refinement) in std::mem::take(&mut self.refinements) {
+            if let Some(entry) = self
+                .package
+                .metadata
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == target)
+            {
+                entry.refinements.push(refinement);
+            }
+        }
+        derive(&mut self.package.metadata);
+    }
+}
+
+/// The EPUB 2 refinement attributes, as the refinements they are equivalent to.
+fn epub2_refinements(start: &BytesStart<'_>) -> Vec<Refinement> {
+    [("role", "role"), ("file-as", "file-as")]
+        .into_iter()
+        .filter_map(|(attribute_name, property)| {
+            let value = attribute(start, attribute_name);
+            (!value.is_empty()).then(|| Refinement {
+                property: property.to_owned(),
+                value,
+                scheme: String::new(),
+            })
+        })
+        .collect()
+}
+
+/// Read the typed metadata fields out of the collected entries.
+///
+/// Repeatable elements keep every value; single-valued ones keep the first,
+/// which is the reading every EPUB reader implements for a book that declares
+/// two publishers.
+fn derive(metadata: &mut Metadata) {
+    /// The first entry with this element name, or `""`.
+    fn first<'a>(entries: &'a [MetaEntry], element: &str) -> &'a str {
+        entries
+            .iter()
+            .find(|entry| entry.element == element)
+            .map_or("", |entry| entry.value.as_str())
+    }
+    /// Every value with this element name, in document order.
+    fn every(entries: &[MetaEntry], element: &str) -> Vec<String> {
+        entries
+            .iter()
+            .filter(|entry| entry.element == element)
+            .map(|entry| entry.value.clone())
+            .collect()
+    }
+    /// Every entry with this element name, read as a credited contributor.
+    fn credited(entries: &[MetaEntry], element: &str) -> Vec<Contributor> {
+        entries
+            .iter()
+            .filter(|entry| entry.element == element)
+            .map(|entry| Contributor {
+                name: entry.value.clone(),
+                role: entry.refined("role").to_owned(),
+                file_as: entry.refined("file-as").to_owned(),
+            })
+            .collect()
+    }
+
+    let entries = std::mem::take(&mut metadata.entries);
+
+    metadata.titles = entries
+        .iter()
+        .filter(|entry| entry.element == "title")
+        .map(|entry| Title {
+            value: entry.value.clone(),
+            title_type: entry.refined("title-type").to_owned(),
+        })
+        .collect();
+    // A book that marks one of several titles `main` means it; a book that
+    // marks none is answered by document order, which is what EPUB 2 had.
+    metadata.title = metadata
+        .titles
+        .iter()
+        .find(|title| title.title_type == "main")
+        .or_else(|| metadata.titles.first())
+        .map(|title| title.value.clone())
+        .unwrap_or_default();
+
+    metadata.creators = credited(&entries, "creator");
+    metadata.contributors = credited(&entries, "contributor");
+    metadata.languages = every(&entries, "language");
+    metadata.language = metadata.languages.first().cloned().unwrap_or_default();
+    metadata.subjects = every(&entries, "subject");
+    metadata.identifiers = entries
+        .iter()
+        .filter(|entry| entry.element == "identifier")
+        .map(|entry| Identifier {
+            value: entry.value.clone(),
+            id: entry.id.clone(),
+            scheme: entry.scheme.clone(),
+        })
+        .collect();
+
+    metadata.publisher = first(&entries, "publisher").to_owned();
+    metadata.description = first(&entries, "description").to_owned();
+    metadata.date = first(&entries, "date").to_owned();
+    metadata.modified = first(&entries, "dcterms:modified").to_owned();
+    metadata.rights = first(&entries, "rights").to_owned();
+    metadata.source = first(&entries, "source").to_owned();
+    metadata.resource_type = first(&entries, "type").to_owned();
+    metadata.format = first(&entries, "format").to_owned();
+    metadata.coverage = first(&entries, "coverage").to_owned();
+    metadata.relation = first(&entries, "relation").to_owned();
+
+    metadata.entries = entries;
 }
 
 /// Parse an OPF package document.
@@ -504,6 +799,7 @@ pub fn parse_package(bytes: &[u8]) -> Result<Package, XmlError> {
     if parser.package.spine.is_empty() {
         return Err(XmlError::EmptySpine);
     }
+    parser.finish_metadata();
     Ok(parser.package)
 }
 
@@ -566,8 +862,13 @@ mod tests {
 
         let metadata = &package.metadata;
         assert_eq!(metadata.title, "A Tale of Two Chapters");
-        assert_eq!(metadata.creators, ["Ada Lovelace", "Charles Babbage"]);
-        assert_eq!(metadata.contributors, ["The Typesetter"]);
+        let names: Vec<&str> = metadata
+            .creators
+            .iter()
+            .map(|creator| creator.name.as_str())
+            .collect();
+        assert_eq!(names, ["Ada Lovelace", "Charles Babbage"]);
+        assert_eq!(metadata.contributors[0].name, "The Typesetter");
         assert_eq!(metadata.language, "en-GB");
         assert_eq!(metadata.description, "Short & sweet");
         assert_eq!(metadata.date, "1843-10-01");
@@ -585,6 +886,112 @@ mod tests {
         assert_eq!(package.spine[0].idref, "ch1");
         assert!(package.spine[0].linear, "absent linear means linear");
         assert!(!package.spine[1].linear, "linear=\"no\" is auxiliary");
+        assert_eq!(package.toc_idref, "ncx", "the spine names the EPUB 2 NCX");
+    }
+
+    /// EPUB 3 metadata expression: refinements before and after their target,
+    /// a main title that is not the first, and the six Dublin Core elements
+    /// the old nine-element allow-list walked past.
+    const EXPRESSIVE: &[u8] = br##"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <meta refines="#t-main" property="title-type">main</meta>
+    <dc:title id="t-sub">Being an Account of Two Chapters</dc:title>
+    <meta refines="#t-sub" property="title-type">subtitle</meta>
+    <dc:title id="t-main">A Tale of Two Chapters</dc:title>
+    <dc:creator id="c1">Ada Lovelace</dc:creator>
+    <meta refines="#c1" property="role" scheme="marc:relators">aut</meta>
+    <meta refines="#c1" property="file-as">Lovelace, Ada</meta>
+    <dc:creator id="c2">Charles Babbage</dc:creator>
+    <meta refines="#c2" property="role">ill</meta>
+    <dc:language>en-GB</dc:language>
+    <dc:language>fr</dc:language>
+    <dc:identifier id="bookid">urn:isbn:9780000000000</dc:identifier>
+    <dc:rights>Public domain</dc:rights>
+    <dc:source>urn:isbn:9781111111111</dc:source>
+    <dc:type>monograph</dc:type>
+    <dc:format>application/epub+zip</dc:format>
+    <dc:coverage>England, 1843</dc:coverage>
+    <dc:relation>urn:isbn:9782222222222</dc:relation>
+    <meta property="dcterms:modified">2026-08-25T00:00:00Z</meta>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="c1.xhtml" media-type="application/xhtml+xml" media-overlay="ov1"/>
+    <item id="ov1" href="c1.smil" media-type="application/smil+xml"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"##;
+
+    #[test]
+    fn refinements_attach_whichever_side_of_their_target_they_sit_on() {
+        let metadata = parse_package(EXPRESSIVE).unwrap().metadata;
+
+        assert_eq!(
+            metadata.title, "A Tale of Two Chapters",
+            "the title marked `main` wins over the one that merely came first"
+        );
+        assert_eq!(metadata.titles.len(), 2);
+        assert_eq!(metadata.titles[0].title_type, "subtitle");
+        assert_eq!(metadata.titles[1].title_type, "main");
+
+        // `#c1` is refined by elements that follow it, `#t-main` by one that
+        // precedes it. Both must resolve.
+        assert_eq!(metadata.creators[0].role, "aut");
+        assert_eq!(metadata.creators[0].file_as, "Lovelace, Ada");
+        assert_eq!(metadata.creators[1].role, "ill");
+        assert_eq!(
+            metadata.creators[1].file_as, "",
+            "a refinement the book omitted stays empty rather than guessed"
+        );
+    }
+
+    #[test]
+    fn the_dublin_core_tail_survives_the_allow_list() {
+        let metadata = parse_package(EXPRESSIVE).unwrap().metadata;
+        assert_eq!(metadata.rights, "Public domain");
+        assert_eq!(metadata.source, "urn:isbn:9781111111111");
+        assert_eq!(metadata.resource_type, "monograph");
+        assert_eq!(metadata.format, "application/epub+zip");
+        assert_eq!(metadata.coverage, "England, 1843");
+        assert_eq!(metadata.relation, "urn:isbn:9782222222222");
+        assert_eq!(metadata.modified, "2026-08-25T00:00:00Z");
+        assert_eq!(
+            metadata.languages,
+            ["en-GB", "fr"],
+            "a bilingual edition declares both and the first alone misreports it"
+        );
+    }
+
+    #[test]
+    fn the_manifest_keeps_the_link_from_a_chapter_to_its_narration() {
+        let package = parse_package(EXPRESSIVE).unwrap();
+        assert_eq!(package.manifest[0].media_overlay, "ov1");
+        assert_eq!(
+            package.manifest[1].media_overlay, "",
+            "the overlay itself has none"
+        );
+    }
+
+    #[test]
+    fn epub2_role_attributes_read_as_the_refinements_they_are() {
+        let epub2 = br#"<package xmlns:opf="http://www.idpf.org/2007/opf" version="2.0">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <dc:creator opf:role="aut" opf:file-as="Lovelace, Ada">Ada Lovelace</dc:creator>
+</metadata><spine><itemref idref="a"/></spine></package>"#;
+        let metadata = parse_package(epub2).unwrap().metadata;
+        assert_eq!(metadata.creators[0].role, "aut");
+        assert_eq!(metadata.creators[0].file_as, "Lovelace, Ada");
+    }
+
+    #[test]
+    fn a_refinement_naming_nothing_is_dropped_rather_than_guessed_at() {
+        let dangling = br##"<package version="3.0"><metadata>
+  <dc:title id="t">Only Title</dc:title>
+  <meta refines="#nobody" property="title-type">main</meta>
+</metadata><spine><itemref idref="a"/></spine></package>"##;
+        let metadata = parse_package(dangling).unwrap().metadata;
+        assert_eq!(metadata.title, "Only Title");
+        assert_eq!(metadata.titles[0].title_type, "");
     }
 
     #[test]

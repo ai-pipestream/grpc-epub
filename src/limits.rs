@@ -183,6 +183,8 @@ impl Limits {
             include_stylesheets: options.include_stylesheets.unwrap_or(false),
             include_all_resources: options.include_all_resources.unwrap_or(false),
             emit_document: options.emit_document,
+            parse_navigation: options.parse_navigation.unwrap_or(true),
+            parse_media_overlays: options.parse_media_overlays.unwrap_or(false),
         }
     }
 
@@ -233,6 +235,14 @@ pub struct Effective {
     /// adds to the stream rather than trimming it, and it lives here because
     /// this is what one call's settings are.
     pub emit_document: bool,
+    /// Whether the navigation document or NCX is parsed into a `navigation`
+    /// event and into the Document's outline. On unless refused: the bytes are
+    /// inflated either way, so the only new cost is one small XML parse.
+    pub parse_navigation: bool,
+    /// Whether each SMIL media overlay is parsed into a `media_overlay` event.
+    /// Off unless asked for: overlays are one file per chapter and none of
+    /// them is inflated otherwise.
+    pub parse_media_overlays: bool,
 }
 
 impl Default for Effective {
@@ -255,6 +265,14 @@ mod tests {
         assert!(
             !effective.include_stylesheets,
             "css is off unless asked for"
+        );
+        assert!(
+            effective.parse_navigation,
+            "the table of contents is read unless refused"
+        );
+        assert!(
+            !effective.parse_media_overlays,
+            "overlays cost one inflate per chapter, so they are opt-in"
         );
     }
 

@@ -129,6 +129,8 @@ async fn the_stream_is_not_a_batch() {
                 pb::parse_epub_response::Event::Resource(_) => "resource",
                 pb::parse_epub_response::Event::Status(_) => "status",
                 pb::parse_epub_response::Event::Document(_) => "document",
+                pb::parse_epub_response::Event::Navigation(_) => "navigation",
+                pb::parse_epub_response::Event::MediaOverlay(_) => "media_overlay",
             },
         );
     }
