@@ -191,6 +191,9 @@ impl DocumentFold {
             binary_hash: 0,
             filename: String::new(),
             uri: None,
+            // Retrieval provenance belongs to a crawler; this service is
+            // handed an archive over gRPC and never fetches anything.
+            web: None,
         });
 
         // Everything the OPF said, under `epub.` keys, because none of it has
@@ -279,6 +282,9 @@ impl DocumentFold {
             // items are matched back to.
             name: Some(chapter.href.clone()),
             label: doc::GroupLabel::Chapter as i32,
+            // The typed label says everything; the raw fallback is for
+            // vocabularies this schema does not enumerate.
+            label_raw: None,
         });
         self.link_child(BODY_REF, &self_ref);
     }

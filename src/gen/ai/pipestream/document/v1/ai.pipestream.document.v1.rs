@@ -3,9 +3,21 @@
 // Pipestream document structure.
 //
 // This proto defines the complete structure of a parsed document. The schema
-// tracks field-for-field parity with the docling-core v2 JSON schema so that
-// documents interoperate with that ecosystem; parity is maintained by review,
-// and "upstream" in comments below refers to that schema.
+// is the upstream document v2 JSON schema mirrored field for field, plus the
+// documented extensions this repo adds on top of it; every extension is
+// called out at its own field and is additive, so removing them all yields a
+// document the upstream dialect can express. The mirror is maintained by
+// review, and "upstream" in comments below refers to that schema.
+//
+// Field-number policy:
+// - `custom_fields` is pinned at 100 in every message that carries one, so
+//    the escape hatch sits at the same number wherever a reader looks for it.
+// - Extension fields are appended after the numbers the upstream mirror
+//    occupies, never interleaved with them, so an upstream addition lands on
+//    the number upstream chose.
+// - Numbers are never reused. No field in this file has ever been removed,
+//    which is why there are no `reserved` ranges to guard; the day one is,
+//    its number and name go into a `reserved` statement in the same change.
 //
 // Document Structure Overview:
 // ===========================
@@ -22,7 +34,10 @@
 /// Document is the root message representing a complete parsed document.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Document {
-    /// Schema identifier for versioning (e.g., "docling_document_v2", kept for upstream interop)
+    /// Schema identifier for versioning (e.g., "docling_document_v2"). Producers
+    /// stamp it, but upstream interop does not run through this field: the
+    /// canonical renderer emits the upstream identity from its own constant and
+    /// ignores whatever a producer put here.
     #[prost(string, optional, tag="1")]
     pub schema_name: ::core::option::Option<::prost::alloc::string::String>,
     /// Version number of the upstream schema used
@@ -69,9 +84,32 @@ pub struct Document {
     /// Map of page numbers to page metadata.
     #[prost(map="int32, message", tag="12")]
     pub pages: ::std::collections::HashMap<i32, PageItem>,
+    // Fields 16 and up extend the model beyond the upstream dialect; the
+    // renderers that produce that dialect ignore them.
+
+    /// Source-declared document metadata (title, authors, dates, language).
+    #[prost(message, optional, tag="16")]
+    pub source_meta: ::core::option::Option<DocumentMeta>,
+    /// Nested payloads the source carries (mail parts, embedded files, page
+    /// attachments), addressable for fan-out parsing.
+    #[prost(message, repeated, tag="17")]
+    pub attachments: ::prost::alloc::vec::Vec<SubDocumentRef>,
+    /// The source's own table of contents, when it declares one.
+    #[prost(message, repeated, tag="18")]
+    pub outline: ::prost::alloc::vec::Vec<OutlineEntry>,
+    /// Page-level meta tags for web sources (name/content pairs).
+    #[prost(message, repeated, tag="19")]
+    pub meta_tags: ::prost::alloc::vec::Vec<MetaTag>,
+    /// Machine-readable structured data blocks embedded in the source
+    /// (JSON-LD, microdata, OpenGraph), verbatim.
+    #[prost(message, repeated, tag="20")]
+    pub structured_data: ::prost::alloc::vec::Vec<StructuredData>,
+    /// Media stream metadata for audio and video sources.
+    #[prost(message, optional, tag="21")]
+    pub media: ::core::option::Option<MediaMeta>,
 }
 /// DocumentOrigin contains metadata about the source document file.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DocumentOrigin {
     /// MIME type of the source file
     #[prost(string, tag="1")]
@@ -85,6 +123,10 @@ pub struct DocumentOrigin {
     /// Optional URI/URL where the document was retrieved from
     #[prost(string, optional, tag="4")]
     pub uri: ::core::option::Option<::prost::alloc::string::String>,
+    /// Web retrieval provenance for crawled sources (extension beyond the
+    /// upstream dialect).
+    #[prost(message, optional, tag="5")]
+    pub web: ::core::option::Option<WebMeta>,
 }
 /// GroupItem represents a logical grouping of document elements.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -103,6 +145,9 @@ pub struct GroupItem {
     pub name: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(enumeration="GroupLabel", tag="7")]
     pub label: i32,
+    /// Raw label fallback for forward-compatibility with newer label vocabularies.
+    #[prost(string, optional, tag="8")]
+    pub label_raw: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// RefItem is a JSON Pointer reference to another item in the document.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -163,7 +208,7 @@ pub struct TrackSource {
     pub voice: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// CollectorSource attributes an item to the parser collector that produced
-/// it. This is a pipestream extension over the upstream docling schema:
+/// it. This is a pipestream extension over the upstream schema:
 /// upstream SourceType carries only media-track cues, while the
 /// scatter-gather pipeline needs every collector's output attributable so
 /// additive merges never collide silently. Sources never overwrite each
@@ -189,7 +234,7 @@ pub struct CollectorSource {
 /// SourceType is a union of possible source descriptors.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SourceType {
-    #[prost(oneof="source_type::Source", tags="1, 2")]
+    #[prost(oneof="source_type::Source", tags="1, 2, 3")]
     pub source: ::core::option::Option<source_type::Source>,
 }
 /// Nested message and enum types in `SourceType`.
@@ -200,6 +245,10 @@ pub mod source_type {
         Track(super::TrackSource),
         #[prost(message, tag="2")]
         Collector(super::CollectorSource),
+        /// Model-generated content names its generation (extension beyond the
+        /// upstream dialect).
+        #[prost(message, tag="3")]
+        Generation(super::GenerationSource),
     }
 }
 /// BaseMeta contains metadata fields common to most document items.
@@ -361,6 +410,17 @@ pub struct TextItemBase {
     pub source: ::prost::alloc::vec::Vec<SourceType>,
     #[prost(message, repeated, tag="13")]
     pub comments: ::prost::alloc::vec::Vec<FineRef>,
+    /// Character-level formatting and link runs inside `text` (extension
+    /// beyond the upstream dialect, which styles whole items only).
+    #[prost(message, repeated, tag="14")]
+    pub spans: ::prost::alloc::vec::Vec<InlineSpan>,
+    /// Admonition kind for callout blocks (info, warning, note, tip), when the
+    /// source marks one (extension beyond the upstream dialect).
+    #[prost(string, optional, tag="15")]
+    pub admonition_kind: ::core::option::Option<::prost::alloc::string::String>,
+    /// Raw label fallback for forward-compatibility with newer label vocabularies.
+    #[prost(string, optional, tag="16")]
+    pub label_raw: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// TitleItem represents a document title or major heading.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -453,6 +513,9 @@ pub struct CodeItem {
     /// Raw language string (fallback for unknown enum values).
     #[prost(string, optional, tag="19")]
     pub code_language_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// Raw label fallback for forward-compatibility with newer label vocabularies.
+    #[prost(string, optional, tag="20")]
+    pub label_raw: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// FormulaItem represents a mathematical formula or equation.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -467,6 +530,9 @@ pub struct TextItem {
     pub base: ::core::option::Option<TextItemBase>,
 }
 /// ProvenanceItem tracks the precise location of content in the source document.
+/// Fields 4 and up extend the model beyond the upstream dialect: a source is
+/// located in whatever space it actually has - a page and box, a time range,
+/// a byte range, a spreadsheet cell - and an item may carry several.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProvenanceItem {
     #[prost(int32, tag="1")]
@@ -475,6 +541,20 @@ pub struct ProvenanceItem {
     pub bbox: ::core::option::Option<BoundingBox>,
     #[prost(message, optional, tag="3")]
     pub charspan: ::core::option::Option<IntSpan>,
+    /// Where the content sits in a media timeline (audio, video).
+    #[prost(message, optional, tag="4")]
+    pub time: ::core::option::Option<TimeSpan>,
+    /// Where the content sits in the source byte stream (fixed-length records,
+    /// archive members).
+    #[prost(message, optional, tag="5")]
+    pub byte_range: ::core::option::Option<ByteSpan>,
+    /// Where the content sits in a sheet grid.
+    #[prost(message, optional, tag="6")]
+    pub grid: ::core::option::Option<GridCell>,
+    /// The exact quadrilateral for rotated or skewed text; bbox stays the
+    /// axis-aligned hull.
+    #[prost(message, repeated, tag="7")]
+    pub polygon: ::prost::alloc::vec::Vec<Point>,
 }
 /// BoundingBox defines a rectangular region in page coordinates.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -684,9 +764,15 @@ pub struct PictureScatterChartData {
     pub points: ::prost::alloc::vec::Vec<ChartPoint>,
 }
 /// PictureAnnotation is a union of all annotation types that can appear on a picture.
+///
+/// PLACEMENT RULE: item `meta` is the export contract; the canonical dialect
+/// reads meta and ignores this list entirely (upstream deprecates it in favor
+/// of meta). Producers that want their data visible in dialect exports MUST
+/// write it into meta (a first-class slot or a namespaced custom field) and
+/// may additionally mirror it here for wire consumers.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PictureAnnotation {
-    #[prost(oneof="picture_annotation::Annotation", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(oneof="picture_annotation::Annotation", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
     pub annotation: ::core::option::Option<picture_annotation::Annotation>,
 }
 /// Nested message and enum types in `PictureAnnotation`.
@@ -713,6 +799,11 @@ pub mod picture_annotation {
         PieChart(super::PicturePieChartData),
         #[prost(message, tag="10")]
         ScatterChart(super::PictureScatterChartData),
+        /// Decoded machine-readable code payloads (extension beyond the upstream
+        /// dialect; the misc-annotation convention stays emitted alongside for
+        /// one release).
+        #[prost(message, tag="11")]
+        Barcode(super::BarcodeAnnotation),
     }
 }
 /// TableAnnotation is a union of annotation types that can appear on a table.
@@ -942,6 +1033,14 @@ pub struct TableData {
     /// Raw orientation fallback for forward-compatibility with newer rotation values.
     #[prost(string, optional, tag="6")]
     pub orientation_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// Column declarations when the source has a schema (spreadsheet types,
+    /// fixed-record layouts); extension beyond the upstream dialect.
+    #[prost(message, repeated, tag="7")]
+    pub columns: ::prost::alloc::vec::Vec<TableColumnSchema>,
+    /// Per-row provenance for record-oriented sources (byte ranges, grid
+    /// rows); extension beyond the upstream dialect.
+    #[prost(message, repeated, tag="8")]
+    pub row_prov: ::prost::alloc::vec::Vec<ProvenanceItem>,
 }
 /// TableRow represents a single row in the table.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -978,6 +1077,14 @@ pub struct TableCell {
     pub fillable: bool,
     #[prost(message, optional, tag="13")]
     pub r#ref: ::core::option::Option<RefItem>,
+    /// The cell's typed value when the source has one; `text` stays the
+    /// display string (extension beyond the upstream dialect).
+    #[prost(message, optional, tag="14")]
+    pub value: ::core::option::Option<CellValue>,
+    /// Character-level formatting and link runs inside `text` (extension
+    /// beyond the upstream dialect).
+    #[prost(message, repeated, tag="15")]
+    pub spans: ::prost::alloc::vec::Vec<InlineSpan>,
 }
 /// KeyValueItem represents a key-value pair extracted from forms.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1136,6 +1243,257 @@ pub struct PageItem {
     pub image: ::core::option::Option<ImageRef>,
     #[prost(int32, tag="3")]
     pub page_no: i32,
+}
+// ============================================================================
+// Model extensions
+//
+// Everything below extends the model beyond the upstream dialect. The
+// renderers that produce that dialect ignore these shapes; every other
+// consumer may rely on them. All extensions are additive: removing them
+// yields a document the upstream dialect can express.
+// ============================================================================
+
+/// TimeSpan locates content in a media timeline.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TimeSpan {
+    #[prost(double, tag="1")]
+    pub start_ms: f64,
+    #[prost(double, tag="2")]
+    pub end_ms: f64,
+    /// Which stream the span belongs to, for multi-track sources.
+    #[prost(int32, optional, tag="3")]
+    pub track: ::core::option::Option<i32>,
+    /// Speaker or voice attribution for the span.
+    #[prost(string, optional, tag="4")]
+    pub speaker: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// ByteSpan locates content in the source byte stream.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ByteSpan {
+    #[prost(uint64, tag="1")]
+    pub start: u64,
+    #[prost(uint64, tag="2")]
+    pub end: u64,
+}
+/// GridCell locates content in a sheet grid (zero-based).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GridCell {
+    #[prost(int32, tag="1")]
+    pub row: i32,
+    #[prost(int32, tag="2")]
+    pub col: i32,
+    #[prost(string, optional, tag="3")]
+    pub sheet: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Point is one vertex of a provenance polygon, in the same coordinate space
+/// as the owning bounding box.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct Point {
+    #[prost(double, tag="1")]
+    pub x: f64,
+    #[prost(double, tag="2")]
+    pub y: f64,
+}
+/// InlineSpan is one formatting or link run inside an item's text. Ranges are
+/// code points into `text`, half-open, and may overlap (bold and linked at
+/// once arrives as two spans or one span carrying both).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InlineSpan {
+    #[prost(message, optional, tag="1")]
+    pub range: ::core::option::Option<IntSpan>,
+    #[prost(message, optional, tag="2")]
+    pub formatting: ::core::option::Option<Formatting>,
+    #[prost(string, optional, tag="3")]
+    pub hyperlink: ::core::option::Option<::prost::alloc::string::String>,
+    /// Internal cross-reference target (footnote, citation, section).
+    #[prost(message, optional, tag="4")]
+    pub target: ::core::option::Option<FineRef>,
+}
+/// DocumentMeta carries the metadata the source declares about itself.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DocumentMeta {
+    #[prost(string, optional, tag="1")]
+    pub title: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag="2")]
+    pub authors: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// ISO 8601 timestamps, verbatim from the source.
+    #[prost(string, optional, tag="3")]
+    pub created: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="4")]
+    pub modified: ::core::option::Option<::prost::alloc::string::String>,
+    /// BCP 47 language tag.
+    #[prost(string, optional, tag="5")]
+    pub language: ::core::option::Option<::prost::alloc::string::String>,
+    /// The software that produced the source file.
+    #[prost(string, optional, tag="6")]
+    pub generator: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag="7")]
+    pub keywords: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Source metadata with no first-class slot, keyed by a producer-scoped
+    /// name.
+    #[prost(map="string, string", tag="100")]
+    pub extra: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+/// CellValue is a table cell's typed value; the cell's `text` stays the
+/// display string.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CellValue {
+    /// The source's display format string for the value.
+    #[prost(string, optional, tag="10")]
+    pub number_format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(oneof="cell_value::Kind", tags="1, 2, 3, 4, 5")]
+    pub kind: ::core::option::Option<cell_value::Kind>,
+}
+/// Nested message and enum types in `CellValue`.
+pub mod cell_value {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(double, tag="1")]
+        Number(f64),
+        #[prost(bool, tag="2")]
+        Boolean(bool),
+        /// ISO 8601 date or datetime, verbatim.
+        #[prost(string, tag="3")]
+        Datetime(::prost::alloc::string::String),
+        /// The source formula, in the source's own syntax.
+        #[prost(string, tag="4")]
+        Formula(::prost::alloc::string::String),
+        /// The source's error literal (a spreadsheet #DIV/0!, a conversion
+        /// failure marker).
+        #[prost(string, tag="5")]
+        Error(::prost::alloc::string::String),
+    }
+}
+/// TableColumnSchema declares one column of a schema-carrying table
+/// (spreadsheet types, fixed-record layouts).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TableColumnSchema {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    /// The source's own type name (copybook usage, cell type, SQL type).
+    #[prost(string, optional, tag="2")]
+    pub declared_type: ::core::option::Option<::prost::alloc::string::String>,
+    /// Copybook picture clause, when the source is a fixed-record layout.
+    #[prost(string, optional, tag="3")]
+    pub picture: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, optional, tag="4")]
+    pub byte_offset: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag="5")]
+    pub byte_size: ::core::option::Option<u64>,
+    /// Copybook level number.
+    #[prost(int32, optional, tag="6")]
+    pub level: ::core::option::Option<i32>,
+}
+/// SubDocumentRef registers one nested payload the source carries (a mail
+/// part, an embedded file, a page attachment) so a downstream parser can fan
+/// out on it. The id is the stable pointer other conventions in the fleet
+/// already embed in item text (for example part:<part_id>).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SubDocumentRef {
+    #[prost(string, tag="1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag="3")]
+    pub media_type: ::prost::alloc::string::String,
+    #[prost(uint64, tag="4")]
+    pub size_bytes: u64,
+    /// The item that mentions or anchors the payload, when one does.
+    #[prost(string, optional, tag="5")]
+    pub item_ref: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// WebMeta carries retrieval provenance for crawled sources.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WebMeta {
+    /// The URI the content was actually fetched from.
+    #[prost(string, optional, tag="1")]
+    pub target_uri: ::core::option::Option<::prost::alloc::string::String>,
+    /// The page's self-declared canonical URI.
+    #[prost(string, optional, tag="2")]
+    pub canonical_uri: ::core::option::Option<::prost::alloc::string::String>,
+    /// ISO 8601 capture time.
+    #[prost(string, optional, tag="3")]
+    pub crawl_time: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int32, optional, tag="4")]
+    pub http_status: ::core::option::Option<i32>,
+    #[prost(string, optional, tag="5")]
+    pub content_language: ::core::option::Option<::prost::alloc::string::String>,
+    /// Selected response headers, lower-cased names.
+    #[prost(map="string, string", tag="6")]
+    pub headers: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+/// MetaTag is one page-level name/content meta pair.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MetaTag {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub content: ::prost::alloc::string::String,
+}
+/// StructuredData is one machine-readable data block embedded in the source,
+/// verbatim.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StructuredData {
+    /// The block's dialect: json-ld, microdata, opengraph, rdfa.
+    #[prost(string, tag="1")]
+    pub kind: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub json: ::prost::alloc::string::String,
+}
+/// MediaMeta describes the media stream a transcript came from.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MediaMeta {
+    #[prost(double, optional, tag="1")]
+    pub duration_ms: ::core::option::Option<f64>,
+    /// Distinct speaker labels, in first-appearance order.
+    #[prost(string, repeated, tag="2")]
+    pub speakers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="3")]
+    pub codec: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// GenerationSource attributes model-generated content to its generation.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GenerationSource {
+    #[prost(string, tag="1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="2")]
+    pub endpoint: ::core::option::Option<::prost::alloc::string::String>,
+    /// The provider's stop reason, verbatim; a length stop means the content
+    /// is truncated.
+    #[prost(string, optional, tag="3")]
+    pub finish_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, optional, tag="4")]
+    pub prompt_tokens: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag="5")]
+    pub completion_tokens: ::core::option::Option<u64>,
+    #[prost(double, optional, tag="6")]
+    pub temperature: ::core::option::Option<f64>,
+}
+/// OutlineEntry is one row of the source's own table of contents.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OutlineEntry {
+    #[prost(string, tag="1")]
+    pub title: ::prost::alloc::string::String,
+    #[prost(int32, tag="2")]
+    pub level: i32,
+    #[prost(int32, optional, tag="3")]
+    pub page_no: ::core::option::Option<i32>,
+    /// The item or destination the entry points at, when resolvable.
+    #[prost(message, optional, tag="4")]
+    pub target: ::core::option::Option<FineRef>,
+}
+/// BarcodeAnnotation is one decoded machine-readable code payload.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BarcodeAnnotation {
+    /// The symbology name as the decoder reports it (QRCode, Code128).
+    #[prost(string, tag="1")]
+    pub format: ::prost::alloc::string::String,
+    /// The decoded content.
+    #[prost(string, tag="2")]
+    pub value: ::prost::alloc::string::String,
+    /// The decoding engine.
+    #[prost(string, tag="3")]
+    pub provenance: ::prost::alloc::string::String,
 }
 /// ContentLayer defines the semantic layer where content appears in the document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
