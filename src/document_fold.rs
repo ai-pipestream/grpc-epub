@@ -374,6 +374,7 @@ impl DocumentFold {
             // Retrieval provenance belongs to a crawler; this service is
             // handed an archive over gRPC and never fetches anything.
             web: None,
+            ..doc::DocumentOrigin::default()
         });
         self.document.source_meta = Some(self.source_meta(info));
 
@@ -573,6 +574,7 @@ impl DocumentFold {
             created_raw: (!created.is_empty()).then(|| created.to_owned()),
             modified_raw: (!modified.is_empty()).then(|| modified.to_owned()),
             extra,
+            ..doc::DocumentMeta::default()
         }
     }
 
@@ -620,6 +622,7 @@ impl DocumentFold {
             // The typed label says everything; the raw fallback is for
             // vocabularies this schema does not enumerate.
             label_raw: None,
+            ..doc::GroupItem::default()
         });
         self.link_child(BODY_REF, &self_ref);
         // The key an outline entry and a media overlay both name their target
@@ -657,6 +660,7 @@ impl DocumentFold {
                 dpi: 0,
                 size: None,
                 uri: format!("{URI_SCHEME}{}", resource.href),
+                ..doc::ImageRef::default()
             }),
             meta: Some(doc::PictureMeta {
                 custom_fields: fields,
@@ -684,6 +688,7 @@ impl DocumentFold {
                 confidence: None,
                 raw_score: None,
                 raw_score_kind: None,
+                ..doc::CollectorSource::default()
             })),
         }
     }
