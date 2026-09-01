@@ -164,10 +164,10 @@ fn reader(bytes: &[u8]) -> Reader<&[u8]> {
 /// `xmlns:content="…"` cannot be mistaken for a `content` attribute.
 fn attribute(start: &BytesStart<'_>, name: &str) -> String {
     for attr in start.attributes().with_checks(false).flatten() {
-        if attr.key.as_ref().starts_with(b"xmlns") {
+        if attr.key.as_ref().starts_with("xmlns") {
             continue;
         }
-        if attr.key.local_name().as_ref() == name.as_bytes() {
+        if attr.key.local_name().as_ref() == name {
             // `normalized_value` resolves the five predefined entities and
             // character references and nothing else — quick-xml documents the
             // replacement set as non-recursive — so an attribute cannot be a
@@ -175,8 +175,8 @@ fn attribute(start: &BytesStart<'_>, name: &str) -> String {
             return match attr.normalized_value(XmlVersion::Implicit1_0) {
                 Ok(value) => value.into_owned(),
                 // An unresolvable reference in an attribute value: keep the
-                // bytes as written rather than guess. Same rule as text.
-                Err(_) => String::from_utf8_lossy(attr.value.as_ref()).into_owned(),
+                // value as written rather than guess. Same rule as text.
+                Err(_) => attr.value.as_ref().to_owned(),
             };
         }
     }
@@ -192,8 +192,8 @@ struct Text(String);
 
 impl Text {
     /// Append a text fragment.
-    fn push_text(&mut self, raw: &[u8]) {
-        self.0.push_str(&String::from_utf8_lossy(raw));
+    fn push_text(&mut self, raw: &str) {
+        self.0.push_str(raw);
     }
 
     /// Append a general reference.
@@ -207,8 +207,8 @@ impl Text {
             self.0.push(resolved);
             return;
         }
-        let name = String::from_utf8_lossy(reference.as_ref()).into_owned();
-        match name.as_str() {
+        let name = reference.as_ref();
+        match name {
             "amp" => self.0.push('&'),
             "lt" => self.0.push('<'),
             "gt" => self.0.push('>'),
@@ -216,7 +216,7 @@ impl Text {
             "apos" => self.0.push('\''),
             _ => {
                 self.0.push('&');
-                self.0.push_str(&name);
+                self.0.push_str(name);
                 self.0.push(';');
             }
         }
@@ -231,8 +231,8 @@ impl Text {
 }
 
 /// Refuse a DTD that declares entities.
-fn check_doctype(raw: &[u8]) -> Result<(), XmlError> {
-    let text = String::from_utf8_lossy(raw).to_ascii_uppercase();
+fn check_doctype(raw: &str) -> Result<(), XmlError> {
+    let text = raw.to_ascii_uppercase();
     if text.contains("<!ENTITY") || text.contains("!ENTITY") {
         return Err(XmlError::EntityDeclaration);
     }
@@ -260,7 +260,7 @@ pub fn parse_container(bytes: &[u8]) -> Result<String, XmlError> {
         match reader.read_event_into(&mut buf)? {
             Event::DocType(dtd) => check_doctype(dtd.as_ref())?,
             Event::Start(start) | Event::Empty(start) => {
-                if start.local_name().as_ref() == b"rootfile" {
+                if start.local_name().as_ref() == "rootfile" {
                     let path = attribute(&start, "full-path");
                     if path.is_empty() {
                         continue;
@@ -295,16 +295,16 @@ enum Section {
 }
 
 /// The Dublin Core elements whose text content is worth keeping.
-const DUBLIN_CORE: &[&[u8]] = &[
-    b"title",
-    b"creator",
-    b"contributor",
-    b"language",
-    b"identifier",
-    b"publisher",
-    b"description",
-    b"date",
-    b"subject",
+const DUBLIN_CORE: &[&str] = &[
+    "title",
+    "creator",
+    "contributor",
+    "language",
+    "identifier",
+    "publisher",
+    "description",
+    "date",
+    "subject",
 ];
 
 /// Streaming state for one package document.
@@ -326,7 +326,7 @@ struct PackageParser {
     section_depth: usize,
     /// Local name of the metadata element currently collecting text, with the
     /// attributes read from its start tag.
-    collecting: Option<(Vec<u8>, Identifier)>,
+    collecting: Option<(String, Identifier)>,
     /// Text collected for `collecting`.
     text: Text,
 }
@@ -341,7 +341,7 @@ impl PackageParser {
         let name = local.as_ref();
 
         if !self.saw_package {
-            if name != b"package" {
+            if name != "package" {
                 return Err(XmlError::NotAPackage);
             }
             self.saw_package = true;
@@ -352,15 +352,15 @@ impl PackageParser {
 
         match self.section {
             Section::Outside if !empty => match name {
-                b"metadata" => self.enter(Section::Metadata),
-                b"manifest" => self.enter(Section::Manifest),
-                b"spine" => self.enter(Section::Spine),
+                "metadata" => self.enter(Section::Metadata),
+                "manifest" => self.enter(Section::Manifest),
+                "spine" => self.enter(Section::Spine),
                 _ => {}
             },
             Section::Outside => {}
             Section::Metadata => self.open_metadata(start, name, empty),
             Section::Manifest => {
-                if name == b"item" {
+                if name == "item" {
                     self.package.manifest.push(ManifestItem {
                         id: attribute(start, "id"),
                         href: attribute(start, "href"),
@@ -373,7 +373,7 @@ impl PackageParser {
                 }
             }
             Section::Spine => {
-                if name == b"itemref" {
+                if name == "itemref" {
                     self.package.spine.push(SpineItem {
                         idref: attribute(start, "idref"),
                         // Absent means linear, per the EPUB spec; only the
@@ -393,8 +393,8 @@ impl PackageParser {
     }
 
     /// Handle a start tag inside `<metadata>`.
-    fn open_metadata(&mut self, start: &BytesStart<'_>, name: &[u8], empty: bool) {
-        if name == b"meta" {
+    fn open_metadata(&mut self, start: &BytesStart<'_>, name: &str, empty: bool) {
+        if name == "meta" {
             // EPUB 2's cover convention. EPUB 3 uses a manifest property
             // instead, which the manifest arm already collects.
             if attribute(start, "name").eq_ignore_ascii_case("cover") {
@@ -418,16 +418,16 @@ impl PackageParser {
             // `<dc:title/>`: no text will follow, so close it now.
             self.store(name, identifier, String::new());
         } else {
-            self.collecting = Some((name.to_vec(), identifier));
+            self.collecting = Some((name.to_owned(), identifier));
         }
     }
 
     /// Handle an end tag.
-    fn close(&mut self, name: &[u8]) {
+    fn close(&mut self, name: &str) {
         let closes_collection = self
             .collecting
             .as_ref()
-            .is_some_and(|(element, _)| element.as_slice() == name);
+            .is_some_and(|(element, _)| element == name);
         if closes_collection {
             let (element, identifier) = self.collecting.take().expect("just matched");
             let value = self.text.take();
@@ -444,21 +444,21 @@ impl PackageParser {
     /// Repeatable elements append; single-valued ones keep the first, because
     /// EPUB 3 permits several titles with `<meta refines>` naming their roles
     /// and picking the last would silently prefer a subtitle over a title.
-    fn store(&mut self, element: &[u8], mut identifier: Identifier, value: String) {
+    fn store(&mut self, element: &str, mut identifier: Identifier, value: String) {
         let metadata = &mut self.package.metadata;
         match element {
-            b"title" if metadata.title.is_empty() => metadata.title = value,
-            b"creator" => metadata.creators.push(value),
-            b"contributor" => metadata.contributors.push(value),
-            b"language" if metadata.language.is_empty() => metadata.language = value,
-            b"identifier" => {
+            "title" if metadata.title.is_empty() => metadata.title = value,
+            "creator" => metadata.creators.push(value),
+            "contributor" => metadata.contributors.push(value),
+            "language" if metadata.language.is_empty() => metadata.language = value,
+            "identifier" => {
                 identifier.value = value;
                 metadata.identifiers.push(identifier);
             }
-            b"publisher" if metadata.publisher.is_empty() => metadata.publisher = value,
-            b"description" if metadata.description.is_empty() => metadata.description = value,
-            b"date" if metadata.date.is_empty() => metadata.date = value,
-            b"subject" => metadata.subjects.push(value),
+            "publisher" if metadata.publisher.is_empty() => metadata.publisher = value,
+            "description" if metadata.description.is_empty() => metadata.description = value,
+            "date" if metadata.date.is_empty() => metadata.date = value,
+            "subject" => metadata.subjects.push(value),
             _ => {}
         }
     }
