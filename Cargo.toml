@@ -20,7 +20,7 @@ prost-types = "0.14.4"
 # Only `container.xml` and the OPF package document are parsed as XML. Chapter
 # XHTML is passed through as bytes: HTML semantics belong to the HTML
 # collector, not to this packager.
-quick-xml = "0.41.0"
+quick-xml = "0.42.0"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 tonic = { version = "0.14.6", features = ["gzip", "zstd"] }
