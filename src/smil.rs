@@ -143,13 +143,13 @@ pub fn parse_clock(raw: &str) -> Option<f64> {
 /// Read one attribute by local name, resolving the predefined entities.
 fn attribute(start: &BytesStart<'_>, name: &str) -> String {
     for attr in start.attributes().with_checks(false).flatten() {
-        if attr.key.as_ref().starts_with(b"xmlns") {
+        if attr.key.as_ref().starts_with("xmlns") {
             continue;
         }
-        if attr.key.local_name().as_ref() == name.as_bytes() {
+        if attr.key.local_name().as_ref() == name {
             return match attr.normalized_value(XmlVersion::Implicit1_0) {
                 Ok(value) => value.into_owned(),
-                Err(_) => String::from_utf8_lossy(attr.value.as_ref()).into_owned(),
+                Err(_) => attr.value.into_owned(),
             };
         }
     }
@@ -206,7 +206,7 @@ pub fn parse_overlay(bytes: &[u8], source_href: &str) -> Overlay {
             // both start forms have to reach the same arms.
             Event::Start(start) | Event::Empty(start) => {
                 match start.local_name().as_ref() {
-                    b"par" => {
+                    "par" => {
                         // A `<par>` inside a `<par>` is not a shape the format
                         // defines; finish the outer one rather than lose it.
                         if let Some(cue) = current.take() {
@@ -217,12 +217,12 @@ pub fn parse_overlay(bytes: &[u8], source_href: &str) -> Overlay {
                             ..Cue::default()
                         });
                     }
-                    b"text" => {
+                    "text" => {
                         if let Some(cue) = current.as_mut() {
                             cue.text_href = resolve_src(&base_dir, &attribute(&start, "src"));
                         }
                     }
-                    b"audio" => {
+                    "audio" => {
                         if let Some(cue) = current.as_mut() {
                             cue.audio_href = resolve_src(&base_dir, &attribute(&start, "src"));
                             // An absent or unreadable clip bound means "from
@@ -238,7 +238,7 @@ pub fn parse_overlay(bytes: &[u8], source_href: &str) -> Overlay {
                 }
             }
             Event::End(end) => {
-                if end.local_name().as_ref() == b"par"
+                if end.local_name().as_ref() == "par"
                     && let Some(cue) = current.take()
                 {
                     push(&mut overlay.cues, cue);

@@ -140,13 +140,13 @@ fn resolve_with_fragment(base_dir: &str, raw: &str) -> Option<String> {
 /// entity that text is protected from.
 fn attribute(start: &BytesStart<'_>, name: &str) -> String {
     for attr in start.attributes().with_checks(false).flatten() {
-        if attr.key.as_ref().starts_with(b"xmlns") {
+        if attr.key.as_ref().starts_with("xmlns") {
             continue;
         }
-        if attr.key.local_name().as_ref() == name.as_bytes() {
+        if attr.key.local_name().as_ref() == name {
             return match attr.normalized_value(XmlVersion::Implicit1_0) {
                 Ok(value) => value.into_owned(),
-                Err(_) => String::from_utf8_lossy(attr.value.as_ref()).into_owned(),
+                Err(_) => attr.value.into_owned(),
             };
         }
     }
@@ -233,7 +233,7 @@ pub fn parse_nav(bytes: &[u8], source_href: &str) -> Navigation {
                 depth += 1;
                 let local = start.local_name();
                 match local.as_ref() {
-                    b"nav" if !in_toc_nav => {
+                    "nav" if !in_toc_nav => {
                         // `epub:type` picks the toc out of the several navs a
                         // document may hold. A `<nav>` with no type is taken
                         // as the toc, because that is what a single-nav
@@ -244,7 +244,7 @@ pub fn parse_nav(bytes: &[u8], source_href: &str) -> Navigation {
                             nav_depth = depth;
                         }
                     }
-                    b"li" if in_toc_nav => {
+                    "li" if in_toc_nav => {
                         if stack.len() < MAX_DEPTH {
                             stack.push(Open {
                                 point: NavPoint::default(),
@@ -254,7 +254,7 @@ pub fn parse_nav(bytes: &[u8], source_href: &str) -> Navigation {
                     }
                     // The first titling element wins: a list item may hold an
                     // anchor and then a whole sublist of them.
-                    b"a" | b"span" if in_toc_nav => {
+                    "a" | "span" if in_toc_nav => {
                         if let Some(open) = stack.last_mut()
                             && open.point.label.is_empty()
                         {
@@ -269,10 +269,10 @@ pub fn parse_nav(bytes: &[u8], source_href: &str) -> Navigation {
                 }
             }
             Event::Text(text) if in_label => {
-                label.push_str(&String::from_utf8_lossy(text.as_ref()));
+                label.push_str(text.as_ref());
             }
             Event::End(end) => {
-                if in_label && matches!(end.local_name().as_ref(), b"a" | b"span") {
+                if in_label && matches!(end.local_name().as_ref(), "a" | "span") {
                     in_label = false;
                     if let Some(open) = stack.last_mut() {
                         open.point.label = collapse(&label);
@@ -336,7 +336,7 @@ pub fn parse_ncx(bytes: &[u8], source_href: &str) -> Navigation {
             // not, so the two arms differ only in whether they open a level.
             Event::Empty(start) => {
                 if in_map
-                    && start.local_name().as_ref() == b"content"
+                    && start.local_name().as_ref() == "content"
                     && let Some(open) = stack.last_mut()
                 {
                     let raw = attribute(&start, "src");
@@ -346,11 +346,11 @@ pub fn parse_ncx(bytes: &[u8], source_href: &str) -> Navigation {
             Event::Start(start) => {
                 depth += 1;
                 match start.local_name().as_ref() {
-                    b"navMap" => {
+                    "navMap" => {
                         in_map = true;
                         map_depth = depth;
                     }
-                    b"navPoint" if in_map && stack.len() < MAX_DEPTH => {
+                    "navPoint" if in_map && stack.len() < MAX_DEPTH => {
                         stack.push(Open {
                             point: NavPoint::default(),
                             depth,
@@ -360,13 +360,13 @@ pub fn parse_ncx(bytes: &[u8], source_href: &str) -> Navigation {
                     // header carries `<docTitle><text>` too, and reading that
                     // as an entry would put the book's title in its own table
                     // of contents.
-                    b"text" if in_map && !stack.is_empty() => {
+                    "text" if in_map && !stack.is_empty() => {
                         in_text = true;
                         label.clear();
                     }
                     // A producer that wrote `<content>…</content>` rather than
                     // the empty form still means the same thing.
-                    b"content" if in_map => {
+                    "content" if in_map => {
                         if let Some(open) = stack.last_mut() {
                             let raw = attribute(&start, "src");
                             open.point.href =
@@ -377,10 +377,10 @@ pub fn parse_ncx(bytes: &[u8], source_href: &str) -> Navigation {
                 }
             }
             Event::Text(text) if in_text => {
-                label.push_str(&String::from_utf8_lossy(text.as_ref()));
+                label.push_str(text.as_ref());
             }
             Event::End(end) => {
-                if end.local_name().as_ref() == b"text" && in_text {
+                if end.local_name().as_ref() == "text" && in_text {
                     in_text = false;
                     if let Some(open) = stack.last_mut()
                         && open.point.label.is_empty()

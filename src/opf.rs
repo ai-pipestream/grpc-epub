@@ -275,10 +275,10 @@ fn reader(bytes: &[u8]) -> Reader<&[u8]> {
 /// `xmlns:content="…"` cannot be mistaken for a `content` attribute.
 fn attribute(start: &BytesStart<'_>, name: &str) -> String {
     for attr in start.attributes().with_checks(false).flatten() {
-        if attr.key.as_ref().starts_with(b"xmlns") {
+        if attr.key.as_ref().starts_with("xmlns") {
             continue;
         }
-        if attr.key.local_name().as_ref() == name.as_bytes() {
+        if attr.key.local_name().as_ref() == name {
             // `normalized_value` resolves the five predefined entities and
             // character references and nothing else — quick-xml documents the
             // replacement set as non-recursive — so an attribute cannot be a
@@ -287,7 +287,7 @@ fn attribute(start: &BytesStart<'_>, name: &str) -> String {
                 Ok(value) => value.into_owned(),
                 // An unresolvable reference in an attribute value: keep the
                 // bytes as written rather than guess. Same rule as text.
-                Err(_) => String::from_utf8_lossy(attr.value.as_ref()).into_owned(),
+                Err(_) => attr.value.into_owned(),
             };
         }
     }
@@ -303,8 +303,8 @@ struct Text(String);
 
 impl Text {
     /// Append a text fragment.
-    fn push_text(&mut self, raw: &[u8]) {
-        self.0.push_str(&String::from_utf8_lossy(raw));
+    fn push_text(&mut self, raw: &str) {
+        self.0.push_str(raw);
     }
 
     /// Append a general reference.
@@ -318,8 +318,8 @@ impl Text {
             self.0.push(resolved);
             return;
         }
-        let name = String::from_utf8_lossy(reference.as_ref()).into_owned();
-        match name.as_str() {
+        let name = reference.as_ref();
+        match name {
             "amp" => self.0.push('&'),
             "lt" => self.0.push('<'),
             "gt" => self.0.push('>'),
@@ -327,7 +327,7 @@ impl Text {
             "apos" => self.0.push('\''),
             _ => {
                 self.0.push('&');
-                self.0.push_str(&name);
+                self.0.push_str(name);
                 self.0.push(';');
             }
         }
@@ -342,8 +342,8 @@ impl Text {
 }
 
 /// Refuse a DTD that declares entities.
-fn check_doctype(raw: &[u8]) -> Result<(), XmlError> {
-    let text = String::from_utf8_lossy(raw).to_ascii_uppercase();
+fn check_doctype(raw: &str) -> Result<(), XmlError> {
+    let text = raw.to_ascii_uppercase();
     if text.contains("<!ENTITY") || text.contains("!ENTITY") {
         return Err(XmlError::EntityDeclaration);
     }
@@ -371,7 +371,7 @@ pub fn parse_container(bytes: &[u8]) -> Result<String, XmlError> {
         match reader.read_event_into(&mut buf)? {
             Event::DocType(dtd) => check_doctype(dtd.as_ref())?,
             Event::Start(start) | Event::Empty(start) => {
-                if start.local_name().as_ref() == b"rootfile" {
+                if start.local_name().as_ref() == "rootfile" {
                     let path = attribute(&start, "full-path");
                     if path.is_empty() {
                         continue;
@@ -411,28 +411,28 @@ enum Section {
 /// The list used to stop at nine, which dropped rights, source, type, format,
 /// coverage and relation on the floor; `dc:rights` in particular is the one an
 /// ingest pipeline is asked about, and keeping an element costs a match arm.
-const DUBLIN_CORE: &[&[u8]] = &[
-    b"title",
-    b"creator",
-    b"contributor",
-    b"language",
-    b"identifier",
-    b"publisher",
-    b"description",
-    b"date",
-    b"subject",
-    b"rights",
-    b"source",
-    b"type",
-    b"format",
-    b"coverage",
-    b"relation",
+const DUBLIN_CORE: &[&str] = &[
+    "title",
+    "creator",
+    "contributor",
+    "language",
+    "identifier",
+    "publisher",
+    "description",
+    "date",
+    "subject",
+    "rights",
+    "source",
+    "type",
+    "format",
+    "coverage",
+    "relation",
 ];
 
 /// A metadata element whose text is still being collected.
 struct Pending {
     /// Local name of the element, so the matching end tag can be recognized.
-    local: Vec<u8>,
+    local: String,
     /// The entry as far as its start tag described it.
     entry: MetaEntry,
     /// The `refines` target with its leading `#` removed. Non-empty only for a
@@ -480,7 +480,7 @@ impl PackageParser {
         let name = local.as_ref();
 
         if !self.saw_package {
-            if name != b"package" {
+            if name != "package" {
                 return Err(XmlError::NotAPackage);
             }
             self.saw_package = true;
@@ -491,9 +491,9 @@ impl PackageParser {
 
         match self.section {
             Section::Outside if !empty => match name {
-                b"metadata" => self.enter(Section::Metadata),
-                b"manifest" => self.enter(Section::Manifest),
-                b"spine" => {
+                "metadata" => self.enter(Section::Metadata),
+                "manifest" => self.enter(Section::Manifest),
+                "spine" => {
                     // `toc` names the NCX, which is the only way to find it in
                     // an EPUB 2 book: the manifest gives it no property.
                     self.package.toc_idref = attribute(start, "toc");
@@ -504,7 +504,7 @@ impl PackageParser {
             Section::Outside => {}
             Section::Metadata => self.open_metadata(start, name, empty),
             Section::Manifest => {
-                if name == b"item" {
+                if name == "item" {
                     self.package.manifest.push(ManifestItem {
                         id: attribute(start, "id"),
                         href: attribute(start, "href"),
@@ -518,7 +518,7 @@ impl PackageParser {
                 }
             }
             Section::Spine => {
-                if name == b"itemref" {
+                if name == "itemref" {
                     self.package.spine.push(SpineItem {
                         idref: attribute(start, "idref"),
                         // Absent means linear, per the EPUB spec; only the
@@ -538,8 +538,8 @@ impl PackageParser {
     }
 
     /// Handle a start tag inside `<metadata>`.
-    fn open_metadata(&mut self, start: &BytesStart<'_>, name: &[u8], empty: bool) {
-        let pending = if name == b"meta" {
+    fn open_metadata(&mut self, start: &BytesStart<'_>, name: &str, empty: bool) {
+        let pending = if name == "meta" {
             // EPUB 2's cover convention. EPUB 3 uses a manifest property
             // instead, which the manifest arm already collects.
             if attribute(start, "name").eq_ignore_ascii_case("cover") {
@@ -558,7 +558,7 @@ impl PackageParser {
                 return;
             }
             Pending {
-                local: name.to_vec(),
+                local: name.to_owned(),
                 entry: MetaEntry {
                     element: property,
                     id: attribute(start, "id"),
@@ -571,9 +571,9 @@ impl PackageParser {
             }
         } else if DUBLIN_CORE.contains(&name) {
             Pending {
-                local: name.to_vec(),
+                local: name.to_owned(),
                 entry: MetaEntry {
-                    element: String::from_utf8_lossy(name).into_owned(),
+                    element: name.to_owned(),
                     id: attribute(start, "id"),
                     scheme: attribute(start, "scheme"),
                     // EPUB 2 spells role and sort name as attributes on the
@@ -600,11 +600,11 @@ impl PackageParser {
     }
 
     /// Handle an end tag.
-    fn close(&mut self, name: &[u8]) {
+    fn close(&mut self, name: &str) {
         let closes_collection = self
             .collecting
             .as_ref()
-            .is_some_and(|pending| pending.local.as_slice() == name);
+            .is_some_and(|pending| pending.local == name);
         if closes_collection {
             let pending = self.collecting.take().expect("just matched");
             let value = self.text.take();
