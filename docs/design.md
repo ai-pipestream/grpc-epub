@@ -146,7 +146,9 @@ What is deliberately not mapped, and why:
 emitted with no children on purpose: they are the sockets the HTML collector's
 items merge into downstream, and an empty-children group is valid output (the
 fold's integrity checker accepts it). Reimplementing HTML in the EPUB packager
-is the thing this service exists not to do.
+is the thing this service exists not to do. The one exception has no XHTML to
+reimplement: a spine item that is itself an image, with no XHTML fallback (a
+comic page), is its chapter's whole content, so its group holds its picture.
 
 **Non-image resources.** Stylesheets, fonts, audio, video, nav documents, SMIL:
 the schema has no item kind for them, labelling them as something else would be
@@ -171,9 +173,9 @@ follows is fixed by the EPUB version, which is `epub.version`, not by an
 **Image bytes.** A Document is one gRPC message and clients commonly cap
 receives at 4 MiB, so `ImageRef.uri` is a pointer, `epub:` plus the resolved
 archive path, naming the `resource` event on this same stream that carries the
-bytes. Not a data URI, not even for the cover. `ImageRef.size` is left unset
-because nothing here decodes an image; a `Size` of 0x0 would be a claim rather
-than a gap.
+bytes (or, for an image spine item, the `chapter` event). Not a data URI, not
+even for the cover. `ImageRef.size` is left unset because nothing here decodes
+an image; a `Size` of 0x0 would be a claim rather than a gap.
 
 **Provenance.** No `prov` anywhere: an EPUB is reflowable and has no pages and
 no bounding boxes. Source locators go in `meta.custom_fields` instead.
@@ -204,7 +206,8 @@ SMIL was parsed.
 
 **Chapter to picture attribution.** Which chapter references an image is a fact
 about the XHTML, so pictures hang off the body rather than off a chapter group.
-The coordinator learns it from the HTML collector's own picture items.
+The coordinator learns it from the HTML collector's own picture items. An image
+spine item's picture is the exception again: that image is the chapter.
 
 Two conventions worth restating:
 
@@ -282,6 +285,16 @@ name escapes the root, is absolute or holds a NUL is left out with
 read or sent; a non-spine manifest href that cannot be resolved is a
 `MISSING_MANIFEST_ENTRY` warning. A backslash is read as a separator, because
 that is what a zip tool on Windows means by it.
+
+**Spine items that are not XHTML read through their fallbacks.** EPUB lets a
+spine item be any media type as long as its manifest `fallback` chain reaches
+a content document, which is how comics and fixed-layout books put image pages
+in the spine. Emitting the image as the chapter left the HTML collector
+nothing to read. The chapter is now the first XHTML or HTML item in the chain
+that the archive holds, with `Chapter.primary_href` naming the spine item it
+stands in for, and the spine item's own bytes go out as an ordinary resource,
+so the page's `<img>` resolves like any other. A spine item with no such
+fallback is still its own chapter, whatever its type.
 
 **Resource ordering is by archive position.** Section 3 allows a resource to
 arrive after the chapter referencing it. The implementation emits each resource

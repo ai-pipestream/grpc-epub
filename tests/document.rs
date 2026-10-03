@@ -285,3 +285,65 @@ async fn a_failed_parse_emits_no_document() {
         .expect_err("a ZIP that is not an EPUB is refused");
     assert_eq!(status.code(), tonic::Code::Unimplemented, "{status:?}");
 }
+
+/// A comic read through its XHTML fallbacks projects like any illustrated
+/// book: a chapter group per page, named by the page, and the images as
+/// pictures the pages' own picture items will claim downstream.
+#[tokio::test]
+async fn a_comic_projects_a_group_per_page_and_its_images() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(&common::comic(true), with_document())
+        .await
+        .expect("the book should parse");
+    let document = common::documents(&events)[0];
+
+    let names: Vec<&str> = document
+        .groups
+        .iter()
+        .filter_map(|group| group.name.as_deref())
+        .collect();
+    assert_eq!(names, [common::PAGE1, common::PAGE2]);
+    let uris: Vec<&str> = document
+        .pictures
+        .iter()
+        .filter_map(|picture| picture.image.as_ref())
+        .map(|image| image.uri.as_str())
+        .collect();
+    assert_eq!(
+        uris,
+        [
+            format!("epub:{}", common::PAGE1_IMAGE),
+            format!("epub:{}", common::PAGE2_IMAGE)
+        ]
+    );
+    assert!(integrity_errors(document).is_empty());
+}
+
+/// A spine item that is an image, with no fallback, is a picture inside its
+/// own chapter group: the image is the chapter, and its bytes are on the
+/// `chapter` event the picture points at.
+#[tokio::test]
+async fn an_image_page_is_a_picture_in_its_chapter_group() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(&common::comic(false), with_document())
+        .await
+        .expect("the book should parse");
+    let document = common::documents(&events)[0];
+
+    assert_eq!(document.groups.len(), 2);
+    assert_eq!(document.pictures.len(), 2);
+    for (index, (group, picture)) in document.groups.iter().zip(&document.pictures).enumerate() {
+        assert_eq!(group.children.len(), 1, "the page's picture");
+        assert_eq!(group.children[0].r#ref, format!("#/pictures/{index}"));
+        assert_eq!(
+            picture.parent.as_ref().map(|parent| parent.r#ref.as_str()),
+            Some(format!("#/groups/{index}").as_str())
+        );
+    }
+    let image = document.pictures[0].image.as_ref().expect("an image");
+    assert_eq!(image.uri, format!("epub:{}", common::PAGE1_IMAGE));
+    assert_eq!(image.mimetype, "image/jpeg");
+    assert!(integrity_errors(document).is_empty());
+}

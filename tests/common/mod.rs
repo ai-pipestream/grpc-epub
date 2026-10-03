@@ -439,6 +439,72 @@ pub fn narrated() -> Vec<u8> {
         .build()
 }
 
+/// Archive path of a comic's first page image.
+pub const PAGE1_IMAGE: &str = "OEBPS/images/p1.jpg";
+
+/// Archive path of a comic's second page image.
+pub const PAGE2_IMAGE: &str = "OEBPS/images/p2.png";
+
+/// Archive path of the XHTML page showing the first image.
+pub const PAGE1: &str = "OEBPS/pages/p1.xhtml";
+
+/// Archive path of the XHTML page showing the second image.
+pub const PAGE2: &str = "OEBPS/pages/p2.xhtml";
+
+/// Stand-in bytes of a comic's first page image.
+pub const PAGE1_BYTES: &[u8] = b"\xff\xd8\xff\xe0 page one of the comic";
+
+/// Stand-in bytes of a comic's second page image.
+pub const PAGE2_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n page two of the comic";
+
+/// An XHTML page that shows one image, the shape a comic's fallback takes.
+#[must_use]
+pub fn page_xhtml(image: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Page</title></head>
+<body><img src="../images/{image}" alt="page"/></body></html>"#
+    )
+}
+
+/// A two-page comic whose spine items are the page images.
+///
+/// With `fallbacks`, each image names the XHTML page that shows it as its
+/// manifest `fallback`, which is how EPUB lets a spine item be an image at
+/// all. Without, the images stand in the spine alone. Archive order is each
+/// image followed by its page.
+#[must_use]
+pub fn comic(fallbacks: bool) -> Vec<u8> {
+    let manifest = if fallbacks {
+        "\
+    <item id=\"p1\" href=\"images/p1.jpg\" media-type=\"image/jpeg\" fallback=\"p1-page\"/>\n\
+    <item id=\"p2\" href=\"images/p2.png\" media-type=\"image/png\" fallback=\"p2-page\"/>\n\
+    <item id=\"p1-page\" href=\"pages/p1.xhtml\" media-type=\"application/xhtml+xml\"/>\n\
+    <item id=\"p2-page\" href=\"pages/p2.xhtml\" media-type=\"application/xhtml+xml\"/>\n"
+    } else {
+        "\
+    <item id=\"p1\" href=\"images/p1.jpg\" media-type=\"image/jpeg\"/>\n\
+    <item id=\"p2\" href=\"images/p2.png\" media-type=\"image/png\"/>\n"
+    };
+    let mut builder = shell()
+        .add(
+            OPF_PATH,
+            package(
+                manifest,
+                "    <itemref idref=\"p1\"/>\n    <itemref idref=\"p2\"/>\n",
+            ),
+        )
+        .add(PAGE1_IMAGE, PAGE1_BYTES);
+    if fallbacks {
+        builder = builder.add(PAGE1, page_xhtml("p1.jpg"));
+    }
+    builder = builder.add(PAGE2_IMAGE, PAGE2_BYTES);
+    if fallbacks {
+        builder = builder.add(PAGE2, page_xhtml("p2.png"));
+    }
+    builder.build()
+}
+
 /// A book of `count` chapters, each padded to roughly `size` bytes.
 ///
 /// Used by the streaming tests, where the point is that a chapter reaches the

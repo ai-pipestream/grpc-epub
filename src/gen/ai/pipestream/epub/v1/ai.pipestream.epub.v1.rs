@@ -71,9 +71,9 @@ pub struct ParseOptions {
     /// a client that speaks the Document plane does not have to fold the stream
     /// itself. The typed events remain the lossless wire: the Document carries
     /// no chapter or image bytes, only the skeleton (one chapter group per spine
-    /// item, one picture per image resource) and the OPF metadata. Chapter XHTML
-    /// is not parsed here — that is the HTML collector's job, and its items merge
-    /// into these chapter groups downstream.
+    /// item, one picture per image resource or image spine item) and the OPF
+    /// metadata. Chapter XHTML is not parsed here — that is the HTML collector's
+    /// job, and its items merge into these chapter groups downstream.
     ///
     /// A plain bool rather than an `optional bool`: unlike the include options,
     /// "absent" and "false" mean the same thing here, because the useful default
@@ -288,6 +288,21 @@ pub struct Chapter {
     /// when `ParseOptions.parse_media_overlays` is set.
     #[prost(string, tag="8")]
     pub media_overlay_href: ::prost::alloc::string::String,
+    /// Archive path of the spine item's own manifest entry, set only when this
+    /// chapter is that item's manifest fallback instead. Empty when the chapter
+    /// is the spine item itself, which is the normal case.
+    ///
+    /// A spine item that is not XHTML or HTML (an image page of a comic or
+    /// fixed-layout book, a DTBook file) is replaced by the first XHTML or HTML
+    /// item in its `fallback` chain that the archive holds, because that is what
+    /// the HTML collector reads. `href`, `media_type`, `content` and `properties`
+    /// then describe the fallback, `idref` still names the spine item, and the
+    /// spine item's own bytes go out as an ordinary `resource` event when the
+    /// include options select its kind, so the fallback's references to it
+    /// resolve. A spine item with no such fallback is the chapter itself,
+    /// whatever its media type.
+    #[prost(string, tag="9")]
+    pub primary_href: ::prost::alloc::string::String,
 }
 /// Resource is one manifest entry that is not a spine chapter.
 ///
@@ -691,7 +706,8 @@ pub mod parse_epub_response {
         /// per spine item in spine order, and one `PictureItem` per emitted image
         /// resource; it holds no bytes. Chapter XHTML is deliberately not parsed
         /// here, so the chapter groups arrive empty and the HTML collector's items
-        /// merge into them downstream.
+        /// merge into them downstream. The exception is a spine item that is
+        /// itself an image, with no XHTML fallback: its group holds its picture.
         #[prost(message, tag="5")]
         Document(super::super::super::document::v1::Document),
         /// The book's own table of contents, parsed from its navigation document

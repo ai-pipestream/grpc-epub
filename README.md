@@ -101,7 +101,7 @@ when `emit_document` was set, one `document`, then one `status`.
 | Event | Carries |
 |---|---|
 | `info` | title, creators, contributors, language, identifiers, publisher, date, subjects, spine length, OPF path, EPUB version, cover href |
-| `chapter` | spine index, idref, resolved href, media type, XHTML bytes verbatim, `linear`, EPUB 3 properties |
+| `chapter` | spine index, idref, resolved href, media type, XHTML bytes verbatim, `linear`, EPUB 3 properties; for a spine item read through its manifest fallback (an image page of a comic), the fallback's href and bytes, with `primary_href` naming the spine item |
 | `resource` | resolved href, media type, kind, bytes, manifest id, properties |
 | `document` | the whole book as one `ai.pipestream.document.v1.Document`; opt-in, and always the event before `status` |
 | `status` | chapters and resources emitted, resources skipped, inflated bytes, entries read, warnings |
@@ -137,9 +137,11 @@ What it contains is the skeleton of the book:
 
 The chapter groups have no children, on purpose: chapter XHTML is not parsed
 here, and the groups exist so the HTML collector's items can merge into them
-downstream. Non-image resources (stylesheets, fonts, media, the nav document)
-are not projected at all; the Document schema has no item kind for them, and
-they are already on the typed stream in full.
+downstream. The exception is a spine item that is itself an image with no XHTML
+fallback, a comic page: its group holds its picture. Non-image resources
+(stylesheets, fonts, media, the nav document) are not projected at all; the
+Document schema has no item kind for them, and they are already on the typed
+stream in full.
 
 **Dates are instants, not strings.** `dcterms:created` (or `dc:date`, which is
 what an EPUB 2 book has instead) and `dcterms:modified` are read into
@@ -164,6 +166,7 @@ commonly cap receives at 4 MiB, so `ImageRef.uri` is a pointer, not a data URI:
 
 ```text
 epub:OEBPS/images/cover.png    the `resource` event with that href carries the bytes
+                               (the `chapter` event, for an image spine item)
 ```
 
 `ImageRef.size` is left unset because nothing here decodes an image, and `prov`

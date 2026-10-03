@@ -90,6 +90,11 @@ pub struct ManifestItem {
     /// with the alignment, so it is read here even though the SMIL itself is
     /// parsed elsewhere.
     pub media_overlay: String,
+    /// The `fallback` attribute: the `id` of the manifest item to use in this
+    /// one's place by a reader that cannot use this one. Empty when there is
+    /// none. A spine item that is not XHTML (an image page of a comic, a
+    /// DTBook file) names its XHTML rendering this way.
+    pub fallback: String,
 }
 
 /// One `<itemref>` of the OPF spine: a position in reading order.
@@ -621,6 +626,7 @@ impl PackageParser {
                             .map(str::to_owned)
                             .collect(),
                         media_overlay: attribute(start, "media-overlay"),
+                        fallback: attribute(start, "fallback"),
                     });
                 }
             }
@@ -1067,6 +1073,17 @@ mod tests {
             ["en-GB", "fr"],
             "a bilingual edition declares both and the first alone misreports it"
         );
+    }
+
+    #[test]
+    fn the_manifest_keeps_each_items_fallback() {
+        let comic = br#"<package version="3.0"><manifest>
+  <item id="p1" href="p1.jpg" media-type="image/jpeg" fallback="p1-page"/>
+  <item id="p1-page" href="p1.xhtml" media-type="application/xhtml+xml"/>
+</manifest><spine><itemref idref="p1"/></spine></package>"#;
+        let package = parse_package(comic).unwrap();
+        assert_eq!(package.manifest[0].fallback, "p1-page");
+        assert_eq!(package.manifest[1].fallback, "", "absent means none");
     }
 
     #[test]

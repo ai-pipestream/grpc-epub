@@ -126,7 +126,8 @@ message ParseEpubResponse {
     // per spine item in spine order, and one `PictureItem` per emitted image
     // resource; it holds no bytes. Chapter XHTML is deliberately not parsed
     // here, so the chapter groups arrive empty and the HTML collector's items
-    // merge into them downstream.
+    // merge into them downstream. The exception is a spine item that is
+    // itself an image, with no XHTML fallback: its group holds its picture.
     ai.pipestream.document.v1.Document document = 5;
 
     // The book's own table of contents, parsed from its navigation document

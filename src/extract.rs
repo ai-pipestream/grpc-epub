@@ -624,7 +624,11 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     // spine can be diagnosed before the stream opens. That matters: a client
     // that has already been told "eight chapters" and then gets an error after
     // three has to unwind, while a call that never opened is just a failure.
-    let mut spine: Vec<(usize, &opf::SpineItem)> = Vec::with_capacity(package.spine.len());
+    //
+    // Each entry is `(spine item, chapter source, itemref)`, two manifest
+    // positions that differ only when the chapter is the spine item's
+    // fallback; see [`chapter_source`].
+    let mut spine: Vec<(usize, usize, &opf::SpineItem)> = Vec::with_capacity(package.spine.len());
     for itemref in &package.spine {
         let Some(&position) = by_id.get(itemref.idref.as_str()) else {
             return Err(Status::invalid_argument(format!(
@@ -633,6 +637,24 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             ))
             .into());
         };
+        if let Some(source) = chapter_source(position, &resolved, &by_id) {
+            let target = &resolved[source];
+            let entry = target
+                .entry
+                .expect("a chapter source is always in the archive");
+            if obfuscated.contains(&entry) {
+                return Err(Status::unimplemented(format!(
+                    "spine item {:?} ({:?}) is listed in {ENCRYPTION_PATH}; encrypted chapters \
+                     are not supported",
+                    itemref.idref, target.path
+                ))
+                .into());
+            }
+            spine.push((position, source, itemref));
+            continue;
+        }
+        // Nothing in the chain is in the archive; say why for the spine item
+        // itself.
         let target = &resolved[position];
         if let Some(error) = &target.unusable {
             return Err(Status::invalid_argument(format!(
@@ -649,26 +671,18 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             ))
             .into());
         }
-        let Some(entry) = target.entry else {
-            return Err(Status::invalid_argument(format!(
-                "spine item {:?} names {:?}, which the archive does not contain",
-                itemref.idref, target.path
-            ))
-            .into());
-        };
-        if obfuscated.contains(&entry) {
-            return Err(Status::unimplemented(format!(
-                "spine item {:?} ({:?}) is listed in {ENCRYPTION_PATH}; encrypted chapters are \
-                 not supported",
-                itemref.idref, target.path
-            ))
-            .into());
-        }
-        spine.push((position, itemref));
+        return Err(Status::invalid_argument(format!(
+            "spine item {:?} names {:?}, which the archive does not contain",
+            itemref.idref, target.path
+        ))
+        .into());
     }
 
     // --- info ---------------------------------------------------------------
-    let spine_ids: HashSet<usize> = spine.iter().map(|(position, _)| *position).collect();
+    // The manifest items the walk sends as chapters. A spine item replaced by
+    // its fallback is not one of them, so its own bytes go out as a resource,
+    // where the fallback's references to it can find them.
+    let spine_ids: HashSet<usize> = spine.iter().map(|(_, source, _)| *source).collect();
     let cover_href = cover(&resolved, &package);
     let navigation_source = navigation_source(&resolved, &by_id, &package);
     let info = pb::EpubInfo {
@@ -742,8 +756,8 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     // which of the entries they inflate the walk is going to send.
     let chapter_entries: HashSet<usize> = spine
         .iter()
-        .map(|(position, _)| {
-            resolved[*position]
+        .map(|(_, source, _)| {
+            resolved[*source]
                 .entry
                 .expect("checked while resolving the spine")
         })
@@ -933,8 +947,8 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     // --- Walk the spine ------------------------------------------------------
     let mut chapters = 0u32;
     let mut emitted = 0u32;
-    for (spine_index, (position, itemref)) in spine.iter().enumerate() {
-        let target = &resolved[*position];
+    for (spine_index, (primary, source, itemref)) in spine.iter().enumerate() {
+        let target = &resolved[*source];
         let chapter_entry = target.entry.expect("checked while resolving the spine");
 
         while pending
@@ -968,6 +982,19 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
                 metrics,
             )?,
         };
+        // When the chapter is a fallback, the spine item it stands in for is
+        // still named, as long as it has an archive path to name.
+        let spine_item = &resolved[*primary];
+        let primary_href =
+            if primary == source || spine_item.remote || spine_item.unusable.is_some() {
+                String::new()
+            } else {
+                spine_item.path.clone()
+            };
+        let mut media_overlay_href = overlay_href(*source);
+        if media_overlay_href.is_empty() {
+            media_overlay_href = overlay_href(*primary);
+        }
         sink.emit(pb::parse_epub_response::Event::Chapter(pb::Chapter {
             spine_index: u32::try_from(spine_index).unwrap_or(u32::MAX),
             idref: itemref.idref.clone(),
@@ -976,7 +1003,8 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             content,
             linear: itemref.linear,
             properties: target.item.properties.clone(),
-            media_overlay_href: overlay_href(*position),
+            media_overlay_href,
+            primary_href,
         }))?;
         metrics.chapter_emitted();
         chapters += 1;
@@ -1012,6 +1040,58 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
         warnings: warnings.entries,
     }))?;
     Ok(())
+}
+
+/// Longest manifest fallback chain followed from a spine item.
+///
+/// A chain is a list of manifest ids that a hostile OPF can make as long as
+/// the manifest, or loop; real ones are one or two links long.
+const MAX_FALLBACK_CHAIN: usize = 16;
+
+/// Whether a media type is markup the HTML collector reads as a chapter.
+fn is_markup(media_type: &str) -> bool {
+    let media_type = media_type.trim().to_ascii_lowercase();
+    matches!(
+        media_type.split(';').next().unwrap_or("").trim(),
+        "application/xhtml+xml" | "text/html" | "text/x-oeb1-document"
+    )
+}
+
+/// The manifest item a spine item's chapter is read from.
+///
+/// The spine item itself when it is XHTML or HTML, which every reflowable
+/// EPUB 3 chapter is. Otherwise the first XHTML or HTML item in its
+/// `fallback` chain that the archive holds: the reading the EPUB
+/// specification asks of a reader that cannot use the spine item, and the
+/// right one here, because the chapter is for the HTML collector. A comic or
+/// fixed-layout book whose spine items are images, each falling back to the
+/// XHTML page that shows it, is read through those pages. Failing that, the
+/// first item in the chain the archive holds at all, so an image page with
+/// no fallback is still a chapter. `None` when the chain holds nothing the
+/// archive has.
+fn chapter_source(
+    primary: usize,
+    resolved: &[Resolved<'_>],
+    by_id: &HashMap<&str, usize>,
+) -> Option<usize> {
+    let mut chain = vec![primary];
+    while chain.len() < MAX_FALLBACK_CHAIN {
+        let fallback = resolved[chain[chain.len() - 1]].item.fallback.as_str();
+        if fallback.is_empty() {
+            break;
+        }
+        match by_id.get(fallback) {
+            Some(next) if !chain.contains(next) => chain.push(*next),
+            _ => break,
+        }
+    }
+    let held = |position: &&usize| resolved[**position].entry.is_some();
+    chain
+        .iter()
+        .filter(held)
+        .find(|position| is_markup(&resolved[**position].item.media_type))
+        .or_else(|| chain.iter().find(held))
+        .copied()
 }
 
 /// Where a book's navigation lives, and which dialect it is written in.

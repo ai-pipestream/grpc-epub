@@ -18,7 +18,8 @@
 //! - the book's own table of contents, as `Document.outline`, with each entry
 //!   pointing at the chapter group it names;
 //! - one `GROUP_LABEL_CHAPTER` group per spine item, in spine order, **with no
-//!   children**;
+//!   children**, except that a spine item which is itself an image holds its
+//!   picture;
 //! - one `PictureItem` per emitted image resource, pointing at the bytes
 //!   rather than carrying them.
 //!
@@ -118,8 +119,9 @@ pub fn source_hash(bytes: &[u8]) -> u64 {
 /// A Document is one gRPC message and clients commonly cap receives at 4 MiB,
 /// so image bytes never go inside it — not even the cover. `epub:` plus the
 /// resolved archive path is a **pointer into this call's own typed stream**:
-/// the `resource` event with that `href` carries the bytes. It is not a
-/// registered URI scheme and nothing dereferences it over a network.
+/// the `resource` event with that `href` carries the bytes, or the `chapter`
+/// event for a spine item that is itself an image. It is not a registered URI
+/// scheme and nothing dereferences it over a network.
 pub const URI_SCHEME: &str = "epub:";
 
 /// JSON Pointer of the body group, the parent of everything this fold makes.
@@ -625,6 +627,18 @@ impl DocumentFold {
             ..doc::GroupItem::default()
         });
         self.link_child(BODY_REF, &self_ref);
+        // A spine item that is itself an image, with no XHTML fallback (a
+        // comic page), has no markup for the HTML collector to fill the group
+        // with. The image is the chapter, so its picture goes in the group,
+        // pointing at the bytes on this same `chapter` event.
+        if is_image(&chapter.media_type) {
+            self.add_picture(
+                &self_ref,
+                &chapter.href,
+                &chapter.idref,
+                &chapter.media_type,
+            );
+        }
         // The key an outline entry and a media overlay both name their target
         // by. Recorded here because this is where the group's ref is known.
         self.chapter_refs.insert(chapter.href.clone(), self_ref);
@@ -637,29 +651,39 @@ impl DocumentFold {
     /// does not read XHTML. The coordinator learns it from the HTML
     /// collector's own picture items.
     fn picture(&mut self, resource: &pb::Resource) {
+        self.add_picture(
+            BODY_REF,
+            &resource.href,
+            &resource.manifest_id,
+            &resource.media_type,
+        );
+    }
+
+    /// Append one picture of the archive entry `href` under `parent_ref`.
+    fn add_picture(&mut self, parent_ref: &str, href: &str, manifest_id: &str, media_type: &str) {
         let self_ref = format!("#/pictures/{}", self.document.pictures.len());
 
         let mut fields = HashMap::new();
-        fields.insert("epub.href".to_owned(), text(&resource.href));
-        fields.insert("epub.manifest_id".to_owned(), text(&resource.manifest_id));
-        if !self.cover_href.is_empty() && resource.href == self.cover_href {
+        fields.insert("epub.href".to_owned(), text(href));
+        fields.insert("epub.manifest_id".to_owned(), text(manifest_id));
+        if !self.cover_href.is_empty() && href == self.cover_href {
             fields.insert("epub.cover".to_owned(), flag(true));
         }
 
         self.document.pictures.push(doc::PictureItem {
             self_ref: self_ref.clone(),
-            parent: Some(reference(BODY_REF)),
+            parent: Some(reference(parent_ref)),
             content_layer: doc::ContentLayer::Body as i32,
             label: doc::DocItemLabel::Picture as i32,
             image: Some(doc::ImageRef {
-                mimetype: resource.media_type.clone(),
+                mimetype: media_type.to_owned(),
                 // Nothing here decodes an image — the manifest's declared
                 // media type is all this service knows about it — so there
                 // are no pixel dimensions and no dpi to report. An unset
                 // `size` says "unknown"; a `Size` of 0x0 would be a claim.
                 dpi: 0,
                 size: None,
-                uri: format!("{URI_SCHEME}{}", resource.href),
+                uri: format!("{URI_SCHEME}{href}"),
                 ..doc::ImageRef::default()
             }),
             meta: Some(doc::PictureMeta {
@@ -669,7 +693,7 @@ impl DocumentFold {
             source: vec![self.collector_source()],
             ..doc::PictureItem::default()
         });
-        self.link_child(BODY_REF, &self_ref);
+        self.link_child(parent_ref, &self_ref);
     }
 
     /// This collector's attribution, for the items that have a slot for it.
@@ -748,6 +772,14 @@ impl Default for DocumentFold {
     fn default() -> Self {
         Self::for_this_build()
     }
+}
+
+/// Whether a declared media type is an image.
+fn is_image(media_type: &str) -> bool {
+    media_type
+        .trim()
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
 }
 
 /// An empty document with its two roots in place.
@@ -1176,6 +1208,7 @@ mod tests {
             linear: true,
             properties: Vec::new(),
             media_overlay_href: String::new(),
+            primary_href: String::new(),
         })
     }
 
