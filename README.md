@@ -190,7 +190,7 @@ Events already delivered stay valid.
 | `RESOURCE_EXHAUSTED` | upload, entry count, total inflated size or an entry's compression ratio over its cap, or the server already holding as much upload as its process-wide budget allows |
 | `INVALID_ARGUMENT` | not a ZIP, truncated, or an EPUB whose `container.xml`, OPF or spine is missing or unusable, a spine href that escapes the archive included |
 | `UNIMPLEMENTED` | a ZIP that is not an EPUB, or one this build cannot open: DRM, entry encryption, or a compression method outside store and deflate |
-| `DEADLINE_EXCEEDED` | no request frame arrived within the idle timeout |
+| `DEADLINE_EXCEEDED` | no request frame arrived within the idle timeout, or the whole upload was not in within the upload timeout |
 | `INTERNAL` | a bug here; the parser panicked |
 
 `grpc.health.v1.Health` is registered and reports
@@ -213,11 +213,12 @@ Events already delivered stay valid.
 | `GRPC_EPUB_MAX_CONCURRENT_PARSES` | `8` | calls that may inflate at once; further calls wait |
 | `GRPC_EPUB_MAX_BUFFERED_UPLOAD_MIB` | document cap × parse slots (`2048`) | upload bytes the process holds at once across every call; an upload that would pass it fails with `RESOURCE_EXHAUSTED` instead of waiting; never below the document cap |
 | `GRPC_EPUB_IDLE_TIMEOUT_SECONDS` | `30` | longest wait for the next request frame; past it the call ends with `DEADLINE_EXCEEDED` and frees its share of the upload budget |
+| `GRPC_EPUB_UPLOAD_TIMEOUT_SECONDS` | `300` | longest a call's whole upload may take, options frame included; past it the call ends with `DEADLINE_EXCEEDED` and frees its share of the upload budget, however steadily it was sending |
 
 Every size limit is also readable at runtime through `GetServiceInfo` (the
-idle timeout is not on the wire). The same RPC carries a `ui` block (`title`,
-`path`, `description`) advertising this service's tab in the shared demo
-shell.
+idle and upload timeouts are not on the wire; both are in the startup line).
+The same RPC carries a `ui` block (`title`, `path`, `description`)
+advertising this service's tab in the shared demo shell.
 
 ## Web demo
 
@@ -264,7 +265,9 @@ summed over every open stream, are capped by
 `GRPC_EPUB_MAX_BUFFERED_UPLOAD_MIB`: an upload that would pass it is refused
 with `RESOURCE_EXHAUSTED` while it arrives, so opening many streams cannot make
 the server buffer an upload's worth of memory for each. A stream that sends
-nothing for the idle timeout is ended and its share given back.
+nothing for the idle timeout is ended and its share given back, and so is one
+whose upload is still not complete after the upload timeout, so a client
+trickling bytes in just inside the idle timeout cannot hold its share forever.
 
 Path traversal is refused, not sanitized. Entry names and OPF hrefs are
 percent-decoded, then normalized (a backslash is read as the `/` a Windows zip

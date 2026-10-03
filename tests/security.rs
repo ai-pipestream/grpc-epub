@@ -721,6 +721,59 @@ async fn an_idle_upload_gives_its_budget_back() {
     assert_eq!(common::status(&events).chapters_emitted, 1);
 }
 
+/// A client that keeps sending, but too slowly to finish, gives its share of
+/// the budget back too.
+///
+/// Each frame here arrives well inside the idle timeout, so that clock never
+/// runs out; without a bound on the whole upload, a client trickling a frame
+/// in just under it could hold its share of the budget, and so shut every
+/// other caller out, for as long as it liked.
+#[tokio::test]
+async fn a_trickled_upload_gives_its_budget_back() {
+    let harness = common::start_service(
+        EpubGrpc::new(tight_budget())
+            .with_idle_timeout(Duration::from_millis(500))
+            .with_upload_timeout(Duration::from_millis(1500)),
+    )
+    .await;
+    let book = padded_book(7 * MIB + MIB / 2);
+    let (tx, rest, trickled) = stalled_upload(&harness, &book).await;
+
+    // One small frame every 100 ms, a fifth of the idle timeout, until the
+    // server ends the call or the test gives up on it.
+    let trickle = tokio::spawn(async move {
+        let mut frames = rest.into_iter();
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let frame = frames
+                .next()
+                .map_or_else(|| vec![0], |frame| frame[..1].to_vec());
+            if tx.send(chunk_frame(&frame)).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let status = tokio::time::timeout(Duration::from_secs(10), trickled)
+        .await
+        .expect("the server gives up on an upload that never finishes")
+        .expect("task")
+        .expect_err("a trickled call is ended");
+    assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+    assert!(
+        status.message().contains("not complete"),
+        "the upload clock, not the idle one, must be what ended it: {}",
+        status.message()
+    );
+    trickle.abort();
+
+    let events = harness
+        .parse(&padded_book(3 * MIB), pb::ParseOptions::default())
+        .await
+        .expect("the trickled call's share of the budget was given back");
+    assert_eq!(common::status(&events).chapters_emitted, 1);
+}
+
 /// A call waiting for a parse slot still has its upload read.
 ///
 /// The budget fails a call rather than making it wait, and this is why. A

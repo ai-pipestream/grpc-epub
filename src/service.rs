@@ -18,6 +18,12 @@
 //! the budget back. For the same reason the parse slot is taken only after
 //! the upload is complete: every upload keeps being read.
 //!
+//! Refusing rather than waiting makes the budget something a client can
+//! hold, so two clocks bound how long it is held. The idle timeout ends a
+//! stream that sends nothing; the upload timeout ends one that keeps sending
+//! too slowly to finish, a byte at a time just inside the idle timeout, which
+//! the idle timeout alone would let hold its share forever.
+//!
 //! The parse itself runs on [`tokio::task::spawn_blocking`], because inflating
 //! is CPU-bound and would otherwise occupy an async worker for the length of a
 //! book. [`crate::extract::Sink`] carries backpressure across that boundary:
@@ -58,6 +64,21 @@ const CONSUMER_STALL: Duration = Duration::from_secs(30);
 /// kept the connection up.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default for how long a call's whole upload may take, from the call's
+/// first frame to its last.
+///
+/// Five minutes moves a full 256 MiB upload at under 1 MiB/s, slower than any
+/// link a collector in this fleet sits behind, and still stops a client that
+/// trickles a frame in just under the idle timeout from holding its share of
+/// the upload budget indefinitely.
+pub const DEFAULT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Stand-in for "no deadline" when a timeout is too large to add to now.
+///
+/// `Instant + Duration` panics on overflow, and a timeout read from the
+/// environment can be anything; a year is as good as forever for one call.
+const FOREVER: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 /// Bytes of upload buffer one permit of the upload budget stands for.
 ///
 /// Counted in KiB rather than bytes because one reservation is a `u32`, and
@@ -79,6 +100,8 @@ pub struct EpubGrpc {
     upload_budget: Arc<tokio::sync::Semaphore>,
     /// Longest wait for the next request frame before the call is ended.
     idle_timeout: Duration,
+    /// Longest a call's whole upload may take before the call is ended.
+    upload_timeout: Duration,
 }
 
 impl EpubGrpc {
@@ -115,6 +138,7 @@ impl EpubGrpc {
                     .min(tokio::sync::Semaphore::MAX_PERMITS),
             )),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            upload_timeout: DEFAULT_UPLOAD_TIMEOUT,
         }
     }
 
@@ -126,6 +150,18 @@ impl EpubGrpc {
     #[must_use]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    /// Override how long a call's whole upload may take, options frame
+    /// included.
+    ///
+    /// Past it the call ends with `DEADLINE_EXCEEDED` and gives its share of
+    /// the upload budget back, however steadily it was sending. Raised to one
+    /// millisecond if smaller: an upload is always bounded.
+    #[must_use]
+    pub fn with_upload_timeout(mut self, timeout: Duration) -> Self {
+        self.upload_timeout = timeout.max(Duration::from_millis(1));
         self
     }
 
@@ -163,11 +199,12 @@ impl pb::epub_parse_service_server::EpubParseService for EpubGrpc {
         request: Request<Streaming<pb::ParseEpubRequest>>,
     ) -> Result<Response<Self::ParseEpubStream>, Status> {
         let mut inbound = request.into_inner();
+        let clock = UploadClock::start(self.idle_timeout, self.upload_timeout);
 
         // Options first, so every way the request can be rejected outright is
         // resolved before the response stream opens. Once it is open, only the
         // parse can end it badly.
-        let options = match next_frame(&mut inbound, self.idle_timeout).await? {
+        let options = match clock.next_frame(&mut inbound).await? {
             Some(pb::ParseEpubRequest {
                 frame: Some(pb::parse_epub_request::Frame::Options(options)),
             }) => options,
@@ -188,7 +225,7 @@ impl pb::epub_parse_service_server::EpubParseService for EpubGrpc {
         // the module documentation for why it is read before the slot is
         // taken rather than after.
         let (bytes, upload) = self
-            .receive(&mut inbound, effective.max_document_bytes)
+            .receive(&mut inbound, &clock, effective.max_document_bytes)
             .await?;
 
         // Acquired before the upload is handed to a thread, so the slots
@@ -303,12 +340,13 @@ impl EpubGrpc {
     async fn receive(
         &self,
         inbound: &mut Streaming<pb::ParseEpubRequest>,
+        clock: &UploadClock,
         max_document_bytes: u64,
     ) -> Result<(Vec<u8>, Option<OwnedSemaphorePermit>), Status> {
         let cap = usize::try_from(max_document_bytes).unwrap_or(usize::MAX);
         let mut bytes: Vec<u8> = Vec::new();
         let mut held: Option<OwnedSemaphorePermit> = None;
-        while let Some(request) = next_frame(inbound, self.idle_timeout).await? {
+        while let Some(request) = clock.next_frame(inbound).await? {
             let chunk = match request.frame {
                 Some(pb::parse_epub_request::Frame::Chunk(chunk)) => chunk,
                 Some(pb::parse_epub_request::Frame::Options(_)) => {
@@ -395,24 +433,67 @@ impl EpubGrpc {
     }
 }
 
-/// Wait for the next request frame, for at most `idle`.
-///
-/// # Errors
-///
-/// `DEADLINE_EXCEEDED` when nothing arrives in time, or whatever status the
-/// transport reports for a broken stream.
-async fn next_frame(
-    inbound: &mut Streaming<pb::ParseEpubRequest>,
+/// The two clocks one call's upload runs against.
+#[derive(Clone, Copy, Debug)]
+struct UploadClock {
+    /// Longest wait for any one frame.
     idle: Duration,
-) -> Result<Option<pb::ParseEpubRequest>, Status> {
-    tokio::time::timeout(idle, inbound.message())
-        .await
-        .map_err(|_| {
-            Status::deadline_exceeded(format!(
-                "no request frame arrived for {} ms; an idle stream may not hold server memory",
-                idle.as_millis()
-            ))
-        })?
+    /// Longest the whole upload may take, for the message.
+    total: Duration,
+    /// When the whole upload must be in.
+    deadline: tokio::time::Instant,
+}
+
+impl UploadClock {
+    /// Start both clocks now, at the call's first frame.
+    fn start(idle: Duration, total: Duration) -> Self {
+        Self {
+            idle,
+            total,
+            deadline: after(total),
+        }
+    }
+
+    /// Wait for the next request frame, until the idle timeout or the upload
+    /// deadline, whichever comes first.
+    ///
+    /// # Errors
+    ///
+    /// `DEADLINE_EXCEEDED` when nothing arrives in time, naming which clock
+    /// ran out, or whatever status the transport reports for a broken stream.
+    async fn next_frame(
+        &self,
+        inbound: &mut Streaming<pb::ParseEpubRequest>,
+    ) -> Result<Option<pb::ParseEpubRequest>, Status> {
+        let idle_at = after(self.idle);
+        if idle_at < self.deadline {
+            tokio::time::timeout_at(idle_at, inbound.message())
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded(format!(
+                        "no request frame arrived for {} ms; an idle stream may not hold server \
+                         memory",
+                        self.idle.as_millis()
+                    ))
+                })?
+        } else {
+            tokio::time::timeout_at(self.deadline, inbound.message())
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded(format!(
+                        "the upload was not complete within {} ms; send the book faster or raise \
+                         the server's upload timeout",
+                        self.total.as_millis()
+                    ))
+                })?
+        }
+    }
+}
+
+/// The instant `wait` from now, or [`FOREVER`] from now if that overflows.
+fn after(wait: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(wait).unwrap_or(now + FOREVER)
 }
 
 /// Render a `JoinError` into something worth putting on the wire.
