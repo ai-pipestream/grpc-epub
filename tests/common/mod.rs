@@ -477,6 +477,10 @@ struct Header {
     flags_at: usize,
     /// Offset of the compression method.
     method_at: usize,
+    /// Offset of the stored (compressed) size.
+    stored_size_at: usize,
+    /// Offset of the declared inflated size.
+    declared_size_at: usize,
     /// Offset of the file name length.
     name_length_at: usize,
     /// Offset of the file name itself.
@@ -489,6 +493,8 @@ const HEADERS: [Header; 2] = [
         signature: b"PK\x03\x04",
         flags_at: 6,
         method_at: 8,
+        stored_size_at: 18,
+        declared_size_at: 22,
         name_length_at: 26,
         name_at: 30,
     },
@@ -496,6 +502,8 @@ const HEADERS: [Header; 2] = [
         signature: b"PK\x01\x02",
         flags_at: 8,
         method_at: 10,
+        stored_size_at: 20,
+        declared_size_at: 24,
         name_length_at: 28,
         name_at: 46,
     },
@@ -508,17 +516,43 @@ const HEADERS: [Header; 2] = [
 /// archive it cannot read. Patching the headers is how a test still gets one,
 /// and it is exactly the archive an attacker would hand the server.
 pub fn patch_compression_method(archive: &mut [u8], name: &str, method: u16) {
-    patch(archive, name, |header| header.method_at, method);
+    patch(
+        archive,
+        name,
+        |header| header.method_at,
+        &method.to_le_bytes(),
+    );
 }
 
 /// Set the encryption flag (general-purpose bit 0) on every header naming
 /// `name`, producing the archive a DRM'd or obfuscated entry actually is.
 pub fn patch_encrypted(archive: &mut [u8], name: &str) {
-    patch(archive, name, |header| header.flags_at, 1);
+    patch(archive, name, |header| header.flags_at, &1u16.to_le_bytes());
 }
 
-/// Write `value` into one 16-bit field of every header naming `name`.
-fn patch(archive: &mut [u8], name: &str, field: fn(&Header) -> usize, value: u16) {
+/// Overwrite the inflated size every header naming `name` declares: the
+/// archive whose central directory lies about how large an entry is.
+pub fn patch_declared_size(archive: &mut [u8], name: &str, size: u32) {
+    patch(
+        archive,
+        name,
+        |header| header.declared_size_at,
+        &size.to_le_bytes(),
+    );
+}
+
+/// Overwrite the stored size every header naming `name` declares.
+pub fn patch_stored_size(archive: &mut [u8], name: &str, size: u32) {
+    patch(
+        archive,
+        name,
+        |header| header.stored_size_at,
+        &size.to_le_bytes(),
+    );
+}
+
+/// Write `value` into one little-endian field of every header naming `name`.
+fn patch(archive: &mut [u8], name: &str, field: fn(&Header) -> usize, value: &[u8]) {
     for header in &HEADERS {
         let mut position = 0;
         while position + header.name_at + name.len() <= archive.len() {
@@ -536,7 +570,7 @@ fn patch(archive: &mut [u8], name: &str, field: fn(&Header) -> usize, value: u16
                 && &archive[start..start + length] == name.as_bytes()
             {
                 let at = position + field(header);
-                archive[at..at + 2].copy_from_slice(&value.to_le_bytes());
+                archive[at..at + value.len()].copy_from_slice(value);
             }
             position += 4;
         }

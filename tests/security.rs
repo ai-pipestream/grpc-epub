@@ -70,6 +70,55 @@ async fn a_decompression_bomb_is_refused_on_its_ratio() {
     );
 }
 
+/// A bomb whose central directory understates it is stopped while it
+/// inflates, as soon as it passes the ratio.
+///
+/// The header claims a thousand bytes, so nothing checked before inflating
+/// sees a problem. The ratio rule used to be applied only once the entry was
+/// whole, so the entry inflated until the total budget stopped it; with the
+/// budget at 4 MiB that is the decompressed-size cap firing. Checked on every
+/// chunk, the ratio stops the same entry at about 1.6 MiB, long before.
+#[tokio::test]
+async fn a_bomb_with_a_lying_header_is_stopped_while_it_inflates() {
+    let harness = common::start().await;
+    let mut archive = bomb_book();
+    common::patch_declared_size(&mut archive, common::CHAP2, 1000);
+
+    let status = harness
+        .parse(
+            &archive,
+            pb::ParseOptions {
+                max_uncompressed_mib: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a bomb is a bomb whatever its header says");
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert!(
+        status.message().contains("bomb"),
+        "the ratio, not the budget, must be what stopped it: {}",
+        status.message()
+    );
+}
+
+/// A bomb whose header claims to be stored in more bytes than the archive
+/// holds is measured against the bytes the archive actually has.
+///
+/// Claiming a two-gigabyte stored size makes any entry look barely
+/// compressed. Without a ceiling on the claim, this 8 MiB bomb passed the
+/// ratio rule outright and went to the client as a chapter.
+#[tokio::test]
+async fn a_bomb_claiming_a_huge_stored_size_is_still_a_bomb() {
+    let harness = common::start().await;
+    let mut archive = bomb_book();
+    common::patch_stored_size(&mut archive, common::CHAP2, 0x7fff_ffff);
+
+    let status = harness.parse_err(&archive).await;
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert!(status.message().contains("bomb"), "{}", status.message());
+}
+
 /// A caller may raise the ratio; the total cap then stops the same file.
 ///
 /// Two rules rather than one, because either alone has a hole: the ratio

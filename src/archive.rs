@@ -16,9 +16,17 @@
 //!
 //! Rules 2 and 3 are enforced twice: once against the sizes the central
 //! directory declares, which is free and rejects the honest bomb before a byte
-//! is inflated, and once against what actually came out of the decompressor,
-//! which is what catches a header that lies. Only the second is load-bearing;
-//! the first exists so the common case costs nothing.
+//! is inflated, and again against what is coming out of the decompressor, on
+//! every chunk as it arrives, which is what catches a header that lies. Only
+//! the second is load-bearing; the first exists so the common case costs
+//! nothing. Because the second runs while inflating rather than once the entry
+//! is whole, an entry whose header understates it is stopped as soon as it
+//! passes the ratio, not after it has filled the rest of the budget.
+//!
+//! The stored size a ratio is taken against is the declared one, but never
+//! more than the bytes in front of the central directory: no entry can be
+//! stored in more of the archive than there is, and believing a larger claim
+//! would let any entry pass the ratio rule.
 //!
 //! Nothing here touches the filesystem. `zip`'s `extract` family is never
 //! called, and the crate is built without the features that would let it
@@ -146,7 +154,8 @@ pub struct EntryInfo {
     pub name: String,
     /// Inflated size as declared. May be a lie; treated as a hint only.
     pub declared_size: u64,
-    /// Stored size as declared.
+    /// Stored size as declared, capped at the offset of the central
+    /// directory: an entry cannot be stored in more bytes than precede it.
     pub compressed_size: u64,
 }
 
@@ -183,6 +192,7 @@ pub fn scan(archive: &mut MemoryArchive<'_>) -> Result<Scan, Status> {
         entries: Vec::with_capacity(archive.len()),
         unusable: Vec::new(),
     };
+    let stored_ceiling = archive.central_directory_start();
     for index in 0..archive.len() {
         // `by_index_raw` reads the header without building a decompressor, so
         // this pass costs a seek per entry and no inflation.
@@ -207,7 +217,7 @@ pub fn scan(archive: &mut MemoryArchive<'_>) -> Result<Scan, Status> {
 
         let name = entry.name().to_owned();
         let declared_size = entry.size();
-        let compressed_size = entry.compressed_size();
+        let compressed_size = entry.compressed_size().min(stored_ceiling);
         drop(entry);
 
         let normalized = match crate::href::check_entry_name(&name) {
@@ -265,19 +275,20 @@ pub fn read_entry(
         if read == 0 {
             break;
         }
-        // Checked *before* the copy, so the allocation never overshoots the
-        // budget even by one chunk. This is the check that catches a central
-        // directory understating the entry.
-        if out.len() + read > ceiling {
+        // Both rules are checked against what the decompressor has produced
+        // so far, and *before* the copy, so the allocation never overshoots
+        // either of them even by one chunk. These are the checks that catch a
+        // central directory understating the entry.
+        let inflated = out.len() + read;
+        if inflated > ceiling {
             return Err(exhausted(&entry.name, budget.remaining));
         }
+        check_ratio(inflated as u64, entry.compressed_size, limits, &entry.name)?;
         out.extend_from_slice(&chunk[..read]);
     }
     drop(file);
 
     let actual = out.len() as u64;
-    check_ratio(actual, entry.compressed_size, limits, &entry.name)?;
-
     budget.remaining -= actual;
     budget.consumed += actual;
     budget.entries += 1;
