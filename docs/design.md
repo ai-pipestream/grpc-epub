@@ -284,9 +284,9 @@ name escapes the root, is absolute or holds a NUL is left out with
 `UNUSABLE_ENTRY_NAME`, since nothing can name it and so nothing in it is ever
 read or sent; a non-spine manifest href that cannot be resolved is a
 `MISSING_MANIFEST_ENTRY` warning. A backslash is read as a separator, because
-that is what a zip tool on Windows means by it. Two entries that normalize to
-the same path fail the call with `INVALID_ARGUMENT`, because the archive then
-has no single reading: the file served would be a choice, and a shadow
+that is what a zip tool on Windows means by it. Two entries at the same path,
+named identically or only normalizing alike, fail the call with
+`INVALID_ARGUMENT`, because the archive then has no single reading: the file served would be a choice, and a shadow
 `META-INF/encryption.xml` could decide the DRM policy.
 
 **Spine items that are not XHTML read through their fallbacks.** EPUB lets a

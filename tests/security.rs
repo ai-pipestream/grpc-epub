@@ -351,6 +351,48 @@ async fn a_shadow_encryption_descriptor_is_refused() {
     );
 }
 
+/// Two entries with byte-identical names, the first declaring DRM.
+///
+/// The `zip` crate keeps one entry per raw name, the later one, so the empty
+/// descriptor would be the only `META-INF/encryption.xml` anything here
+/// could see, and the AES-encrypted book would parse. The dropped record is
+/// found by walking the central directory, so the archive is refused.
+#[tokio::test]
+async fn a_duplicate_encryption_descriptor_is_refused() {
+    let harness = common::start().await;
+    let mut archive = common::shell()
+        .add(
+            "META-INF/encryption.xml",
+            r#"<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"
+            xmlns:enc="http://www.w3.org/2001/04/xmlenc#">
+  <enc:EncryptedData>
+    <enc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/>
+    <enc:CipherData><enc:CipherReference URI="OEBPS/text/chap1.xhtml"/></enc:CipherData>
+  </enc:EncryptedData>
+</encryption>"#,
+        )
+        .add("META-INF/encryption.xm_", "<encryption/>")
+        .add(
+            common::OPF_PATH,
+            common::opf_xml(&[("ch1", "text/chap1.xhtml")], &[]),
+        )
+        .add(common::CHAP1, "ciphertext, not XHTML")
+        .build();
+    common::rename_entry(
+        &mut archive,
+        "META-INF/encryption.xm_",
+        "META-INF/encryption.xml",
+    );
+
+    let status = harness.parse_err(&archive).await;
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert!(
+        status.message().contains("two entries named"),
+        "{}",
+        status.message()
+    );
+}
+
 /// The same traversal in an OPF href rather than an entry name.
 #[tokio::test]
 async fn a_manifest_href_that_escapes_the_archive_is_refused() {

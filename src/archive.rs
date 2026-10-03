@@ -34,7 +34,7 @@
 //! called, and the crate is built without the features that would let it
 //! decode anything but store and deflate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 
 use tonic::Status;
@@ -51,6 +51,9 @@ const READ_CHUNK: usize = 64 * 1024;
 
 /// The signature every central directory record starts with (APPNOTE 4.3.12).
 const CENTRAL_RECORD_SIGNATURE: &[u8; 4] = b"PK\x01\x02";
+
+/// Length of a central directory record before its name (APPNOTE 4.3.12).
+const CENTRAL_RECORD_FIXED: usize = 46;
 
 /// The running decompression budget for one call.
 #[derive(Clone, Copy, Debug)]
@@ -128,9 +131,9 @@ pub fn zip_status(error: &ZipError) -> Status {
 ///
 /// # Errors
 ///
-/// `INVALID_ARGUMENT` when the bytes are not a ZIP or are truncated,
-/// `RESOURCE_EXHAUSTED` when the archive declares more entries than the call
-/// allows.
+/// `INVALID_ARGUMENT` when the bytes are not a ZIP, are truncated, or name
+/// one path in two central directory records, `RESOURCE_EXHAUSTED` when the
+/// archive declares more entries than the call allows.
 pub fn open<'a>(bytes: &'a [u8], limits: &Effective) -> Result<MemoryArchive<'a>, Status> {
     if bytes.is_empty() {
         return Err(Status::invalid_argument(
@@ -156,7 +159,7 @@ pub fn open<'a>(bytes: &'a [u8], limits: &Effective) -> Result<MemoryArchive<'a>
         )));
     }
 
-    let archive = ZipArchive::new(Cursor::new(bytes)).map_err(|e| zip_status(&e))?;
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|e| zip_status(&e))?;
 
     let entries = u32::try_from(archive.len()).unwrap_or(u32::MAX);
     if entries > limits.max_entries {
@@ -165,7 +168,70 @@ pub fn open<'a>(bytes: &'a [u8], limits: &Effective) -> Result<MemoryArchive<'a>
             limits.max_entries
         )));
     }
+    refuse_merged_records(bytes, &mut archive)?;
     Ok(archive)
+}
+
+/// Refuse an archive whose central directory names one raw path twice.
+///
+/// The `zip` crate keys its entries by raw name, so a record whose name an
+/// earlier record already used replaces that one: `len()`, `by_index` and
+/// `by_name` all see a single entry, the later one, and nothing the crate
+/// exposes says a record was dropped. A second `META-INF/encryption.xml`
+/// declaring nothing would then stand in for the first, which declares DRM,
+/// and the same goes for any chapter. [`scan`] catches two names that only
+/// normalize to one path; this catches the names that are already identical.
+///
+/// The crate reads the records back to back from the start of the central
+/// directory, and remembers where each surviving one began. So the records
+/// are walked here by their own lengths, and a record that begins where no
+/// surviving entry does is one the crate dropped. A dropped record always
+/// precedes the one that replaced it, so the walk stops at the last surviving
+/// record and never reads further than the crate did.
+///
+/// Not the signature count from [`open`] against `len()`: that count also
+/// finds signatures inside stored payloads, which is harmless for a ceiling
+/// and would refuse honest books as a test of equality.
+///
+/// # Errors
+///
+/// `INVALID_ARGUMENT` for a dropped record, or for records that do not lie
+/// where the crate read them, which would mean the walk had lost its place.
+fn refuse_merged_records(bytes: &[u8], archive: &mut MemoryArchive<'_>) -> Result<(), Status> {
+    let mut kept: HashSet<u64> = HashSet::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let entry = archive.by_index_raw(index).map_err(|e| zip_status(&e))?;
+        kept.insert(entry.central_header_start());
+    }
+    let Some(&last) = kept.iter().max() else {
+        return Ok(());
+    };
+
+    let lost = || Status::invalid_argument("the central directory records do not lie end to end");
+    let mut at = archive.central_directory_start();
+    while at < last {
+        let start = usize::try_from(at).map_err(|_| lost())?;
+        let field = |offset: usize| -> Result<usize, Status> {
+            bytes
+                .get(start + offset..start + offset + 2)
+                .map(|le| usize::from(u16::from_le_bytes([le[0], le[1]])))
+                .ok_or_else(lost)
+        };
+        let (name_len, extra_len, comment_len) = (field(28)?, field(30)?, field(32)?);
+        if !kept.contains(&at) {
+            let name = bytes
+                .get(start + CENTRAL_RECORD_FIXED..start + CENTRAL_RECORD_FIXED + name_len)
+                .map(String::from_utf8_lossy)
+                .ok_or_else(lost)?;
+            return Err(Status::invalid_argument(format!(
+                "the archive holds two entries named {name:?}; an archive that holds two files \
+                 at one path has no single reading"
+            )));
+        }
+        let length = CENTRAL_RECORD_FIXED + name_len + extra_len + comment_len;
+        at += u64::try_from(length).map_err(|_| lost())?;
+    }
+    if at == last { Ok(()) } else { Err(lost()) }
 }
 
 /// What the central directory says about one entry, gathered without

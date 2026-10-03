@@ -618,6 +618,30 @@ pub fn patch_stored_size(archive: &mut [u8], name: &str, size: u32) {
 }
 
 /// Write `value` into one little-endian field of every header naming `name`.
+/// Rename every header of entry `from` to `to`, in place.
+///
+/// `ZipWriter` refuses to write two entries of one name, which is exactly
+/// the archive some tests need; they write a placeholder name of the same
+/// length and rename it afterwards. The name is not covered by the CRC, so
+/// the archive stays readable.
+///
+/// # Panics
+///
+/// If the names differ in length or `from` occurs nowhere.
+pub fn rename_entry(archive: &mut [u8], from: &str, to: &str) {
+    assert_eq!(from.len(), to.len(), "a rename in place keeps the length");
+    let mut renamed = 0;
+    let mut position = 0;
+    while position + from.len() <= archive.len() {
+        if &archive[position..position + from.len()] == from.as_bytes() {
+            archive[position..position + from.len()].copy_from_slice(to.as_bytes());
+            renamed += 1;
+        }
+        position += 1;
+    }
+    assert!(renamed > 0, "{from:?} is not in the archive");
+}
+
 fn patch(archive: &mut [u8], name: &str, field: fn(&Header) -> usize, value: &[u8]) {
     for header in &HEADERS {
         let mut position = 0;
