@@ -273,7 +273,10 @@ contain a NUL. Nothing here writes to disk, but the paths go out on the wire
 and a client that does write files would otherwise inherit the traversal.
 Refusing a path is not refusing the book: an unusable spine href or rootfile
 fails the call, while an unusable entry name or resource href only leaves that
-one file out, with a warning.
+one file out, with a warning. Two entries whose names normalize to one path
+(`OEBPS/ch1.xhtml` beside `OEBPS\ch1.xhtml`) are `INVALID_ARGUMENT`: whichever
+was served, a conforming reader might pick the other, and a second
+`META-INF/encryption.xml` could otherwise stand in for the one declaring DRM.
 
 XXE cannot happen by construction: quick-xml has no DTD processor, so it cannot
 fetch an external entity. On top of that, a `<!DOCTYPE>` declaring an

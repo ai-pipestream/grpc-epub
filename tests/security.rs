@@ -283,6 +283,74 @@ async fn a_spine_item_that_only_an_escaping_entry_could_supply_fails() {
     );
 }
 
+/// Two entries whose names differ only in their separators.
+///
+/// The `zip` crate sees two files; normalized, they are one path, and serving
+/// either would be a choice a conforming reader may not make the same way.
+/// A scanner that vetted `OEBPS/text/chap1.xhtml` would then have vetted
+/// bytes the client never gets.
+#[tokio::test]
+async fn two_entries_at_one_path_are_refused() {
+    let harness = common::start().await;
+    let archive = common::shell()
+        .add(
+            common::OPF_PATH,
+            common::opf_xml(&[("ch1", "text/chap1.xhtml")], &[]),
+        )
+        .add(common::CHAP1, common::chapter_xhtml("One", "vetted"))
+        .add(
+            "OEBPS\\text\\chap1.xhtml",
+            common::chapter_xhtml("One", "smuggled"),
+        )
+        .build();
+
+    let status = harness.parse_err(&archive).await;
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert!(
+        status.message().contains("both name"),
+        "{}",
+        status.message()
+    );
+}
+
+/// A second encryption descriptor cannot stand in for the one that declares
+/// DRM.
+///
+/// The real `META-INF/encryption.xml` encrypts the chapter with AES; a later
+/// entry spelled with a backslash declares nothing. Whichever of the two the
+/// lookup kept would decide the policy, so the archive is refused before
+/// either is read.
+#[tokio::test]
+async fn a_shadow_encryption_descriptor_is_refused() {
+    let harness = common::start().await;
+    let archive = common::shell()
+        .add(
+            "META-INF/encryption.xml",
+            r#"<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"
+            xmlns:enc="http://www.w3.org/2001/04/xmlenc#">
+  <enc:EncryptedData>
+    <enc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/>
+    <enc:CipherData><enc:CipherReference URI="OEBPS/text/chap1.xhtml"/></enc:CipherData>
+  </enc:EncryptedData>
+</encryption>"#,
+        )
+        .add("META-INF\\encryption.xml", "<encryption/>")
+        .add(
+            common::OPF_PATH,
+            common::opf_xml(&[("ch1", "text/chap1.xhtml")], &[]),
+        )
+        .add(common::CHAP1, "ciphertext, not XHTML")
+        .build();
+
+    let status = harness.parse_err(&archive).await;
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert!(
+        status.message().contains("META-INF/encryption.xml"),
+        "{}",
+        status.message()
+    );
+}
+
 /// The same traversal in an OPF href rather than an entry name.
 #[tokio::test]
 async fn a_manifest_href_that_escapes_the_archive_is_refused() {

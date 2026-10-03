@@ -34,6 +34,7 @@
 //! called, and the crate is built without the features that would let it
 //! decode anything but store and deflate.
 
+use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
 use tonic::Status;
@@ -207,16 +208,26 @@ pub struct Scan {
 /// careless zip tool does not have to cost the reader the whole book. If the
 /// book needed that entry, the spine or the container check says so.
 ///
+/// Two entries whose names normalize to the same path are fatal. The `zip`
+/// crate keys entries by their raw names, so `OEBPS/ch1.xhtml` and
+/// `OEBPS\ch1.xhtml` are two files to it and one path here, and whichever
+/// the lookup kept would be the one served: a second `META-INF/encryption.xml`
+/// could stand in for the one that declares DRM, or a chapter could carry
+/// other bytes than a conforming reader shows. There is no honest reading of
+/// such an archive, so there is no choice to make.
+///
 /// # Errors
 ///
 /// `UNIMPLEMENTED` for an encrypted entry or a compression method outside
-/// store and deflate.
+/// store and deflate, `INVALID_ARGUMENT` for two entries naming one path.
 pub fn scan(archive: &mut MemoryArchive<'_>) -> Result<Scan, Status> {
     let mut scan = Scan {
         entries: Vec::with_capacity(archive.len()),
         unusable: Vec::new(),
     };
     let stored_ceiling = archive.central_directory_start();
+    // Normalized path to the raw name that claimed it first.
+    let mut claimed: HashMap<String, String> = HashMap::with_capacity(archive.len());
     for index in 0..archive.len() {
         // `by_index_raw` reads the header without building a decompressor, so
         // this pass costs a seek per entry and no inflation.
@@ -252,6 +263,14 @@ pub fn scan(archive: &mut MemoryArchive<'_>) -> Result<Scan, Status> {
                 continue;
             }
         };
+
+        if let Some(first) = claimed.get(&normalized) {
+            return Err(Status::invalid_argument(format!(
+                "archive entries {first:?} and {name:?} both name {normalized:?}; an archive \
+                 that holds two files at one path has no single reading"
+            )));
+        }
+        claimed.insert(normalized.clone(), name);
 
         scan.entries.push(EntryInfo {
             index,
