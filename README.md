@@ -250,8 +250,9 @@ control below has a test in `tests/security.rs` built by the test itself, so
 the attack is legible in the source.
 
 Decompression bombs are covered by three rules, because each covers a hole the
-others leave: an entry-count check from the central directory, a running total
-of inflated bytes, and a per-entry inflated-to-stored ratio above a size floor.
+others leave: an entry-count check made before the central directory is even
+parsed (the parse allocates for every entry it lists), a running total of
+inflated bytes, and a per-entry inflated-to-stored ratio above a size floor.
 The last two are enforced against what actually comes out of the decompressor,
 not just against the sizes the archive declares, so a lying header is caught
 too. Over any of them is `RESOURCE_EXHAUSTED`, raised partway through the

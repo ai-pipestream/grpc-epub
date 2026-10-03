@@ -5,9 +5,11 @@
 //! This is where the zip-bomb policy from `docs/design.md` lives. Three rules,
 //! each covering a hole the others leave:
 //!
-//! 1. **Entry count**, checked against the central directory before anything
-//!    is inflated. Cheap, and it stops the archive whose whole payload is a
-//!    million zero-byte names.
+//! 1. **Entry count**, checked before anything is inflated, and before the
+//!    central directory is even parsed: the `zip` crate builds a record for
+//!    every entry the directory lists before it says how many there are, at
+//!    a dozen times the bytes each one takes in the archive. Cheap, and it
+//!    stops the archive whose whole payload is a million zero-byte names.
 //! 2. **Total inflated bytes**, a running budget across every entry the call
 //!    extracts. This is the heap ceiling.
 //! 3. **Per-entry ratio**, inflated over stored. The total alone lets an
@@ -45,6 +47,9 @@ pub type MemoryArchive<'a> = ZipArchive<Cursor<&'a [u8]>>;
 
 /// Inflated bytes read in one pass before the budget is re-checked.
 const READ_CHUNK: usize = 64 * 1024;
+
+/// The signature every central directory record starts with (APPNOTE 4.3.12).
+const CENTRAL_RECORD_SIGNATURE: &[u8; 4] = b"PK\x01\x02";
 
 /// The running decompression budget for one call.
 #[derive(Clone, Copy, Debug)]
@@ -131,6 +136,25 @@ pub fn open<'a>(bytes: &'a [u8], limits: &Effective) -> Result<MemoryArchive<'a>
             "the upload was empty; send the EPUB as one or more `chunk` frames",
         ));
     }
+
+    // `ZipArchive::new` parses every record the central directory declares,
+    // and allocates for each, before the count below can be checked: a
+    // 256 MiB upload of forged ZIP64 records costs it gigabytes. Each record
+    // it parses starts with this signature, so the number of signatures in
+    // the upload bounds what it will build, and counting them is one pass
+    // over bytes already in memory. A conforming archive holds one per entry,
+    // plus whatever its stored payloads happen to contain.
+    let records = bytes
+        .windows(CENTRAL_RECORD_SIGNATURE.len())
+        .filter(|window| window == CENTRAL_RECORD_SIGNATURE)
+        .count();
+    if records > limits.max_entries as usize {
+        return Err(Status::resource_exhausted(format!(
+            "the archive holds {records} central directory records, over the {} entries allowed",
+            limits.max_entries
+        )));
+    }
+
     let archive = ZipArchive::new(Cursor::new(bytes)).map_err(|e| zip_status(&e))?;
 
     let entries = u32::try_from(archive.len()).unwrap_or(u32::MAX);
@@ -355,6 +379,71 @@ mod tests {
     fn a_stored_entry_never_trips_the_ratio_rule() {
         let limits = Effective::default();
         assert!(check_ratio(64 * 1024 * 1024, 64 * 1024 * 1024, &limits, "big.png").is_ok());
+    }
+
+    /// A ZIP64 archive whose central directory lists `count` empty entries,
+    /// every one pointing at the same local header: about 50 bytes of upload
+    /// per entry a reader has to build a record for.
+    fn forged_zip64(count: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        // The one local header: an empty stored file named "a".
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&[20, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.push(b'a');
+        let directory = out.len() as u64;
+        for index in 0..count {
+            out.extend_from_slice(CENTRAL_RECORD_SIGNATURE);
+            out.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0]);
+            out.extend_from_slice(&[0; 16]);
+            out.extend_from_slice(&4u16.to_le_bytes()); // a distinct 4-byte name
+            out.extend_from_slice(&[0; 12]);
+            out.extend_from_slice(&0u32.to_le_bytes()); // local header at 0
+            out.extend_from_slice(&index.to_le_bytes());
+        }
+        let size = out.len() as u64 - directory;
+        let zip64_end = out.len() as u64;
+        out.extend_from_slice(b"PK\x06\x06");
+        out.extend_from_slice(&44u64.to_le_bytes());
+        out.extend_from_slice(&[45, 0, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&u64::from(count).to_le_bytes());
+        out.extend_from_slice(&u64::from(count).to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&directory.to_le_bytes());
+        out.extend_from_slice(b"PK\x06\x07");
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&zip64_end.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&[0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+        out.extend_from_slice(&[0xff; 8]);
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    /// The entry count is enforced before the central directory is parsed.
+    ///
+    /// Parsing it is what costs: the `zip` crate builds a record for every
+    /// entry the directory lists before it reports how many there are, at a
+    /// dozen times the bytes each takes in the archive, so a 256 MiB upload
+    /// of these cost it gigabytes before the count was ever compared.
+    #[test]
+    fn a_forged_directory_is_refused_before_it_is_parsed() {
+        let forged = forged_zip64(100_000);
+        assert!(
+            ZipArchive::new(Cursor::new(forged.as_slice())).is_ok(),
+            "the forgery is a readable archive, so only the count stops it"
+        );
+
+        let status = open(&forged, &Effective::default()).expect_err("over the entry cap");
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            status.message().contains("central directory records"),
+            "refused by the signature count, before the crate parsed anything: {}",
+            status.message()
+        );
     }
 
     #[test]
