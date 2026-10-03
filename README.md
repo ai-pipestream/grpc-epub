@@ -101,7 +101,7 @@ when `emit_document` was set, one `document`, then one `status`.
 | Event | Carries |
 |---|---|
 | `info` | title, creators, contributors, language, identifiers, publisher, date, subjects, spine length, OPF path, EPUB version, cover href |
-| `chapter` | spine index, idref, resolved href, media type, XHTML bytes verbatim, `linear`, EPUB 3 properties |
+| `chapter` | spine index, idref, resolved href, media type, XHTML bytes verbatim, `linear`, EPUB 3 properties; for a spine item read through its manifest fallback (an image page of a comic), the fallback's href and bytes, with `primary_href` naming the spine item |
 | `resource` | resolved href, media type, kind, bytes, manifest id, properties |
 | `document` | the whole book as one `ai.pipestream.document.v1.Document`; opt-in, and always the event before `status` |
 | `status` | chapters and resources emitted, resources skipped, inflated bytes, entries read, warnings |
@@ -137,9 +137,11 @@ What it contains is the skeleton of the book:
 
 The chapter groups have no children, on purpose: chapter XHTML is not parsed
 here, and the groups exist so the HTML collector's items can merge into them
-downstream. Non-image resources (stylesheets, fonts, media, the nav document)
-are not projected at all; the Document schema has no item kind for them, and
-they are already on the typed stream in full.
+downstream. The exception is a spine item that is itself an image with no XHTML
+fallback, a comic page: its group holds its picture. Non-image resources
+(stylesheets, fonts, media, the nav document) are not projected at all; the
+Document schema has no item kind for them, and they are already on the typed
+stream in full.
 
 **Dates are instants, not strings.** `dcterms:created` (or `dc:date`, which is
 what an EPUB 2 book has instead) and `dcterms:modified` are read into
@@ -164,6 +166,7 @@ commonly cap receives at 4 MiB, so `ImageRef.uri` is a pointer, not a data URI:
 
 ```text
 epub:OEBPS/images/cover.png    the `resource` event with that href carries the bytes
+                               (the `chapter` event, for an image spine item)
 ```
 
 `ImageRef.size` is left unset because nothing here decodes an image, and `prov`
@@ -184,9 +187,10 @@ Events already delivered stay valid.
 
 | Code | When |
 |---|---|
-| `RESOURCE_EXHAUSTED` | upload, entry count, total inflated size or an entry's compression ratio over its cap |
-| `INVALID_ARGUMENT` | not a ZIP, truncated, path traversal in an entry name or href, or an EPUB whose `container.xml`, OPF or spine is missing or unusable |
+| `RESOURCE_EXHAUSTED` | upload, entry count, total inflated size or an entry's compression ratio over its cap, or the server already holding as much upload as its process-wide budget allows |
+| `INVALID_ARGUMENT` | not a ZIP, truncated, or an EPUB whose `container.xml`, OPF or spine is missing or unusable, a spine href that escapes the archive included |
 | `UNIMPLEMENTED` | a ZIP that is not an EPUB, or one this build cannot open: DRM, entry encryption, or a compression method outside store and deflate |
+| `DEADLINE_EXCEEDED` | no request frame arrived within the idle timeout, or the whole upload was not in within the upload timeout |
 | `INTERNAL` | a bug here; the parser panicked |
 
 `grpc.health.v1.Health` is registered and reports
@@ -207,10 +211,14 @@ Events already delivered stay valid.
 | `GRPC_EPUB_COMPRESSION_RATIO_FLOOR_BYTES` | `1048576` | size an entry must exceed before the ratio rule applies |
 | `GRPC_EPUB_MAX_CHUNK_BYTES` | `16777216` | largest single inbound `chunk` frame |
 | `GRPC_EPUB_MAX_CONCURRENT_PARSES` | `8` | calls that may inflate at once; further calls wait |
+| `GRPC_EPUB_MAX_BUFFERED_UPLOAD_MIB` | document cap × parse slots (`2048`) | upload bytes the process holds at once across every call; an upload that would pass it fails with `RESOURCE_EXHAUSTED` instead of waiting; never below the document cap |
+| `GRPC_EPUB_IDLE_TIMEOUT_SECONDS` | `30` | longest wait for the next request frame; past it the call ends with `DEADLINE_EXCEEDED` and frees its share of the upload budget |
+| `GRPC_EPUB_UPLOAD_TIMEOUT_SECONDS` | `300` | longest a call's whole upload may take, options frame included; past it the call ends with `DEADLINE_EXCEEDED` and frees its share of the upload budget, however steadily it was sending |
 
-Every limit is also readable at runtime through `GetServiceInfo`. The same RPC
-carries a `ui` block (`title`, `path`, `description`) advertising this
-service's tab in the shared demo shell.
+Every size limit is also readable at runtime through `GetServiceInfo` (the
+idle and upload timeouts are not on the wire; both are in the startup line).
+The same RPC carries a `ui` block (`title`, `path`, `description`)
+advertising this service's tab in the shared demo shell.
 
 ## Web demo
 
@@ -243,18 +251,36 @@ control below has a test in `tests/security.rs` built by the test itself, so
 the attack is legible in the source.
 
 Decompression bombs are covered by three rules, because each covers a hole the
-others leave: an entry-count check from the central directory, a running total
-of inflated bytes, and a per-entry inflated-to-stored ratio above a size floor.
+others leave: an entry-count check made before the central directory is even
+parsed (the parse allocates for every entry it lists), a running total of
+inflated bytes, and a per-entry inflated-to-stored ratio above a size floor.
 The last two are enforced against what actually comes out of the decompressor,
 not just against the sizes the archive declares, so a lying header is caught
 too. Over any of them is `RESOURCE_EXHAUSTED`, raised partway through the
 extract rather than after it.
 
+Memory is bounded per call and across calls. One upload is cut off at the
+document cap as it arrives, and the upload bytes the whole process holds,
+summed over every open stream, are capped by
+`GRPC_EPUB_MAX_BUFFERED_UPLOAD_MIB`: an upload that would pass it is refused
+with `RESOURCE_EXHAUSTED` while it arrives, so opening many streams cannot make
+the server buffer an upload's worth of memory for each. A stream that sends
+nothing for the idle timeout is ended and its share given back, and so is one
+whose upload is still not complete after the upload timeout, so a client
+trickling bytes in just inside the idle timeout cannot hold its share forever.
+
 Path traversal is refused, not sanitized. Entry names and OPF hrefs are
-percent-decoded, then normalized, then rejected if they escape the archive
-root, are absolute, or contain a NUL or a backslash. Nothing here writes to
-disk, but the paths go out on the wire and a client that does write files would
-otherwise inherit the traversal.
+percent-decoded, then normalized (a backslash is read as the `/` a Windows zip
+tool meant), then rejected if they escape the archive root, are absolute, or
+contain a NUL. Nothing here writes to disk, but the paths go out on the wire
+and a client that does write files would otherwise inherit the traversal.
+Refusing a path is not refusing the book: an unusable spine href or rootfile
+fails the call, while an unusable entry name or resource href only leaves that
+one file out, with a warning. Two entries at one path, whether their names
+are identical or only normalize alike (`OEBPS/ch1.xhtml` beside
+`OEBPS\ch1.xhtml`), are `INVALID_ARGUMENT`: whichever
+was served, a conforming reader might pick the other, and a second
+`META-INF/encryption.xml` could otherwise stand in for the one declaring DRM.
 
 XXE cannot happen by construction: quick-xml has no DTD processor, so it cannot
 fetch an external entity. On top of that, a `<!DOCTYPE>` declaring an
@@ -262,8 +288,11 @@ fetch an external entity. On top of that, a `<!DOCTYPE>` declaring an
 through verbatim, so `&xxe;` reaches the client as four literal characters.
 Both halves are asserted.
 
-`META-INF/encryption.xml`, or any entry with the encryption bit set, is
-`UNIMPLEMENTED`. The `zip` crate is built without the features that decode
+Any entry with the encryption bit set, or a `META-INF/encryption.xml`
+declaring anything but font obfuscation, is `UNIMPLEMENTED`. Font obfuscation
+alone (the IDPF and Adobe algorithms, which scramble embedded fonts and leave
+text and images plain) is not DRM: the book parses and the obfuscated fonts are
+never emitted. The `zip` crate is built without the features that decode
 anything but store and deflate, so the refusal of other compression methods is
 a build flag rather than a check that can be forgotten. Nested archives are
 reported and never opened; recursing is how a bomb hides from a single-level

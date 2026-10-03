@@ -38,9 +38,16 @@
 //! and each media overlay have to be *read* before the chapters, because
 //! `navigation` and `media_overlay` are contracted to arrive before them. They
 //! are inflated once, held in [`Preread`], and handed back rather than
-//! re-inflated when the resource walk reaches their entries, so the budget
-//! counts each of them exactly once and their `resource` events still arrive
-//! in archive order like everything else.
+//! re-inflated when the walk reaches their entries, as a `resource` or as a
+//! `chapter` (a navigation document is often in the spine too), so the budget
+//! counts each of them exactly once and their events still arrive in order
+//! like everything else. One the walk will not send at all, such as an
+//! overlay whose kind was not asked for, is dropped as soon as it is parsed
+//! rather than held for the rest of the call.
+//!
+//! Every archive entry goes out at most once. Two manifest items naming the
+//! same file send its bytes once, under the first of them, and a manifest
+//! item naming a file the spine already sends as a chapter sends nothing.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -61,8 +68,8 @@ use crate::{nav, smil};
 /// Archive path of the container document, fixed by the EPUB specification.
 const CONTAINER_PATH: &str = "META-INF/container.xml";
 
-/// Archive path of the encryption descriptor. Its presence means DRM or font
-/// obfuscation, neither of which this service implements.
+/// Archive path of the encryption descriptor, which lists every resource the
+/// book stores encrypted or font-obfuscated. See [`obfuscated_entries`].
 const ENCRYPTION_PATH: &str = "META-INF/encryption.xml";
 
 /// Archive path of the media-type marker.
@@ -85,6 +92,12 @@ const MAX_MIMETYPE_BYTES: u64 = 256;
 /// Excluded-kind warnings are already collapsed to one per kind; this bounds
 /// everything else.
 const MAX_WARNINGS: usize = 64;
+
+/// Longest stretch of a rejected entry name or href quoted in a warning.
+///
+/// A ZIP entry name can run to 64 KiB and an OPF attribute to anything, and
+/// every warning rides in the one trailer message.
+const MAX_QUOTED_CHARS: usize = 120;
 
 /// How the call ended.
 #[derive(Debug)]
@@ -229,6 +242,9 @@ struct Resolved<'a> {
     entry: Option<usize>,
     /// Whether the href was an absolute URI rather than an archive path.
     remote: bool,
+    /// Why the href could not be an archive path at all, when it could not.
+    /// `path` then holds the href as written and `entry` is absent.
+    unusable: Option<href::PathError>,
 }
 
 /// Entries inflated ahead of the spine walk, held so they are not inflated
@@ -236,11 +252,14 @@ struct Resolved<'a> {
 ///
 /// The navigation document and the media overlays have to be read before the
 /// chapters in order to be emitted before them, but they are also ordinary
-/// manifest resources whose bytes go out when their archive entry is reached.
-/// Without this, each would be inflated once for parsing and once for
-/// emission, which would double what the book charges against the total
-/// decompression budget and make `ParseStatus.uncompressed_bytes` a number
-/// that answers no question.
+/// manifest resources, or spine items, whose bytes go out when the walk
+/// reaches their archive entry. Without this, each would be inflated once for
+/// parsing and once for emission, which would double what the book charges
+/// against the total decompression budget and make
+/// `ParseStatus.uncompressed_bytes` a number that answers no question.
+///
+/// Only bytes the walk will send are held, and the walk takes each back when
+/// it sends it, so nothing in here outlives the walk.
 #[derive(Default)]
 struct Preread {
     /// Inflated bytes by entry position.
@@ -248,7 +267,10 @@ struct Preread {
 }
 
 impl Preread {
-    /// Inflate an entry now, keeping the bytes for the walk that follows.
+    /// The bytes of an entry: the ones an earlier pass kept, or inflated now.
+    ///
+    /// Either way the caller owns them, and hands them back with
+    /// [`keep`](Self::keep) only if they will be needed again.
     fn read(
         &mut self,
         archive: &mut MemoryArchive<'_>,
@@ -257,11 +279,16 @@ impl Preread {
         limits: &Effective,
         budget: &mut Budget,
         metrics: &Metrics,
-    ) -> Result<&[u8], Status> {
-        if let std::collections::hash_map::Entry::Vacant(slot) = self.entries.entry(entry) {
-            slot.insert(read_at(archive, &entries[entry], limits, budget, metrics)?);
+    ) -> Result<Vec<u8>, Status> {
+        match self.entries.remove(&entry) {
+            Some(bytes) => Ok(bytes),
+            None => read_at(archive, &entries[entry], limits, budget, metrics),
         }
-        Ok(&self.entries[&entry])
+    }
+
+    /// Hold inflated bytes until the walk, or a later pass, asks for them.
+    fn keep(&mut self, entry: usize, bytes: Vec<u8>) {
+        self.entries.insert(entry, bytes);
     }
 
     /// Hand back bytes already inflated for this entry, if there are any.
@@ -370,6 +397,14 @@ fn is_nested_archive(media_type: &str, path: &str) -> bool {
         })
 }
 
+/// `value` quoted for a warning message, cut short past [`MAX_QUOTED_CHARS`].
+fn quoted(value: &str) -> String {
+    match value.char_indices().nth(MAX_QUOTED_CHARS) {
+        Some((cut, _)) => format!("{:?}...", &value[..cut]),
+        None => format!("{value:?}"),
+    }
+}
+
 /// Look an archive path up, tolerating a producer that never percent-encoded.
 ///
 /// `resolve` decodes `%20` to a space because that is what an IRI reference
@@ -389,6 +424,55 @@ fn lookup(
     index.get(&raw).copied()
 }
 
+/// Read `META-INF/encryption.xml` as policy: the archive entries the book
+/// stores font-obfuscated, or a refusal.
+///
+/// Font obfuscation is not DRM. Retail books, and books built by InDesign or
+/// Calibre, routinely scramble the first kilobyte of each embedded font with
+/// the IDPF or Adobe algorithm, keyed by the book's own identifier, while
+/// every chapter and image stays plain; refusing them refused readable
+/// books. Any other algorithm, a record that names none, or a key wrapped for
+/// some reader's private key is real encryption, and the book is refused as a
+/// format this service does not implement.
+///
+/// Paths are relative to the container root. One that only resolves against
+/// `META-INF/`, a known producer slip, is read that way too, and one that
+/// names nothing in the archive obfuscates nothing.
+///
+/// # Errors
+///
+/// `UNIMPLEMENTED` for anything but font obfuscation, `INVALID_ARGUMENT` when
+/// the descriptor is not readable XML.
+fn obfuscated_entries(
+    descriptor: &[u8],
+    index: &HashMap<String, usize>,
+) -> Result<HashSet<usize>, Status> {
+    let records = opf::parse_encryption(descriptor)
+        .map_err(|e| Status::invalid_argument(format!("{ENCRYPTION_PATH}: {e}")))?;
+    if let Some(drm) = records.iter().find(|record| !record.is_obfuscation()) {
+        let algorithm = if drm.algorithm.is_empty() {
+            "an unnamed algorithm".to_owned()
+        } else {
+            format!("{:?}", drm.algorithm)
+        };
+        return Err(Status::unimplemented(format!(
+            "{ENCRYPTION_PATH} declares encryption with {algorithm}, which is not font \
+             obfuscation; DRM is not supported"
+        )));
+    }
+    Ok(records
+        .iter()
+        .filter_map(|record| {
+            ["", "META-INF"]
+                .into_iter()
+                .find_map(|base| match href::resolve(base, &record.uri) {
+                    Ok(Target::Entry(path)) => lookup(index, &path, base, &record.uri),
+                    _ => None,
+                })
+        })
+        .collect())
+}
+
 /// The whole parse, with every failure as a `?`.
 #[allow(clippy::too_many_lines)] // A pipeline; splitting it would hide the order.
 fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Result<(), Abort> {
@@ -397,7 +481,7 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     sink.set_source_hash(crate::document_fold::source_hash(bytes));
 
     let mut archive = archive::open(bytes, limits)?;
-    let entries = archive::scan(&mut archive)?;
+    let archive::Scan { entries, unusable } = archive::scan(&mut archive)?;
     let index: HashMap<String, usize> = entries
         .iter()
         .enumerate()
@@ -406,15 +490,31 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
 
     let mut budget = Budget::new(limits.max_uncompressed_bytes);
     let mut warnings = Warnings::default();
+    for (name, error) in &unusable {
+        // The name goes in the message, not in `href`: it is not an archive
+        // path, and a client that treated it as one is what the traversal
+        // policy protects.
+        warnings.push(
+            pb::ParseWarningCode::UnusableEntryName,
+            "",
+            format!("archive entry {} was left out: {error}", quoted(name)),
+        );
+    }
 
     // --- Is this an EPUB at all? -------------------------------------------
-    if index.contains_key(ENCRYPTION_PATH) {
-        return Err(Status::unimplemented(
-            "the archive carries META-INF/encryption.xml; DRM and font obfuscation are not \
-             supported",
-        )
-        .into());
-    }
+    let obfuscated = match index.get(ENCRYPTION_PATH) {
+        Some(&position) => {
+            let descriptor = read_at(
+                &mut archive,
+                &entries[position],
+                limits,
+                &mut budget,
+                metrics,
+            )?;
+            obfuscated_entries(&descriptor, &index)?
+        }
+        None => HashSet::new(),
+    };
 
     let declared = read_named(
         &mut archive,
@@ -497,19 +597,16 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     let mut resolved: Vec<Resolved<'_>> = Vec::with_capacity(package.manifest.len());
     let mut by_id: HashMap<&str, usize> = HashMap::with_capacity(package.manifest.len());
     for item in &package.manifest {
-        let target = href::resolve(&opf_dir, &item.href).map_err(|e| {
-            Status::invalid_argument(format!(
-                "manifest item {:?} has an unusable href {:?}: {e}",
-                item.id, item.href
-            ))
-        })?;
-        let entry = match &target {
-            Target::Entry(path) => lookup(&index, path, &opf_dir, &item.href),
-            Target::Remote(_) => None,
-        };
-        let (path, remote) = match target {
-            Target::Entry(path) => (path, false),
-            Target::Remote(uri) => (uri, true),
+        // An href that cannot be resolved names nothing. That is fatal for a
+        // spine item and a warning for anything else, decided below where the
+        // spine is known.
+        let (path, entry, remote, unusable) = match href::resolve(&opf_dir, &item.href) {
+            Ok(Target::Entry(path)) => {
+                let entry = lookup(&index, &path, &opf_dir, &item.href);
+                (path, entry, false, None)
+            }
+            Ok(Target::Remote(uri)) => (uri, None, true, None),
+            Err(error) => (item.href.clone(), None, false, Some(error)),
         };
         by_id.entry(item.id.as_str()).or_insert(resolved.len());
         resolved.push(Resolved {
@@ -517,6 +614,7 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             path,
             entry,
             remote,
+            unusable,
         });
     }
 
@@ -526,7 +624,11 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     // spine can be diagnosed before the stream opens. That matters: a client
     // that has already been told "eight chapters" and then gets an error after
     // three has to unwind, while a call that never opened is just a failure.
-    let mut spine: Vec<(usize, &opf::SpineItem)> = Vec::with_capacity(package.spine.len());
+    //
+    // Each entry is `(spine item, chapter source, itemref)`, two manifest
+    // positions that differ only when the chapter is the spine item's
+    // fallback; see [`chapter_source`].
+    let mut spine: Vec<(usize, usize, &opf::SpineItem)> = Vec::with_capacity(package.spine.len());
     for itemref in &package.spine {
         let Some(&position) = by_id.get(itemref.idref.as_str()) else {
             return Err(Status::invalid_argument(format!(
@@ -535,7 +637,32 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             ))
             .into());
         };
+        if let Some(source) = chapter_source(position, &resolved, &by_id) {
+            let target = &resolved[source];
+            let entry = target
+                .entry
+                .expect("a chapter source is always in the archive");
+            if obfuscated.contains(&entry) {
+                return Err(Status::unimplemented(format!(
+                    "spine item {:?} ({:?}) is listed in {ENCRYPTION_PATH}; encrypted chapters \
+                     are not supported",
+                    itemref.idref, target.path
+                ))
+                .into());
+            }
+            spine.push((position, source, itemref));
+            continue;
+        }
+        // Nothing in the chain is in the archive; say why for the spine item
+        // itself.
         let target = &resolved[position];
+        if let Some(error) = &target.unusable {
+            return Err(Status::invalid_argument(format!(
+                "manifest item {:?} has an unusable href {:?}: {error}",
+                target.item.id, target.item.href
+            ))
+            .into());
+        }
         if target.remote {
             return Err(Status::invalid_argument(format!(
                 "spine item {:?} points outside the archive at {:?}; remote chapters are not \
@@ -544,18 +671,18 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             ))
             .into());
         }
-        if target.entry.is_none() {
-            return Err(Status::invalid_argument(format!(
-                "spine item {:?} names {:?}, which the archive does not contain",
-                itemref.idref, target.path
-            ))
-            .into());
-        }
-        spine.push((position, itemref));
+        return Err(Status::invalid_argument(format!(
+            "spine item {:?} names {:?}, which the archive does not contain",
+            itemref.idref, target.path
+        ))
+        .into());
     }
 
     // --- info ---------------------------------------------------------------
-    let spine_ids: HashSet<usize> = spine.iter().map(|(position, _)| *position).collect();
+    // The manifest items the walk sends as chapters. A spine item replaced by
+    // its fallback is not one of them, so its own bytes go out as a resource,
+    // where the fallback's references to it can find them.
+    let spine_ids: HashSet<usize> = spine.iter().map(|(_, source, _)| *source).collect();
     let cover_href = cover(&resolved, &package);
     let navigation_source = navigation_source(&resolved, &by_id, &package);
     let info = pb::EpubInfo {
@@ -623,10 +750,109 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     };
     sink.emit(pb::parse_epub_response::Event::Info(info))?;
 
+    // --- Plan the walk -------------------------------------------------------
+    //
+    // Before anything is read ahead, so the navigation and overlay passes know
+    // which of the entries they inflate the walk is going to send.
+    let chapter_entries: HashSet<usize> = spine
+        .iter()
+        .map(|(_, source, _)| {
+            resolved[*source]
+                .entry
+                .expect("checked while resolving the spine")
+        })
+        .collect();
+    let mut pending: Vec<(usize, usize)> = Vec::new();
+    let mut skipped = 0u32;
+    for (position, target) in resolved.iter().enumerate() {
+        if spine_ids.contains(&position) {
+            continue;
+        }
+        let kind = classify(&target.item.media_type);
+        if let Some(error) = &target.unusable {
+            skipped += 1;
+            warnings.push(
+                pb::ParseWarningCode::MissingManifestEntry,
+                "",
+                format!(
+                    "manifest item {} has an unusable href {} ({error}); nothing is read for it",
+                    quoted(&target.item.id),
+                    quoted(&target.item.href)
+                ),
+            );
+            continue;
+        }
+        if target.remote {
+            skipped += 1;
+            warnings.push(
+                pb::ParseWarningCode::MissingManifestEntry,
+                &target.path,
+                "the manifest points at a remote resource; nothing is fetched over the network",
+            );
+            continue;
+        }
+        let Some(entry) = target.entry else {
+            skipped += 1;
+            warnings.push(
+                pb::ParseWarningCode::MissingManifestEntry,
+                &target.path,
+                "the manifest names a file the archive does not contain",
+            );
+            continue;
+        };
+        // The spine already sends this file as a chapter; a second manifest
+        // item naming it adds no bytes, so it is neither sent nor skipped.
+        if chapter_entries.contains(&entry) {
+            continue;
+        }
+        if is_nested_archive(&target.item.media_type, &target.path) {
+            skipped += 1;
+            warnings.push(
+                pb::ParseWarningCode::NestedArchive,
+                &target.path,
+                "nested archives are not opened",
+            );
+            continue;
+        }
+        if !selected(kind, limits) {
+            skipped += 1;
+            warnings.exclude_kind(kind);
+            continue;
+        }
+        // Checked after the kind, so a font nobody asked for is reported as
+        // excluded like any other, and only one that would have gone out is
+        // reported as obfuscated.
+        if obfuscated.contains(&entry) {
+            skipped += 1;
+            warnings.push(
+                pb::ParseWarningCode::ObfuscatedResource,
+                &target.path,
+                format!(
+                    "{ENCRYPTION_PATH} lists this resource as font-obfuscated, so its stored \
+                     bytes are not its content; it was not emitted"
+                ),
+            );
+            continue;
+        }
+        pending.push((entry, position));
+    }
+    // Archive order, which is what makes a resource arrive when its entry is
+    // hit rather than at the end. Two manifest items naming one file send it
+    // once, under the first of them.
+    pending.sort_unstable();
+    pending.dedup_by_key(|(entry, _)| *entry);
+    let will_emit: HashSet<usize> = chapter_entries
+        .iter()
+        .copied()
+        .chain(pending.iter().map(|(entry, _)| *entry))
+        .collect();
+    let mut pending = pending.into_iter().peekable();
+
     // --- navigation and media overlays ---------------------------------------
     //
     // Both are contracted to arrive before the chapters, so both are inflated
-    // here and held in `preread` for the resource walk below to reuse.
+    // here, and held in `preread` for the walk below to reuse when it is going
+    // to send them.
     let mut preread = Preread::default();
     if limits.parse_navigation
         && let Some(source) = &navigation_source
@@ -641,10 +867,13 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             metrics,
         )?;
         let parsed = if source.from_ncx {
-            nav::parse_ncx(bytes, &target.path)
+            nav::parse_ncx(&bytes, &target.path)
         } else {
-            nav::parse_nav(bytes, &target.path)
+            nav::parse_nav(&bytes, &target.path)
         };
+        if will_emit.contains(&source.entry) {
+            preread.keep(source.entry, bytes);
+        }
         if parsed.is_empty() {
             warnings.push(
                 pb::ParseWarningCode::Metadata,
@@ -662,14 +891,24 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
 
     let overlays = overlay_links(&resolved, &by_id);
     if limits.parse_media_overlays {
-        for (position, overlay) in &overlays {
+        // The last pair each overlay serves, so one shared by several
+        // chapters is inflated once and held no longer than it is needed.
+        let last_use: HashMap<usize, usize> = overlays
+            .iter()
+            .enumerate()
+            .filter_map(|(at, (_, overlay))| resolved[*overlay].entry.map(|entry| (entry, at)))
+            .collect();
+        for (at, (position, overlay)) in overlays.iter().enumerate() {
             let Some(entry) = resolved[*overlay].entry else {
                 continue;
             };
             let path = resolved[*overlay].path.clone();
             let bytes =
                 preread.read(&mut archive, &entries, entry, limits, &mut budget, metrics)?;
-            let parsed = smil::parse_overlay(bytes, &path);
+            let parsed = smil::parse_overlay(&bytes, &path);
+            if will_emit.contains(&entry) || last_use[&entry] > at {
+                preread.keep(entry, bytes);
+            }
             if parsed.is_empty() {
                 warnings.push(
                     pb::ParseWarningCode::Metadata,
@@ -705,68 +944,18 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             .unwrap_or_default()
     };
 
-    // --- Plan the resource interleave ---------------------------------------
-    let mut pending: Vec<usize> = Vec::new();
-    let mut skipped = 0u32;
-    for (position, target) in resolved.iter().enumerate() {
-        if spine_ids.contains(&position) {
-            continue;
-        }
-        let kind = classify(&target.item.media_type);
-        if target.remote {
-            skipped += 1;
-            warnings.push(
-                pb::ParseWarningCode::MissingManifestEntry,
-                &target.path,
-                "the manifest points at a remote resource; nothing is fetched over the network",
-            );
-            continue;
-        }
-        let Some(entry) = target.entry else {
-            skipped += 1;
-            warnings.push(
-                pb::ParseWarningCode::MissingManifestEntry,
-                &target.path,
-                "the manifest names a file the archive does not contain",
-            );
-            continue;
-        };
-        if is_nested_archive(&target.item.media_type, &target.path) {
-            skipped += 1;
-            warnings.push(
-                pb::ParseWarningCode::NestedArchive,
-                &target.path,
-                "nested archives are not opened",
-            );
-            continue;
-        }
-        if !selected(kind, limits) {
-            skipped += 1;
-            warnings.exclude_kind(kind);
-            continue;
-        }
-        pending.push(entry);
-    }
-    // Archive order, which is what makes a resource arrive when its entry is
-    // hit rather than at the end.
-    pending.sort_unstable();
-    let mut pending = pending.into_iter().peekable();
-    let position_of_entry: HashMap<usize, usize> = resolved
-        .iter()
-        .enumerate()
-        .filter_map(|(position, target)| target.entry.map(|entry| (entry, position)))
-        .collect();
-
     // --- Walk the spine ------------------------------------------------------
     let mut chapters = 0u32;
     let mut emitted = 0u32;
-    for (spine_index, (position, itemref)) in spine.iter().enumerate() {
-        let target = &resolved[*position];
+    for (spine_index, (primary, source, itemref)) in spine.iter().enumerate() {
+        let target = &resolved[*source];
         let chapter_entry = target.entry.expect("checked while resolving the spine");
 
-        while pending.peek().is_some_and(|entry| *entry < chapter_entry) {
-            let entry = pending.next().expect("peeked");
-            let position = position_of_entry[&entry];
+        while pending
+            .peek()
+            .is_some_and(|(entry, _)| *entry < chapter_entry)
+        {
+            let (entry, position) = pending.next().expect("peeked");
             emit_resource(
                 &mut archive,
                 &entries[entry],
@@ -781,13 +970,31 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             emitted += 1;
         }
 
-        let content = read_at(
-            &mut archive,
-            &entries[chapter_entry],
-            limits,
-            &mut budget,
-            metrics,
-        )?;
+        // A navigation document in the spine was read ahead to be parsed;
+        // its chapter is those bytes, not a second inflation of them.
+        let content = match preread.take(chapter_entry) {
+            Some(bytes) => bytes,
+            None => read_at(
+                &mut archive,
+                &entries[chapter_entry],
+                limits,
+                &mut budget,
+                metrics,
+            )?,
+        };
+        // When the chapter is a fallback, the spine item it stands in for is
+        // still named, as long as it has an archive path to name.
+        let spine_item = &resolved[*primary];
+        let primary_href =
+            if primary == source || spine_item.remote || spine_item.unusable.is_some() {
+                String::new()
+            } else {
+                spine_item.path.clone()
+            };
+        let mut media_overlay_href = overlay_href(*source);
+        if media_overlay_href.is_empty() {
+            media_overlay_href = overlay_href(*primary);
+        }
         sink.emit(pb::parse_epub_response::Event::Chapter(pb::Chapter {
             spine_index: u32::try_from(spine_index).unwrap_or(u32::MAX),
             idref: itemref.idref.clone(),
@@ -796,14 +1003,14 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             content,
             linear: itemref.linear,
             properties: target.item.properties.clone(),
-            media_overlay_href: overlay_href(*position),
+            media_overlay_href,
+            primary_href,
         }))?;
         metrics.chapter_emitted();
         chapters += 1;
     }
 
-    for entry in pending {
-        let position = position_of_entry[&entry];
+    for (entry, position) in pending {
         emit_resource(
             &mut archive,
             &entries[entry],
@@ -818,6 +1025,11 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
         emitted += 1;
     }
 
+    debug_assert!(
+        preread.entries.is_empty(),
+        "every entry held for the walk is handed back by it"
+    );
+
     // --- status --------------------------------------------------------------
     sink.emit(pb::parse_epub_response::Event::Status(pb::ParseStatus {
         chapters_emitted: chapters,
@@ -828,6 +1040,58 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
         warnings: warnings.entries,
     }))?;
     Ok(())
+}
+
+/// Longest manifest fallback chain followed from a spine item.
+///
+/// A chain is a list of manifest ids that a hostile OPF can make as long as
+/// the manifest, or loop; real ones are one or two links long.
+const MAX_FALLBACK_CHAIN: usize = 16;
+
+/// Whether a media type is markup the HTML collector reads as a chapter.
+fn is_markup(media_type: &str) -> bool {
+    let media_type = media_type.trim().to_ascii_lowercase();
+    matches!(
+        media_type.split(';').next().unwrap_or("").trim(),
+        "application/xhtml+xml" | "text/html" | "text/x-oeb1-document"
+    )
+}
+
+/// The manifest item a spine item's chapter is read from.
+///
+/// The spine item itself when it is XHTML or HTML, which every reflowable
+/// EPUB 3 chapter is. Otherwise the first XHTML or HTML item in its
+/// `fallback` chain that the archive holds: the reading the EPUB
+/// specification asks of a reader that cannot use the spine item, and the
+/// right one here, because the chapter is for the HTML collector. A comic or
+/// fixed-layout book whose spine items are images, each falling back to the
+/// XHTML page that shows it, is read through those pages. Failing that, the
+/// first item in the chain the archive holds at all, so an image page with
+/// no fallback is still a chapter. `None` when the chain holds nothing the
+/// archive has.
+fn chapter_source(
+    primary: usize,
+    resolved: &[Resolved<'_>],
+    by_id: &HashMap<&str, usize>,
+) -> Option<usize> {
+    let mut chain = vec![primary];
+    while chain.len() < MAX_FALLBACK_CHAIN {
+        let fallback = resolved[chain[chain.len() - 1]].item.fallback.as_str();
+        if fallback.is_empty() {
+            break;
+        }
+        match by_id.get(fallback) {
+            Some(next) if !chain.contains(next) => chain.push(*next),
+            _ => break,
+        }
+    }
+    let held = |position: &&usize| resolved[**position].entry.is_some();
+    chain
+        .iter()
+        .filter(held)
+        .find(|position| is_markup(&resolved[**position].item.media_type))
+        .or_else(|| chain.iter().find(held))
+        .copied()
 }
 
 /// Where a book's navigation lives, and which dialect it is written in.
@@ -889,7 +1153,11 @@ fn overlay_links(resolved: &[Resolved<'_>], by_id: &HashMap<&str, usize>) -> Vec
         .enumerate()
         .filter_map(|(position, target)| {
             let overlay = *by_id.get(target.item.media_overlay.as_str())?;
-            Some((position, overlay))
+            // An overlay whose href is no archive path has no path to report.
+            resolved[overlay]
+                .unusable
+                .is_none()
+                .then_some((position, overlay))
         })
         .collect()
 }
@@ -914,6 +1182,14 @@ fn nav_point(point: &nav::NavPoint) -> pb::NavPoint {
 
 /// Find the cover image's archive path, if the book names one.
 fn cover(resolved: &[Resolved<'_>], package: &Package) -> String {
+    // An href that is no archive path names no cover.
+    let path = |target: &Resolved<'_>| {
+        if target.unusable.is_some() {
+            String::new()
+        } else {
+            target.path.clone()
+        }
+    };
     // EPUB 3: a manifest property.
     if let Some(target) = resolved.iter().find(|target| {
         target
@@ -922,7 +1198,7 @@ fn cover(resolved: &[Resolved<'_>], package: &Package) -> String {
             .iter()
             .any(|property| property == "cover-image")
     }) {
-        return target.path.clone();
+        return path(target);
     }
     // EPUB 2: `<meta name="cover" content="…">` naming a manifest item.
     if package.metadata.cover_id.is_empty() {
@@ -931,7 +1207,7 @@ fn cover(resolved: &[Resolved<'_>], package: &Package) -> String {
     resolved
         .iter()
         .find(|target| target.item.id == package.metadata.cover_id)
-        .map(|target| target.path.clone())
+        .map(path)
         .unwrap_or_default()
 }
 
@@ -1059,6 +1335,15 @@ mod tests {
             "extra/inner.EPUB"
         ));
         assert!(!is_nested_archive("image/png", "images/cover.png"));
+    }
+
+    #[test]
+    fn a_long_rejected_name_is_quoted_short() {
+        assert_eq!(quoted("../x"), "\"../x\"");
+        let long = "a/".repeat(10_000);
+        let shown = quoted(&long);
+        assert!(shown.len() < 2 * MAX_QUOTED_CHARS, "{}", shown.len());
+        assert!(shown.ends_with("..."));
     }
 
     #[test]

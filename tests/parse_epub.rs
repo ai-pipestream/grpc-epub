@@ -307,6 +307,182 @@ async fn an_epub_2_book_parses_with_its_own_conventions() {
     );
 }
 
+/// A book zipped on Windows, every entry name written with backslashes.
+///
+/// APPNOTE says `/`; a zip tool on Windows writes `\` anyway, and most
+/// readers open the result. So does this one: the backslash is read as the
+/// separator it was meant to be, and the paths on the wire use `/`.
+#[tokio::test]
+async fn a_book_zipped_with_windows_separators_parses() {
+    let harness = common::start().await;
+    let archive = common::Builder::new()
+        .add_stored("mimetype", "application/epub+zip")
+        .add(
+            "META-INF\\container.xml",
+            common::container_xml(common::OPF_PATH),
+        )
+        .add(
+            "OEBPS\\content.opf",
+            common::opf_xml(
+                &[("ch1", "text/chap1.xhtml"), ("ch2", "text/chap2.xhtml")],
+                &[("cover-img", "images/cover.png", "image/png", "cover-image")],
+            ),
+        )
+        .add(
+            "OEBPS\\text\\chap1.xhtml",
+            common::chapter_xhtml("Chapter One", "The first chapter."),
+        )
+        .add(
+            "OEBPS\\text\\chap2.xhtml",
+            common::chapter_xhtml("Chapter Two", "The second chapter."),
+        )
+        .add("OEBPS\\images\\cover.png", common::IMAGE)
+        .build();
+
+    let events = harness.parse_ok(&archive).await;
+    let hrefs: Vec<&str> = common::chapters(&events)
+        .iter()
+        .map(|chapter| chapter.href.as_str())
+        .collect();
+    assert_eq!(hrefs, [common::CHAP1, common::CHAP2]);
+    assert_eq!(common::resources(&events)[0].href, common::COVER);
+    assert_eq!(common::resources(&events)[0].content, common::IMAGE);
+    assert!(common::status(&events).warnings.is_empty());
+}
+
+/// Two manifest items naming one file send its bytes once, and an item
+/// naming a file the spine already sends as a chapter sends nothing.
+///
+/// Sloppy producers repeat manifest entries. Each repeat used to be a
+/// second `resource` event with the same bytes, inflated and charged to the
+/// budget again, and a repeat of a chapter went out as a resource as well.
+#[tokio::test]
+async fn a_file_named_twice_in_the_manifest_goes_out_once() {
+    let harness = common::start().await;
+    let archive = common::shell()
+        .add(
+            common::OPF_PATH,
+            common::opf_xml(
+                &[("ch1", "text/chap1.xhtml")],
+                &[
+                    ("cover-a", "images/cover.png", "image/png", "cover-image"),
+                    ("cover-b", "images/cover.png", "image/png", ""),
+                    ("ch1-again", "text/chap1.xhtml", "application/xhtml+xml", ""),
+                ],
+            ),
+        )
+        .add(common::CHAP1, common::chapter_xhtml("One", "a"))
+        .add(common::COVER, common::IMAGE)
+        .build();
+
+    let events = harness.parse_ok(&archive).await;
+    assert_eq!(
+        common::shape(&events),
+        ["info", "chapter", "resource", "status"]
+    );
+    let resources = common::resources(&events);
+    assert_eq!(resources[0].href, common::COVER);
+    assert_eq!(resources[0].manifest_id, "cover-a", "the first of the two");
+    let status = common::status(&events);
+    assert_eq!(status.resources_emitted, 1);
+    assert_eq!(
+        status.resources_skipped, 0,
+        "nothing was withheld; every byte went out once"
+    );
+    // mimetype, container.xml, the OPF, the chapter and the image, once each.
+    assert_eq!(status.entries_read, 5);
+}
+
+/// A comic whose spine items are images reads them through the XHTML pages
+/// their manifest fallbacks name, and still sends the images.
+///
+/// The images used to go out as chapters, which the HTML collector cannot
+/// read, so every page of the book was empty downstream. The XHTML page is
+/// what the collector reads, and the image it shows arrives as a resource
+/// under its own href, exactly as for any illustrated chapter.
+#[tokio::test]
+async fn a_comic_reads_its_image_pages_through_their_fallbacks() {
+    let harness = common::start().await;
+    let events = harness.parse_ok(&common::comic(true)).await;
+
+    assert_eq!(
+        common::shape(&events),
+        [
+            "info", "resource", "chapter", "resource", "chapter", "status"
+        ],
+        "each image arrives when its entry is reached, just before its page"
+    );
+    let chapters = common::chapters(&events);
+    assert_eq!(
+        chapters[0].idref, "p1",
+        "the spine item is still the one named"
+    );
+    assert_eq!(chapters[0].href, common::PAGE1);
+    assert_eq!(chapters[0].media_type, "application/xhtml+xml");
+    assert_eq!(
+        chapters[0].content,
+        common::page_xhtml("p1.jpg").into_bytes()
+    );
+    assert_eq!(chapters[0].primary_href, common::PAGE1_IMAGE);
+    assert_eq!(chapters[1].href, common::PAGE2);
+    assert_eq!(chapters[1].primary_href, common::PAGE2_IMAGE);
+
+    let resources = common::resources(&events);
+    assert_eq!(resources[0].href, common::PAGE1_IMAGE);
+    assert_eq!(resources[0].content, common::PAGE1_BYTES);
+    assert_eq!(resources[0].kind, pb::ResourceKind::Image as i32);
+    assert_eq!(resources[1].href, common::PAGE2_IMAGE);
+    let status = common::status(&events);
+    assert_eq!(status.chapters_emitted, 2);
+    assert_eq!(status.resources_emitted, 2);
+    assert!(status.warnings.is_empty(), "{:?}", status.warnings);
+}
+
+/// An image page with no fallback is still a chapter: the image itself.
+#[tokio::test]
+async fn an_image_page_with_no_fallback_is_its_own_chapter() {
+    let harness = common::start().await;
+    let events = harness.parse_ok(&common::comic(false)).await;
+
+    let chapters = common::chapters(&events);
+    assert_eq!(chapters.len(), 2);
+    assert_eq!(chapters[0].href, common::PAGE1_IMAGE);
+    assert_eq!(chapters[0].media_type, "image/jpeg");
+    assert_eq!(chapters[0].content, common::PAGE1_BYTES);
+    assert_eq!(chapters[0].primary_href, "", "no fallback stands in for it");
+    assert!(
+        common::resources(&events).is_empty(),
+        "the bytes went out once, as the chapter"
+    );
+}
+
+/// A fallback chain that loops ends; with no markup in it, the spine item
+/// is the chapter.
+#[tokio::test]
+async fn a_fallback_chain_that_loops_still_ends() {
+    let harness = common::start().await;
+    let archive = common::shell()
+        .add(
+            common::OPF_PATH,
+            common::package(
+                "    <item id=\"p1\" href=\"images/p1.jpg\" media-type=\"image/jpeg\" \
+                 fallback=\"p2\"/>\n    \
+                 <item id=\"p2\" href=\"images/p2.png\" media-type=\"image/png\" \
+                 fallback=\"p1\"/>\n",
+                "    <itemref idref=\"p1\"/>\n",
+            ),
+        )
+        .add(common::PAGE1_IMAGE, common::PAGE1_BYTES)
+        .add(common::PAGE2_IMAGE, common::PAGE2_BYTES)
+        .build();
+
+    let events = harness.parse_ok(&archive).await;
+    let chapters = common::chapters(&events);
+    assert_eq!(chapters.len(), 1);
+    assert_eq!(chapters[0].href, common::PAGE1_IMAGE);
+    assert_eq!(common::resources(&events)[0].href, common::PAGE2_IMAGE);
+}
+
 /// Percent-encoded hrefs resolve to the entry names they name.
 #[tokio::test]
 async fn a_percent_encoded_href_finds_its_entry() {
@@ -358,6 +534,11 @@ async fn get_service_info_reports_the_limits_in_force() {
         grpc_epub::limits::DEFAULT_MAX_COMPRESSION_RATIO
     );
     assert!(limits.max_chunk_bytes > 0);
+    assert_eq!(
+        limits.max_buffered_upload_mib,
+        grpc_epub::limits::DEFAULT_MAX_BUFFERED_UPLOAD_MIB,
+        "the process-wide upload budget is advertised with the other limits"
+    );
 
     let ui = info.ui.expect("ui advertisement is always reported");
     assert_eq!(ui.title, "EPUB");

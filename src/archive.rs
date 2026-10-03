@@ -5,9 +5,11 @@
 //! This is where the zip-bomb policy from `docs/design.md` lives. Three rules,
 //! each covering a hole the others leave:
 //!
-//! 1. **Entry count**, checked against the central directory before anything
-//!    is inflated. Cheap, and it stops the archive whose whole payload is a
-//!    million zero-byte names.
+//! 1. **Entry count**, checked before anything is inflated, and before the
+//!    central directory is even parsed: the `zip` crate builds a record for
+//!    every entry the directory lists before it says how many there are, at
+//!    a dozen times the bytes each one takes in the archive. Cheap, and it
+//!    stops the archive whose whole payload is a million zero-byte names.
 //! 2. **Total inflated bytes**, a running budget across every entry the call
 //!    extracts. This is the heap ceiling.
 //! 3. **Per-entry ratio**, inflated over stored. The total alone lets an
@@ -16,14 +18,23 @@
 //!
 //! Rules 2 and 3 are enforced twice: once against the sizes the central
 //! directory declares, which is free and rejects the honest bomb before a byte
-//! is inflated, and once against what actually came out of the decompressor,
-//! which is what catches a header that lies. Only the second is load-bearing;
-//! the first exists so the common case costs nothing.
+//! is inflated, and again against what is coming out of the decompressor, on
+//! every chunk as it arrives, which is what catches a header that lies. Only
+//! the second is load-bearing; the first exists so the common case costs
+//! nothing. Because the second runs while inflating rather than once the entry
+//! is whole, an entry whose header understates it is stopped as soon as it
+//! passes the ratio, not after it has filled the rest of the budget.
+//!
+//! The stored size a ratio is taken against is the declared one, but never
+//! more than the bytes in front of the central directory: no entry can be
+//! stored in more of the archive than there is, and believing a larger claim
+//! would let any entry pass the ratio rule.
 //!
 //! Nothing here touches the filesystem. `zip`'s `extract` family is never
 //! called, and the crate is built without the features that would let it
 //! decode anything but store and deflate.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 
 use tonic::Status;
@@ -37,6 +48,12 @@ pub type MemoryArchive<'a> = ZipArchive<Cursor<&'a [u8]>>;
 
 /// Inflated bytes read in one pass before the budget is re-checked.
 const READ_CHUNK: usize = 64 * 1024;
+
+/// The signature every central directory record starts with (APPNOTE 4.3.12).
+const CENTRAL_RECORD_SIGNATURE: &[u8; 4] = b"PK\x01\x02";
+
+/// Length of a central directory record before its name (APPNOTE 4.3.12).
+const CENTRAL_RECORD_FIXED: usize = 46;
 
 /// The running decompression budget for one call.
 #[derive(Clone, Copy, Debug)]
@@ -114,16 +131,35 @@ pub fn zip_status(error: &ZipError) -> Status {
 ///
 /// # Errors
 ///
-/// `INVALID_ARGUMENT` when the bytes are not a ZIP or are truncated,
-/// `RESOURCE_EXHAUSTED` when the archive declares more entries than the call
-/// allows.
+/// `INVALID_ARGUMENT` when the bytes are not a ZIP, are truncated, or name
+/// one path in two central directory records, `RESOURCE_EXHAUSTED` when the
+/// archive declares more entries than the call allows.
 pub fn open<'a>(bytes: &'a [u8], limits: &Effective) -> Result<MemoryArchive<'a>, Status> {
     if bytes.is_empty() {
         return Err(Status::invalid_argument(
             "the upload was empty; send the EPUB as one or more `chunk` frames",
         ));
     }
-    let archive = ZipArchive::new(Cursor::new(bytes)).map_err(|e| zip_status(&e))?;
+
+    // `ZipArchive::new` parses every record the central directory declares,
+    // and allocates for each, before the count below can be checked: a
+    // 256 MiB upload of forged ZIP64 records costs it gigabytes. Each record
+    // it parses starts with this signature, so the number of signatures in
+    // the upload bounds what it will build, and counting them is one pass
+    // over bytes already in memory. A conforming archive holds one per entry,
+    // plus whatever its stored payloads happen to contain.
+    let records = bytes
+        .windows(CENTRAL_RECORD_SIGNATURE.len())
+        .filter(|window| window == CENTRAL_RECORD_SIGNATURE)
+        .count();
+    if records > limits.max_entries as usize {
+        return Err(Status::resource_exhausted(format!(
+            "the archive holds {records} central directory records, over the {} entries allowed",
+            limits.max_entries
+        )));
+    }
+
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|e| zip_status(&e))?;
 
     let entries = u32::try_from(archive.len()).unwrap_or(u32::MAX);
     if entries > limits.max_entries {
@@ -132,7 +168,70 @@ pub fn open<'a>(bytes: &'a [u8], limits: &Effective) -> Result<MemoryArchive<'a>
             limits.max_entries
         )));
     }
+    refuse_merged_records(bytes, &mut archive)?;
     Ok(archive)
+}
+
+/// Refuse an archive whose central directory names one raw path twice.
+///
+/// The `zip` crate keys its entries by raw name, so a record whose name an
+/// earlier record already used replaces that one: `len()`, `by_index` and
+/// `by_name` all see a single entry, the later one, and nothing the crate
+/// exposes says a record was dropped. A second `META-INF/encryption.xml`
+/// declaring nothing would then stand in for the first, which declares DRM,
+/// and the same goes for any chapter. [`scan`] catches two names that only
+/// normalize to one path; this catches the names that are already identical.
+///
+/// The crate reads the records back to back from the start of the central
+/// directory, and remembers where each surviving one began. So the records
+/// are walked here by their own lengths, and a record that begins where no
+/// surviving entry does is one the crate dropped. A dropped record always
+/// precedes the one that replaced it, so the walk stops at the last surviving
+/// record and never reads further than the crate did.
+///
+/// Not the signature count from [`open`] against `len()`: that count also
+/// finds signatures inside stored payloads, which is harmless for a ceiling
+/// and would refuse honest books as a test of equality.
+///
+/// # Errors
+///
+/// `INVALID_ARGUMENT` for a dropped record, or for records that do not lie
+/// where the crate read them, which would mean the walk had lost its place.
+fn refuse_merged_records(bytes: &[u8], archive: &mut MemoryArchive<'_>) -> Result<(), Status> {
+    let mut kept: HashSet<u64> = HashSet::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let entry = archive.by_index_raw(index).map_err(|e| zip_status(&e))?;
+        kept.insert(entry.central_header_start());
+    }
+    let Some(&last) = kept.iter().max() else {
+        return Ok(());
+    };
+
+    let lost = || Status::invalid_argument("the central directory records do not lie end to end");
+    let mut at = archive.central_directory_start();
+    while at < last {
+        let start = usize::try_from(at).map_err(|_| lost())?;
+        let field = |offset: usize| -> Result<usize, Status> {
+            bytes
+                .get(start + offset..start + offset + 2)
+                .map(|le| usize::from(u16::from_le_bytes([le[0], le[1]])))
+                .ok_or_else(lost)
+        };
+        let (name_len, extra_len, comment_len) = (field(28)?, field(30)?, field(32)?);
+        if !kept.contains(&at) {
+            let name = bytes
+                .get(start + CENTRAL_RECORD_FIXED..start + CENTRAL_RECORD_FIXED + name_len)
+                .map(String::from_utf8_lossy)
+                .ok_or_else(lost)?;
+            return Err(Status::invalid_argument(format!(
+                "the archive holds two entries named {name:?}; an archive that holds two files \
+                 at one path has no single reading"
+            )));
+        }
+        let length = CENTRAL_RECORD_FIXED + name_len + extra_len + comment_len;
+        at += u64::try_from(length).map_err(|_| lost())?;
+    }
+    if at == last { Ok(()) } else { Err(lost()) }
 }
 
 /// What the central directory says about one entry, gathered without
@@ -146,24 +245,55 @@ pub struct EntryInfo {
     pub name: String,
     /// Inflated size as declared. May be a lie; treated as a hint only.
     pub declared_size: u64,
-    /// Stored size as declared.
+    /// Stored size as declared, capped at the offset of the central
+    /// directory: an entry cannot be stored in more bytes than precede it.
     pub compressed_size: u64,
+}
+
+/// The central directory, read and checked.
+#[derive(Debug, Default)]
+pub struct Scan {
+    /// Every file entry with a usable name, in central-directory order.
+    pub entries: Vec<EntryInfo>,
+    /// Entries left out because their names cannot be archive paths: the name
+    /// as stored, and why.
+    pub unusable: Vec<(String, crate::href::PathError)>,
 }
 
 /// Read the central directory and check every entry name and encoding.
 ///
-/// This runs before any event is emitted, so a hostile name or an entry this
-/// build cannot decode fails the call cleanly instead of truncating a stream
-/// that has already started. Directory entries are dropped: they carry no
-/// content and their names would collide with real files after normalization.
+/// This runs before any event is emitted, so an entry this build cannot
+/// decode fails the call cleanly instead of truncating a stream that has
+/// already started. Directory entries are dropped: they carry no content and
+/// their names would collide with real files after normalization.
+///
+/// An entry whose name cannot be an archive path (one that escapes the root,
+/// is absolute, or holds a NUL) is left out and reported, not fatal. Nothing
+/// can name it, so nothing in it is ever read or sent, which is all the
+/// traversal policy needs; a stray `__MACOSX/../x` or `/mimetype` from a
+/// careless zip tool does not have to cost the reader the whole book. If the
+/// book needed that entry, the spine or the container check says so.
+///
+/// Two entries whose names normalize to the same path are fatal. The `zip`
+/// crate keys entries by their raw names, so `OEBPS/ch1.xhtml` and
+/// `OEBPS\ch1.xhtml` are two files to it and one path here, and whichever
+/// the lookup kept would be the one served: a second `META-INF/encryption.xml`
+/// could stand in for the one that declares DRM, or a chapter could carry
+/// other bytes than a conforming reader shows. There is no honest reading of
+/// such an archive, so there is no choice to make.
 ///
 /// # Errors
 ///
-/// `INVALID_ARGUMENT` for a name that escapes the archive root or is otherwise
-/// unusable, `UNIMPLEMENTED` for an encrypted entry or a compression method
-/// outside store and deflate.
-pub fn scan(archive: &mut MemoryArchive<'_>) -> Result<Vec<EntryInfo>, Status> {
-    let mut entries = Vec::with_capacity(archive.len());
+/// `UNIMPLEMENTED` for an encrypted entry or a compression method outside
+/// store and deflate, `INVALID_ARGUMENT` for two entries naming one path.
+pub fn scan(archive: &mut MemoryArchive<'_>) -> Result<Scan, Status> {
+    let mut scan = Scan {
+        entries: Vec::with_capacity(archive.len()),
+        unusable: Vec::new(),
+    };
+    let stored_ceiling = archive.central_directory_start();
+    // Normalized path to the raw name that claimed it first.
+    let mut claimed: HashMap<String, String> = HashMap::with_capacity(archive.len());
     for index in 0..archive.len() {
         // `by_index_raw` reads the header without building a decompressor, so
         // this pass costs a seek per entry and no inflation.
@@ -188,23 +318,34 @@ pub fn scan(archive: &mut MemoryArchive<'_>) -> Result<Vec<EntryInfo>, Status> {
 
         let name = entry.name().to_owned();
         let declared_size = entry.size();
-        let compressed_size = entry.compressed_size();
+        let compressed_size = entry.compressed_size().min(stored_ceiling);
         drop(entry);
 
-        let Some(normalized) = crate::href::check_entry_name(&name)
-            .map_err(|e| Status::invalid_argument(format!("archive entry {name:?}: {e}")))?
-        else {
-            continue; // A directory entry.
+        let normalized = match crate::href::check_entry_name(&name) {
+            Ok(Some(normalized)) => normalized,
+            Ok(None) => continue, // A directory entry.
+            Err(error) => {
+                scan.unusable.push((name, error));
+                continue;
+            }
         };
 
-        entries.push(EntryInfo {
+        if let Some(first) = claimed.get(&normalized) {
+            return Err(Status::invalid_argument(format!(
+                "archive entries {first:?} and {name:?} both name {normalized:?}; an archive \
+                 that holds two files at one path has no single reading"
+            )));
+        }
+        claimed.insert(normalized.clone(), name);
+
+        scan.entries.push(EntryInfo {
             index,
             name: normalized,
             declared_size,
             compressed_size,
         });
     }
-    Ok(entries)
+    Ok(scan)
 }
 
 /// Inflate one entry under the budget.
@@ -243,19 +384,20 @@ pub fn read_entry(
         if read == 0 {
             break;
         }
-        // Checked *before* the copy, so the allocation never overshoots the
-        // budget even by one chunk. This is the check that catches a central
-        // directory understating the entry.
-        if out.len() + read > ceiling {
+        // Both rules are checked against what the decompressor has produced
+        // so far, and *before* the copy, so the allocation never overshoots
+        // either of them even by one chunk. These are the checks that catch a
+        // central directory understating the entry.
+        let inflated = out.len() + read;
+        if inflated > ceiling {
             return Err(exhausted(&entry.name, budget.remaining));
         }
+        check_ratio(inflated as u64, entry.compressed_size, limits, &entry.name)?;
         out.extend_from_slice(&chunk[..read]);
     }
     drop(file);
 
     let actual = out.len() as u64;
-    check_ratio(actual, entry.compressed_size, limits, &entry.name)?;
-
     budget.remaining -= actual;
     budget.consumed += actual;
     budget.entries += 1;
@@ -322,6 +464,71 @@ mod tests {
     fn a_stored_entry_never_trips_the_ratio_rule() {
         let limits = Effective::default();
         assert!(check_ratio(64 * 1024 * 1024, 64 * 1024 * 1024, &limits, "big.png").is_ok());
+    }
+
+    /// A ZIP64 archive whose central directory lists `count` empty entries,
+    /// every one pointing at the same local header: about 50 bytes of upload
+    /// per entry a reader has to build a record for.
+    fn forged_zip64(count: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        // The one local header: an empty stored file named "a".
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&[20, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.push(b'a');
+        let directory = out.len() as u64;
+        for index in 0..count {
+            out.extend_from_slice(CENTRAL_RECORD_SIGNATURE);
+            out.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0]);
+            out.extend_from_slice(&[0; 16]);
+            out.extend_from_slice(&4u16.to_le_bytes()); // a distinct 4-byte name
+            out.extend_from_slice(&[0; 12]);
+            out.extend_from_slice(&0u32.to_le_bytes()); // local header at 0
+            out.extend_from_slice(&index.to_le_bytes());
+        }
+        let size = out.len() as u64 - directory;
+        let zip64_end = out.len() as u64;
+        out.extend_from_slice(b"PK\x06\x06");
+        out.extend_from_slice(&44u64.to_le_bytes());
+        out.extend_from_slice(&[45, 0, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&u64::from(count).to_le_bytes());
+        out.extend_from_slice(&u64::from(count).to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&directory.to_le_bytes());
+        out.extend_from_slice(b"PK\x06\x07");
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&zip64_end.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&[0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+        out.extend_from_slice(&[0xff; 8]);
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    /// The entry count is enforced before the central directory is parsed.
+    ///
+    /// Parsing it is what costs: the `zip` crate builds a record for every
+    /// entry the directory lists before it reports how many there are, at a
+    /// dozen times the bytes each takes in the archive, so a 256 MiB upload
+    /// of these cost it gigabytes before the count was ever compared.
+    #[test]
+    fn a_forged_directory_is_refused_before_it_is_parsed() {
+        let forged = forged_zip64(100_000);
+        assert!(
+            ZipArchive::new(Cursor::new(forged.as_slice())).is_ok(),
+            "the forgery is a readable archive, so only the count stops it"
+        );
+
+        let status = open(&forged, &Effective::default()).expect_err("over the entry cap");
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            status.message().contains("central directory records"),
+            "refused by the signature count, before the crate parsed anything: {}",
+            status.message()
+        );
     }
 
     #[test]

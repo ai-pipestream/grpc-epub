@@ -146,7 +146,9 @@ What is deliberately not mapped, and why:
 emitted with no children on purpose: they are the sockets the HTML collector's
 items merge into downstream, and an empty-children group is valid output (the
 fold's integrity checker accepts it). Reimplementing HTML in the EPUB packager
-is the thing this service exists not to do.
+is the thing this service exists not to do. The one exception has no XHTML to
+reimplement: a spine item that is itself an image, with no XHTML fallback (a
+comic page), is its chapter's whole content, so its group holds its picture.
 
 **Non-image resources.** Stylesheets, fonts, audio, video, nav documents, SMIL:
 the schema has no item kind for them, labelling them as something else would be
@@ -171,9 +173,9 @@ follows is fixed by the EPUB version, which is `epub.version`, not by an
 **Image bytes.** A Document is one gRPC message and clients commonly cap
 receives at 4 MiB, so `ImageRef.uri` is a pointer, `epub:` plus the resolved
 archive path, naming the `resource` event on this same stream that carries the
-bytes. Not a data URI, not even for the cover. `ImageRef.size` is left unset
-because nothing here decodes an image; a `Size` of 0x0 would be a claim rather
-than a gap.
+bytes (or, for an image spine item, the `chapter` event). Not a data URI, not
+even for the cover. `ImageRef.size` is left unset because nothing here decodes
+an image; a `Size` of 0x0 would be a claim rather than a gap.
 
 **Provenance.** No `prov` anywhere: an EPUB is reflowable and has no pages and
 no bounding boxes. Source locators go in `meta.custom_fields` instead.
@@ -204,7 +206,8 @@ SMIL was parsed.
 
 **Chapter to picture attribution.** Which chapter references an image is a fact
 about the XHTML, so pictures hang off the body rather than off a chapter group.
-The coordinator learns it from the HTML collector's own picture items.
+The coordinator learns it from the HTML collector's own picture items. An image
+spine item's picture is the exception again: that image is the chapter.
 
 Two conventions worth restating:
 
@@ -274,6 +277,28 @@ when. The central directory lists every file up front, so a dangling `idref` or
 a missing chapter is diagnosed before the stream opens rather than after three
 chapters have been delivered.
 
+**Unusable paths cost the file, not the book.** Section 5 has traversal fail
+the call. The implementation does that only where the book needs the path: an
+unusable spine href or rootfile is `INVALID_ARGUMENT`. An archive entry whose
+name escapes the root, is absolute or holds a NUL is left out with
+`UNUSABLE_ENTRY_NAME`, since nothing can name it and so nothing in it is ever
+read or sent; a non-spine manifest href that cannot be resolved is a
+`MISSING_MANIFEST_ENTRY` warning. A backslash is read as a separator, because
+that is what a zip tool on Windows means by it. Two entries at the same path,
+named identically or only normalizing alike, fail the call with
+`INVALID_ARGUMENT`, because the archive then has no single reading: the file served would be a choice, and a shadow
+`META-INF/encryption.xml` could decide the DRM policy.
+
+**Spine items that are not XHTML read through their fallbacks.** EPUB lets a
+spine item be any media type as long as its manifest `fallback` chain reaches
+a content document, which is how comics and fixed-layout books put image pages
+in the spine. Emitting the image as the chapter left the HTML collector
+nothing to read. The chapter is now the first XHTML or HTML item in the chain
+that the archive holds, with `Chapter.primary_href` naming the spine item it
+stands in for, and the spine item's own bytes go out as an ordinary resource,
+so the page's `<img>` resolves like any other. A spine item with no such
+fallback is still its own chapter, whatever its type.
+
 **Resource ordering is by archive position.** Section 3 allows a resource to
 arrive after the chapter referencing it. The implementation emits each resource
 at the point its archive entry is reached during the spine walk, which is
@@ -281,8 +306,17 @@ deterministic per file and is what `architecture.md` means by "when their
 entries are hit". The `tests/parse_epub.rs` ordering test pins it by packing
 the same book two ways.
 
-**The DRM split.** `META-INF/encryption.xml`, or an entry with the encryption
-bit set, is `UNIMPLEMENTED`, matching the ownership table in `architecture.md`.
+**The DRM split.** An entry with the encryption bit set, or a
+`META-INF/encryption.xml` declaring any algorithm other than font obfuscation,
+is `UNIMPLEMENTED`, matching the ownership table in `architecture.md`. Font
+obfuscation (the IDPF `http://www.idpf.org/2008/embedding` and Adobe
+`http://ns.adobe.com/pdf/enc#RC` algorithms) is not DRM: it scrambles the first
+kilobyte of an embedded font with a key taken from the book's own identifier,
+and retail and tool-built books use it while their text and images stay plain.
+Such a book parses. The obfuscated resources are never emitted (fonts are
+excluded by default anyway, and one that was asked for is skipped with
+`OBFUSCATED_RESOURCE`), and obfuscation applied to a spine item is
+`UNIMPLEMENTED` like any encrypted chapter.
 A ZIP that never claimed to be an EPUB is also `UNIMPLEMENTED`; a file that
 says `application/epub+zip` and then has no container is `INVALID_ARGUMENT`,
 because that is a broken book rather than an unsupported format.

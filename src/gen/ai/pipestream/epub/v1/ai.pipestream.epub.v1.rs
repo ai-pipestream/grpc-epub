@@ -71,9 +71,9 @@ pub struct ParseOptions {
     /// a client that speaks the Document plane does not have to fold the stream
     /// itself. The typed events remain the lossless wire: the Document carries
     /// no chapter or image bytes, only the skeleton (one chapter group per spine
-    /// item, one picture per image resource) and the OPF metadata. Chapter XHTML
-    /// is not parsed here — that is the HTML collector's job, and its items merge
-    /// into these chapter groups downstream.
+    /// item, one picture per image resource or image spine item) and the OPF
+    /// metadata. Chapter XHTML is not parsed here — that is the HTML collector's
+    /// job, and its items merge into these chapter groups downstream.
     ///
     /// A plain bool rather than an `optional bool`: unlike the include options,
     /// "absent" and "false" mean the same thing here, because the useful default
@@ -288,6 +288,21 @@ pub struct Chapter {
     /// when `ParseOptions.parse_media_overlays` is set.
     #[prost(string, tag="8")]
     pub media_overlay_href: ::prost::alloc::string::String,
+    /// Archive path of the spine item's own manifest entry, set only when this
+    /// chapter is that item's manifest fallback instead. Empty when the chapter
+    /// is the spine item itself, which is the normal case.
+    ///
+    /// A spine item that is not XHTML or HTML (an image page of a comic or
+    /// fixed-layout book, a DTBook file) is replaced by the first XHTML or HTML
+    /// item in its `fallback` chain that the archive holds, because that is what
+    /// the HTML collector reads. `href`, `media_type`, `content` and `properties`
+    /// then describe the fallback, `idref` still names the spine item, and the
+    /// spine item's own bytes go out as an ordinary `resource` event when the
+    /// include options select its kind, so the fallback's references to it
+    /// resolve. A spine item with no such fallback is the chapter itself,
+    /// whatever its media type.
+    #[prost(string, tag="9")]
+    pub primary_href: ::prost::alloc::string::String,
 }
 /// Resource is one manifest entry that is not a spine chapter.
 ///
@@ -489,6 +504,17 @@ pub struct ServerLimits {
     /// shed load.
     #[prost(uint32, tag="7")]
     pub max_concurrent_parses: u32,
+    /// Upload bytes the server holds at once, in MiB, summed over every call
+    /// whether it is still uploading, waiting for a parse slot or parsing. Never
+    /// less than `max_document_mib`.
+    ///
+    /// A call whose upload would take the server past this fails with
+    /// RESOURCE_EXHAUSTED while uploading, rather than waiting for room: a call
+    /// that waited would stop reading its stream, and on an HTTP/2 connection it
+    /// shares with other calls that would stall them too. Retry once calls in
+    /// progress have finished.
+    #[prost(uint32, tag="8")]
+    pub max_buffered_upload_mib: u32,
 }
 /// ResourceKind classifies a manifest entry that is not a spine chapter.
 ///
@@ -559,8 +585,10 @@ pub enum ParseWarningCode {
     /// A manifest item was not emitted because its kind was not selected by the
     /// include options. Ordinary, not a defect.
     ResourceKindExcluded = 1,
-    /// A manifest item names a file the archive does not contain, and it is not
-    /// a spine item. A missing *spine* item fails the call instead.
+    /// A manifest item names a file the archive does not contain, or an href
+    /// that cannot be an archive path at all (empty, absolute, or escaping the
+    /// archive root), and it is not a spine item. A missing or unusable *spine*
+    /// item fails the call instead.
     MissingManifestEntry = 2,
     /// A nested archive was found inside the EPUB and was not opened. ZIP-in-ZIP
     /// is a non-goal, and recursing into one is how a decompression bomb hides
@@ -569,6 +597,21 @@ pub enum ParseWarningCode {
     /// OPF metadata was present but could not be interpreted, so a field on
     /// EpubInfo is empty that should not have been.
     Metadata = 4,
+    /// A manifest resource was not emitted because META-INF/encryption.xml
+    /// lists it under the IDPF or Adobe font-obfuscation algorithm, so its
+    /// stored bytes are not its content. In practice it is an embedded font.
+    /// Reported only for a resource the include options selected. A book that
+    /// obfuscates its fonts still parses; real encryption fails the call with
+    /// UNIMPLEMENTED instead.
+    ObfuscatedResource = 5,
+    /// An archive entry was left out because its name cannot be an archive path:
+    /// it escapes the archive root, is absolute, or contains a NUL. Nothing can
+    /// name such an entry, so nothing in it is read or sent; if the book needed
+    /// it, the spine or container check fails the call as for a missing file.
+    /// The name is quoted in `message` and `href` is empty, because the name is
+    /// not a path anyone should resolve. A backslash is not such a name: it is
+    /// read as the separator a Windows zip tool meant.
+    UnusableEntryName = 6,
 }
 impl ParseWarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -582,6 +625,8 @@ impl ParseWarningCode {
             Self::MissingManifestEntry => "PARSE_WARNING_CODE_MISSING_MANIFEST_ENTRY",
             Self::NestedArchive => "PARSE_WARNING_CODE_NESTED_ARCHIVE",
             Self::Metadata => "PARSE_WARNING_CODE_METADATA",
+            Self::ObfuscatedResource => "PARSE_WARNING_CODE_OBFUSCATED_RESOURCE",
+            Self::UnusableEntryName => "PARSE_WARNING_CODE_UNUSABLE_ENTRY_NAME",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -592,6 +637,8 @@ impl ParseWarningCode {
             "PARSE_WARNING_CODE_MISSING_MANIFEST_ENTRY" => Some(Self::MissingManifestEntry),
             "PARSE_WARNING_CODE_NESTED_ARCHIVE" => Some(Self::NestedArchive),
             "PARSE_WARNING_CODE_METADATA" => Some(Self::Metadata),
+            "PARSE_WARNING_CODE_OBFUSCATED_RESOURCE" => Some(Self::ObfuscatedResource),
+            "PARSE_WARNING_CODE_UNUSABLE_ENTRY_NAME" => Some(Self::UnusableEntryName),
             _ => None,
         }
     }
@@ -659,7 +706,8 @@ pub mod parse_epub_response {
         /// per spine item in spine order, and one `PictureItem` per emitted image
         /// resource; it holds no bytes. Chapter XHTML is deliberately not parsed
         /// here, so the chapter groups arrive empty and the HTML collector's items
-        /// merge into them downstream.
+        /// merge into them downstream. The exception is a spine item that is
+        /// itself an image, with no XHTML fallback: its group holds its picture.
         #[prost(message, tag="5")]
         Document(super::super::super::document::v1::Document),
         /// The book's own table of contents, parsed from its navigation document

@@ -439,6 +439,72 @@ pub fn narrated() -> Vec<u8> {
         .build()
 }
 
+/// Archive path of a comic's first page image.
+pub const PAGE1_IMAGE: &str = "OEBPS/images/p1.jpg";
+
+/// Archive path of a comic's second page image.
+pub const PAGE2_IMAGE: &str = "OEBPS/images/p2.png";
+
+/// Archive path of the XHTML page showing the first image.
+pub const PAGE1: &str = "OEBPS/pages/p1.xhtml";
+
+/// Archive path of the XHTML page showing the second image.
+pub const PAGE2: &str = "OEBPS/pages/p2.xhtml";
+
+/// Stand-in bytes of a comic's first page image.
+pub const PAGE1_BYTES: &[u8] = b"\xff\xd8\xff\xe0 page one of the comic";
+
+/// Stand-in bytes of a comic's second page image.
+pub const PAGE2_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n page two of the comic";
+
+/// An XHTML page that shows one image, the shape a comic's fallback takes.
+#[must_use]
+pub fn page_xhtml(image: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Page</title></head>
+<body><img src="../images/{image}" alt="page"/></body></html>"#
+    )
+}
+
+/// A two-page comic whose spine items are the page images.
+///
+/// With `fallbacks`, each image names the XHTML page that shows it as its
+/// manifest `fallback`, which is how EPUB lets a spine item be an image at
+/// all. Without, the images stand in the spine alone. Archive order is each
+/// image followed by its page.
+#[must_use]
+pub fn comic(fallbacks: bool) -> Vec<u8> {
+    let manifest = if fallbacks {
+        "\
+    <item id=\"p1\" href=\"images/p1.jpg\" media-type=\"image/jpeg\" fallback=\"p1-page\"/>\n\
+    <item id=\"p2\" href=\"images/p2.png\" media-type=\"image/png\" fallback=\"p2-page\"/>\n\
+    <item id=\"p1-page\" href=\"pages/p1.xhtml\" media-type=\"application/xhtml+xml\"/>\n\
+    <item id=\"p2-page\" href=\"pages/p2.xhtml\" media-type=\"application/xhtml+xml\"/>\n"
+    } else {
+        "\
+    <item id=\"p1\" href=\"images/p1.jpg\" media-type=\"image/jpeg\"/>\n\
+    <item id=\"p2\" href=\"images/p2.png\" media-type=\"image/png\"/>\n"
+    };
+    let mut builder = shell()
+        .add(
+            OPF_PATH,
+            package(
+                manifest,
+                "    <itemref idref=\"p1\"/>\n    <itemref idref=\"p2\"/>\n",
+            ),
+        )
+        .add(PAGE1_IMAGE, PAGE1_BYTES);
+    if fallbacks {
+        builder = builder.add(PAGE1, page_xhtml("p1.jpg"));
+    }
+    builder = builder.add(PAGE2_IMAGE, PAGE2_BYTES);
+    if fallbacks {
+        builder = builder.add(PAGE2, page_xhtml("p2.png"));
+    }
+    builder.build()
+}
+
 /// A book of `count` chapters, each padded to roughly `size` bytes.
 ///
 /// Used by the streaming tests, where the point is that a chapter reaches the
@@ -477,6 +543,10 @@ struct Header {
     flags_at: usize,
     /// Offset of the compression method.
     method_at: usize,
+    /// Offset of the stored (compressed) size.
+    stored_size_at: usize,
+    /// Offset of the declared inflated size.
+    declared_size_at: usize,
     /// Offset of the file name length.
     name_length_at: usize,
     /// Offset of the file name itself.
@@ -489,6 +559,8 @@ const HEADERS: [Header; 2] = [
         signature: b"PK\x03\x04",
         flags_at: 6,
         method_at: 8,
+        stored_size_at: 18,
+        declared_size_at: 22,
         name_length_at: 26,
         name_at: 30,
     },
@@ -496,6 +568,8 @@ const HEADERS: [Header; 2] = [
         signature: b"PK\x01\x02",
         flags_at: 8,
         method_at: 10,
+        stored_size_at: 20,
+        declared_size_at: 24,
         name_length_at: 28,
         name_at: 46,
     },
@@ -508,17 +582,67 @@ const HEADERS: [Header; 2] = [
 /// archive it cannot read. Patching the headers is how a test still gets one,
 /// and it is exactly the archive an attacker would hand the server.
 pub fn patch_compression_method(archive: &mut [u8], name: &str, method: u16) {
-    patch(archive, name, |header| header.method_at, method);
+    patch(
+        archive,
+        name,
+        |header| header.method_at,
+        &method.to_le_bytes(),
+    );
 }
 
 /// Set the encryption flag (general-purpose bit 0) on every header naming
 /// `name`, producing the archive a DRM'd or obfuscated entry actually is.
 pub fn patch_encrypted(archive: &mut [u8], name: &str) {
-    patch(archive, name, |header| header.flags_at, 1);
+    patch(archive, name, |header| header.flags_at, &1u16.to_le_bytes());
 }
 
-/// Write `value` into one 16-bit field of every header naming `name`.
-fn patch(archive: &mut [u8], name: &str, field: fn(&Header) -> usize, value: u16) {
+/// Overwrite the inflated size every header naming `name` declares: the
+/// archive whose central directory lies about how large an entry is.
+pub fn patch_declared_size(archive: &mut [u8], name: &str, size: u32) {
+    patch(
+        archive,
+        name,
+        |header| header.declared_size_at,
+        &size.to_le_bytes(),
+    );
+}
+
+/// Overwrite the stored size every header naming `name` declares.
+pub fn patch_stored_size(archive: &mut [u8], name: &str, size: u32) {
+    patch(
+        archive,
+        name,
+        |header| header.stored_size_at,
+        &size.to_le_bytes(),
+    );
+}
+
+/// Write `value` into one little-endian field of every header naming `name`.
+/// Rename every header of entry `from` to `to`, in place.
+///
+/// `ZipWriter` refuses to write two entries of one name, which is exactly
+/// the archive some tests need; they write a placeholder name of the same
+/// length and rename it afterwards. The name is not covered by the CRC, so
+/// the archive stays readable.
+///
+/// # Panics
+///
+/// If the names differ in length or `from` occurs nowhere.
+pub fn rename_entry(archive: &mut [u8], from: &str, to: &str) {
+    assert_eq!(from.len(), to.len(), "a rename in place keeps the length");
+    let mut renamed = 0;
+    let mut position = 0;
+    while position + from.len() <= archive.len() {
+        if &archive[position..position + from.len()] == from.as_bytes() {
+            archive[position..position + from.len()].copy_from_slice(to.as_bytes());
+            renamed += 1;
+        }
+        position += 1;
+    }
+    assert!(renamed > 0, "{from:?} is not in the archive");
+}
+
+fn patch(archive: &mut [u8], name: &str, field: fn(&Header) -> usize, value: &[u8]) {
     for header in &HEADERS {
         let mut position = 0;
         while position + header.name_at + name.len() <= archive.len() {
@@ -536,7 +660,7 @@ fn patch(archive: &mut [u8], name: &str, field: fn(&Header) -> usize, value: u16
                 && &archive[start..start + length] == name.as_bytes()
             {
                 let at = position + field(header);
-                archive[at..at + 2].copy_from_slice(&value.to_le_bytes());
+                archive[at..at + value.len()].copy_from_slice(value);
             }
             position += 4;
         }
@@ -588,14 +712,24 @@ pub async fn start_with_window(window: u32) -> Harness {
     start_inner(Limits::default(), Some(window)).await
 }
 
+/// Start a server running an already configured service, for the settings
+/// that are not limits (the idle timeout, say).
+pub async fn start_service(service: EpubGrpc) -> Harness {
+    serve(service, None).await
+}
+
 async fn start_inner(limits: Limits, window: Option<u32>) -> Harness {
+    serve(EpubGrpc::with_metrics(limits, Metrics::new()), window).await
+}
+
+async fn serve(service: EpubGrpc, window: Option<u32>) -> Harness {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local address");
 
-    let metrics = Metrics::new();
-    let service = EpubGrpc::with_metrics(limits, Arc::clone(&metrics)).into_service();
+    let metrics: Arc<Metrics> = service.metrics();
+    let service = service.into_service();
     tokio::spawn(async move {
         Server::builder()
             .add_service(service)

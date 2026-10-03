@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The two XML documents this service parses: `META-INF/container.xml` and
-//! the OPF package document.
+//! The packaging layer's XML: `META-INF/container.xml`,
+//! `META-INF/encryption.xml` and the OPF package document.
 //!
 //! Nothing else in an EPUB is parsed as XML. Chapter XHTML goes out as bytes,
 //! because HTML semantics belong to the HTML collector and reimplementing them
@@ -90,6 +90,11 @@ pub struct ManifestItem {
     /// with the alignment, so it is read here even though the SMIL itself is
     /// parsed elsewhere.
     pub media_overlay: String,
+    /// The `fallback` attribute: the `id` of the manifest item to use in this
+    /// one's place by a reader that cannot use this one. Empty when there is
+    /// none. A spine item that is not XHTML (an image page of a comic, a
+    /// DTBook file) names its XHTML rendering this way.
+    pub fallback: String,
 }
 
 /// One `<itemref>` of the OPF spine: a position in reading order.
@@ -391,6 +396,113 @@ pub fn parse_container(bytes: &[u8]) -> Result<String, XmlError> {
     first.ok_or(XmlError::NoRootfile)
 }
 
+/// The IDPF font-obfuscation algorithm (EPUB Open Container Format).
+///
+/// Not encryption: the key is the book's own unique identifier, and only the
+/// first kilobyte of the font is scrambled. Its purpose is to stop a font
+/// being lifted out of the archive by unzipping it, not to protect the book.
+pub const IDPF_OBFUSCATION: &str = "http://www.idpf.org/2008/embedding";
+
+/// Adobe's font-obfuscation algorithm, the IDPF one's predecessor, keyed by
+/// the book's UUID identifier. Not encryption either.
+pub const ADOBE_OBFUSCATION: &str = "http://ns.adobe.com/pdf/enc#RC";
+
+/// One `<EncryptedData>` or `<EncryptedKey>` of `META-INF/encryption.xml`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Encrypted {
+    /// The `Algorithm` of its own `<EncryptionMethod>`, empty when it
+    /// declared none.
+    pub algorithm: String,
+    /// The `URI` of its `<CipherReference>`, raw: relative to the container
+    /// root and still percent-encoded. Empty when it names no resource, as an
+    /// `<EncryptedKey>` does not.
+    pub uri: String,
+}
+
+impl Encrypted {
+    /// Whether this is font obfuscation rather than encryption.
+    #[must_use]
+    pub fn is_obfuscation(&self) -> bool {
+        self.algorithm == IDPF_OBFUSCATION || self.algorithm == ADOBE_OBFUSCATION
+    }
+}
+
+/// Parse `META-INF/encryption.xml` into everything it declares encrypted.
+///
+/// Every `<EncryptedData>` and every `<EncryptedKey>` is a record, nested or
+/// not, so a key wrapped inside the data it unlocks is reported as well: a
+/// caller deciding whether a book is DRM'd must see every algorithm in the
+/// file, not only the ones attached to a resource. Elements are matched by
+/// local name, so whichever prefix the producer bound the XML Encryption
+/// namespace to reads the same.
+///
+/// # Errors
+///
+/// [`XmlError::Malformed`] if the XML does not parse,
+/// [`XmlError::EntityDeclaration`] if it declares entities.
+pub fn parse_encryption(bytes: &[u8]) -> Result<Vec<Encrypted>, XmlError> {
+    /// Whether an element opens a record.
+    fn is_record(local: &str) -> bool {
+        local == "EncryptedData" || local == "EncryptedKey"
+    }
+    /// Apply a start tag to the innermost open record.
+    fn describe(open: &mut [(usize, Encrypted)], start: &BytesStart<'_>) {
+        let Some((_, record)) = open.last_mut() else {
+            return;
+        };
+        match start.local_name().as_ref() {
+            "EncryptionMethod" if record.algorithm.is_empty() => {
+                record.algorithm = attribute(start, "Algorithm");
+            }
+            "CipherReference" if record.uri.is_empty() => {
+                record.uri = attribute(start, "URI");
+            }
+            _ => {}
+        }
+    }
+
+    let mut reader = reader(bytes);
+    let mut buf = Vec::new();
+    // Records still open, with the depth of the element that opened each.
+    let mut open: Vec<(usize, Encrypted)> = Vec::new();
+    let mut found = Vec::new();
+    let mut depth = 0usize;
+
+    loop {
+        match reader.read_event_into(&mut buf)? {
+            Event::DocType(dtd) => check_doctype(dtd.as_ref())?,
+            Event::Start(start) => {
+                depth += 1;
+                if is_record(start.local_name().as_ref()) {
+                    open.push((depth, Encrypted::default()));
+                } else {
+                    describe(&mut open, &start);
+                }
+            }
+            Event::Empty(start) => {
+                if is_record(start.local_name().as_ref()) {
+                    // Says nothing about an algorithm, so it reads as one
+                    // with none declared, which no caller treats as benign.
+                    found.push(Encrypted::default());
+                } else {
+                    describe(&mut open, &start);
+                }
+            }
+            Event::End(_) => {
+                if open.last().is_some_and(|(at, _)| *at == depth) {
+                    found.extend(open.pop().map(|(_, record)| record));
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(found)
+}
+
 /// Which part of the package document the parser is inside.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Section {
@@ -514,6 +626,7 @@ impl PackageParser {
                             .map(str::to_owned)
                             .collect(),
                         media_overlay: attribute(start, "media-overlay"),
+                        fallback: attribute(start, "fallback"),
                     });
                 }
             }
@@ -963,6 +1076,17 @@ mod tests {
     }
 
     #[test]
+    fn the_manifest_keeps_each_items_fallback() {
+        let comic = br#"<package version="3.0"><manifest>
+  <item id="p1" href="p1.jpg" media-type="image/jpeg" fallback="p1-page"/>
+  <item id="p1-page" href="p1.xhtml" media-type="application/xhtml+xml"/>
+</manifest><spine><itemref idref="p1"/></spine></package>"#;
+        let package = parse_package(comic).unwrap();
+        assert_eq!(package.manifest[0].fallback, "p1-page");
+        assert_eq!(package.manifest[1].fallback, "", "absent means none");
+    }
+
+    #[test]
     fn the_manifest_keeps_the_link_from_a_chapter_to_its_narration() {
         let package = parse_package(EXPRESSIVE).unwrap();
         assert_eq!(package.manifest[0].media_overlay, "ov1");
@@ -1033,6 +1157,74 @@ mod tests {
 <spine><itemref idref="a"/></spine></package>"#;
         let package = parse_package(sneaky).unwrap();
         assert_eq!(package.metadata.title, "&xxe;");
+    }
+
+    /// Two fonts, one obfuscated each way, the shape InDesign and Calibre
+    /// write.
+    const OBFUSCATED_FONTS: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"
+            xmlns:enc="http://www.w3.org/2001/04/xmlenc#">
+  <enc:EncryptedData>
+    <enc:EncryptionMethod Algorithm="http://www.idpf.org/2008/embedding"/>
+    <enc:CipherData><enc:CipherReference URI="OEBPS/fonts/serif.otf"/></enc:CipherData>
+  </enc:EncryptedData>
+  <enc:EncryptedData>
+    <enc:EncryptionMethod Algorithm="http://ns.adobe.com/pdf/enc#RC"/>
+    <enc:CipherData><enc:CipherReference URI="OEBPS/fonts/sans%20bold.otf"/></enc:CipherData>
+  </enc:EncryptedData>
+</encryption>"#;
+
+    #[test]
+    fn font_obfuscation_reads_as_obfuscation_not_encryption() {
+        let found = parse_encryption(OBFUSCATED_FONTS).unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(Encrypted::is_obfuscation));
+        assert_eq!(found[0].uri, "OEBPS/fonts/serif.otf");
+        assert_eq!(
+            found[1].uri, "OEBPS/fonts/sans%20bold.otf",
+            "the reference is kept raw; resolving it is the caller's job"
+        );
+    }
+
+    #[test]
+    fn a_key_wrapped_inside_its_data_is_reported_as_well() {
+        let wrapped = br#"<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"
+  xmlns:enc="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <enc:EncryptedData>
+    <enc:EncryptionMethod Algorithm="http://www.idpf.org/2008/embedding"/>
+    <ds:KeyInfo><enc:EncryptedKey>
+      <enc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-1_5"/>
+    </enc:EncryptedKey></ds:KeyInfo>
+    <enc:CipherData><enc:CipherReference URI="OEBPS/text/chap1.xhtml"/></enc:CipherData>
+  </enc:EncryptedData>
+</encryption>"#;
+        let found = parse_encryption(wrapped).unwrap();
+        assert_eq!(found.len(), 2, "the key and the data are two records");
+        let key = found.iter().find(|record| record.uri.is_empty()).unwrap();
+        assert_eq!(key.algorithm, "http://www.w3.org/2001/04/xmlenc#rsa-1_5");
+        assert!(!key.is_obfuscation());
+        let data = found.iter().find(|record| !record.uri.is_empty()).unwrap();
+        assert_eq!(
+            data.algorithm, IDPF_OBFUSCATION,
+            "the key's method does not overwrite the data's own"
+        );
+    }
+
+    #[test]
+    fn encrypted_data_naming_no_algorithm_is_not_obfuscation() {
+        let unnamed = br#"<encryption><EncryptedData><CipherData>
+  <CipherReference URI="OEBPS/text/chap1.xhtml"/></CipherData></EncryptedData></encryption>"#;
+        let found = parse_encryption(unnamed).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].is_obfuscation());
+        assert_eq!(found[0].uri, "OEBPS/text/chap1.xhtml");
+    }
+
+    #[test]
+    fn an_encryption_descriptor_declaring_an_entity_is_refused() {
+        let hostile = br#"<!DOCTYPE encryption [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>
+<encryption><EncryptedData/></encryption>"#;
+        assert_eq!(parse_encryption(hostile), Err(XmlError::EntityDeclaration));
     }
 
     #[test]

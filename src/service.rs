@@ -4,6 +4,26 @@
 //! that turns a panicking parse into an `INTERNAL` status instead of a stream
 //! that just stops.
 //!
+//! Two bounds share the heap between calls. The parse slots cap how many
+//! calls inflate at once. The upload budget caps the bytes of upload buffer
+//! the whole process holds, across every call, whether it is still uploading,
+//! waiting for a slot, or parsing: without it the slots bounded the parses
+//! and not the buffers, and a client with many streams open could make the
+//! server hold an upload's worth of memory for each of them. A call whose
+//! upload would take the process past the budget fails with
+//! `RESOURCE_EXHAUSTED` on the spot instead of waiting for room, because a
+//! call that waited would stop reading its stream, and on a connection it
+//! shares with other calls its unread frames would hold the HTTP/2
+//! connection window that those calls need to finish their uploads and give
+//! the budget back. For the same reason the parse slot is taken only after
+//! the upload is complete: every upload keeps being read.
+//!
+//! Refusing rather than waiting makes the budget something a client can
+//! hold, so two clocks bound how long it is held. The idle timeout ends a
+//! stream that sends nothing; the upload timeout ends one that keeps sending
+//! too slowly to finish, a byte at a time just inside the idle timeout, which
+//! the idle timeout alone would let hold its share forever.
+//!
 //! The parse itself runs on [`tokio::task::spawn_blocking`], because inflating
 //! is CPU-bound and would otherwise occupy an async worker for the length of a
 //! book. [`crate::extract::Sink`] carries backpressure across that boundary:
@@ -13,7 +33,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -36,6 +56,35 @@ const OUTBOUND_BUFFER: usize = 4;
 /// restarted.
 const CONSUMER_STALL: Duration = Duration::from_secs(30);
 
+/// Default for how long the server waits for the next request frame.
+///
+/// A call holds its share of the upload budget for as long as its upload is
+/// open, so a client that opens a stream, sends part of a book and then
+/// nothing would otherwise keep that share for as long as HTTP/2 keepalive
+/// kept the connection up.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default for how long a call's whole upload may take, from the call's
+/// first frame to its last.
+///
+/// Five minutes moves a full 256 MiB upload at under 1 MiB/s, slower than any
+/// link a collector in this fleet sits behind, and still stops a client that
+/// trickles a frame in just under the idle timeout from holding its share of
+/// the upload budget indefinitely.
+pub const DEFAULT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Stand-in for "no deadline" when a timeout is too large to add to now.
+///
+/// `Instant + Duration` panics on overflow, and a timeout read from the
+/// environment can be anything; a year is as good as forever for one call.
+const FOREVER: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Bytes of upload buffer one permit of the upload budget stands for.
+///
+/// Counted in KiB rather than bytes because one reservation is a `u32`, and
+/// in bytes that would cap a single growth step of one upload at 4 GiB.
+const BUDGET_UNIT: usize = 1024;
+
 /// The `ai.pipestream.epub.v1.EpubParseService` implementation.
 pub struct EpubGrpc {
     /// The ceilings this server enforces.
@@ -45,6 +94,14 @@ pub struct EpubGrpc {
     /// Bounds how many calls may inflate at once, capping heap rather than
     /// shedding load: a call past the bound waits for a permit.
     parse_slots: Arc<tokio::sync::Semaphore>,
+    /// Upload buffer the whole process may hold, in [`BUDGET_UNIT`]s. Each
+    /// call reserves what its buffer grows to and gives it back when its
+    /// stream ends.
+    upload_budget: Arc<tokio::sync::Semaphore>,
+    /// Longest wait for the next request frame before the call is ended.
+    idle_timeout: Duration,
+    /// Longest a call's whole upload may take before the call is ended.
+    upload_timeout: Duration,
 }
 
 impl EpubGrpc {
@@ -62,11 +119,50 @@ impl EpubGrpc {
     /// handed over all at once.
     #[must_use]
     pub fn with_metrics(limits: Limits, metrics: Arc<Metrics>) -> Self {
+        // A budget smaller than one upload would refuse the largest upload a
+        // call is allowed to send, every time.
+        let limits = Limits {
+            max_buffered_upload_bytes: limits
+                .max_buffered_upload_bytes
+                .max(limits.max_document_bytes),
+            ..limits
+        };
         Self {
             limits,
             metrics,
             parse_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent_parses)),
+            upload_budget: Arc::new(tokio::sync::Semaphore::new(
+                usize::try_from(limits.max_buffered_upload_bytes)
+                    .unwrap_or(usize::MAX)
+                    .div_ceil(BUDGET_UNIT)
+                    .min(tokio::sync::Semaphore::MAX_PERMITS),
+            )),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            upload_timeout: DEFAULT_UPLOAD_TIMEOUT,
         }
+    }
+
+    /// Override how long the server waits for the next request frame.
+    ///
+    /// Past it the call ends with `DEADLINE_EXCEEDED` and gives its share of
+    /// the upload budget back. Raised to one millisecond if smaller: an idle
+    /// stream is always bounded.
+    #[must_use]
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    /// Override how long a call's whole upload may take, options frame
+    /// included.
+    ///
+    /// Past it the call ends with `DEADLINE_EXCEEDED` and gives its share of
+    /// the upload budget back, however steadily it was sending. Raised to one
+    /// millisecond if smaller: an upload is always bounded.
+    #[must_use]
+    pub fn with_upload_timeout(mut self, timeout: Duration) -> Self {
+        self.upload_timeout = timeout.max(Duration::from_millis(1));
+        self
     }
 
     /// The counters this service reports into.
@@ -103,11 +199,12 @@ impl pb::epub_parse_service_server::EpubParseService for EpubGrpc {
         request: Request<Streaming<pb::ParseEpubRequest>>,
     ) -> Result<Response<Self::ParseEpubStream>, Status> {
         let mut inbound = request.into_inner();
+        let clock = UploadClock::start(self.idle_timeout, self.upload_timeout);
 
         // Options first, so every way the request can be rejected outright is
         // resolved before the response stream opens. Once it is open, only the
         // parse can end it badly.
-        let options = match inbound.message().await? {
+        let options = match clock.next_frame(&mut inbound).await? {
             Some(pb::ParseEpubRequest {
                 frame: Some(pb::parse_epub_request::Frame::Options(options)),
             }) => options,
@@ -124,12 +221,15 @@ impl pb::epub_parse_service_server::EpubParseService for EpubGrpc {
         };
         let effective = self.limits.resolve(&options);
 
-        let bytes = self
-            .receive(&mut inbound, effective.max_document_bytes)
+        // The upload is bounded by the process-wide budget as it is read; see
+        // the module documentation for why it is read before the slot is
+        // taken rather than after.
+        let (bytes, upload) = self
+            .receive(&mut inbound, &clock, effective.max_document_bytes)
             .await?;
 
-        // Acquired before the upload is handed to a thread, so the memory
-        // ceiling counts calls that are actually inflating.
+        // Acquired before the upload is handed to a thread, so the slots
+        // count calls that are actually inflating.
         let permit = Arc::clone(&self.parse_slots)
             .acquire_owned()
             .await
@@ -179,6 +279,9 @@ impl pb::epub_parse_service_server::EpubParseService for EpubGrpc {
                 let _ = supervisor.send(Err(status)).await;
             }
             drop(permit);
+            // The parse thread has returned and dropped the upload with it,
+            // so its share of the budget is free again.
+            drop(upload);
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -221,19 +324,29 @@ impl pb::epub_parse_service_server::EpubParseService for EpubGrpc {
 }
 
 impl EpubGrpc {
-    /// Drain the request stream into one buffer, enforcing the upload cap.
+    /// Drain the request stream into one buffer, enforcing the upload cap and
+    /// the process-wide upload budget.
     ///
     /// The buffer is unavoidable: a ZIP is unreadable until its central
-    /// directory, which is the last thing to arrive. The cap is checked as
-    /// bytes land rather than at the end, so a hostile upload is cut off at
-    /// the limit instead of after it.
+    /// directory, which is the last thing to arrive. Both bounds are checked
+    /// as bytes land rather than at the end, so a hostile upload is cut off at
+    /// the limit instead of after it. The buffer never grows past the cap
+    /// either: `Vec`'s own doubling would otherwise reserve up to twice the
+    /// cap for an upload just under it. The budget is charged for capacity,
+    /// not length, because capacity is what the allocator handed out.
+    ///
+    /// Returns the upload and the share of the budget it holds, which the
+    /// caller keeps until the upload is dropped.
     async fn receive(
         &self,
         inbound: &mut Streaming<pb::ParseEpubRequest>,
+        clock: &UploadClock,
         max_document_bytes: u64,
-    ) -> Result<Vec<u8>, Status> {
+    ) -> Result<(Vec<u8>, Option<OwnedSemaphorePermit>), Status> {
+        let cap = usize::try_from(max_document_bytes).unwrap_or(usize::MAX);
         let mut bytes: Vec<u8> = Vec::new();
-        while let Some(request) = inbound.message().await? {
+        let mut held: Option<OwnedSemaphorePermit> = None;
+        while let Some(request) = clock.next_frame(inbound).await? {
             let chunk = match request.frame {
                 Some(pb::parse_epub_request::Frame::Chunk(chunk)) => chunk,
                 Some(pb::parse_epub_request::Frame::Options(_)) => {
@@ -260,11 +373,127 @@ impl EpubGrpc {
                      max_document_mib if the book is genuinely this large"
                 )));
             }
+            let needed = bytes.len() + chunk.len();
+            if needed > bytes.capacity() {
+                // Geometric growth, as `Vec` would do it, stopped at the cap.
+                // Near the budget the doubling is given up before the upload
+                // is: growing to exactly what is needed may still fit.
+                let doubled = bytes.capacity().saturating_mul(2).max(needed).min(cap);
+                let target = if self.reserve_upload(&mut held, doubled).is_ok() {
+                    doubled
+                } else {
+                    self.reserve_upload(&mut held, needed)?;
+                    needed
+                };
+                bytes.reserve_exact(target - bytes.len());
+            }
             bytes.extend_from_slice(&chunk);
         }
         self.metrics.uploaded(bytes.len() as u64);
-        Ok(bytes)
+        Ok((bytes, held))
     }
+
+    /// Grow this call's share of the upload budget to cover `capacity`
+    /// bytes, or fail without waiting.
+    ///
+    /// # Errors
+    ///
+    /// `RESOURCE_EXHAUSTED` when the process already holds as much upload as
+    /// the budget allows. See the module documentation for why this fails
+    /// rather than waits.
+    fn reserve_upload(
+        &self,
+        held: &mut Option<OwnedSemaphorePermit>,
+        capacity: usize,
+    ) -> Result<(), Status> {
+        let have = held.as_ref().map_or(0, OwnedSemaphorePermit::num_permits);
+        let more = capacity.div_ceil(BUDGET_UNIT).saturating_sub(have);
+        if more == 0 {
+            return Ok(());
+        }
+        let permit = u32::try_from(more)
+            .ok()
+            .and_then(|more| {
+                Arc::clone(&self.upload_budget)
+                    .try_acquire_many_owned(more)
+                    .ok()
+            })
+            .ok_or_else(|| {
+                Status::resource_exhausted(format!(
+                    "the server is already holding the {} MiB of uploads it allows across all \
+                     calls; retry once calls in progress have finished",
+                    self.limits.max_buffered_upload_bytes / crate::limits::MIB
+                ))
+            })?;
+        match held {
+            Some(held) => held.merge(permit),
+            None => *held = Some(permit),
+        }
+        Ok(())
+    }
+}
+
+/// The two clocks one call's upload runs against.
+#[derive(Clone, Copy, Debug)]
+struct UploadClock {
+    /// Longest wait for any one frame.
+    idle: Duration,
+    /// Longest the whole upload may take, for the message.
+    total: Duration,
+    /// When the whole upload must be in.
+    deadline: tokio::time::Instant,
+}
+
+impl UploadClock {
+    /// Start both clocks now, at the call's first frame.
+    fn start(idle: Duration, total: Duration) -> Self {
+        Self {
+            idle,
+            total,
+            deadline: after(total),
+        }
+    }
+
+    /// Wait for the next request frame, until the idle timeout or the upload
+    /// deadline, whichever comes first.
+    ///
+    /// # Errors
+    ///
+    /// `DEADLINE_EXCEEDED` when nothing arrives in time, naming which clock
+    /// ran out, or whatever status the transport reports for a broken stream.
+    async fn next_frame(
+        &self,
+        inbound: &mut Streaming<pb::ParseEpubRequest>,
+    ) -> Result<Option<pb::ParseEpubRequest>, Status> {
+        let idle_at = after(self.idle);
+        if idle_at < self.deadline {
+            tokio::time::timeout_at(idle_at, inbound.message())
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded(format!(
+                        "no request frame arrived for {} ms; an idle stream may not hold server \
+                         memory",
+                        self.idle.as_millis()
+                    ))
+                })?
+        } else {
+            tokio::time::timeout_at(self.deadline, inbound.message())
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded(format!(
+                        "the upload was not complete within {} ms; send the book faster or raise \
+                         the server's upload timeout",
+                        self.total.as_millis()
+                    ))
+                })?
+        }
+    }
+}
+
+/// The instant `wait` from now, or [`FOREVER`] from now if that overflows.
+fn after(wait: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(wait).unwrap_or(now + FOREVER)
 }
 
 /// Render a `JoinError` into something worth putting on the wire.

@@ -104,6 +104,157 @@ async fn reading_the_navigation_charges_the_budget_once() {
     );
 }
 
+/// An EPUB 3 book that lists its navigation document in the spine, as many
+/// do so a reader can page to the table of contents.
+fn nav_in_spine() -> Vec<u8> {
+    common::shell()
+        .add(
+            common::OPF_PATH,
+            common::package(
+                "    <item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" \
+                 properties=\"nav\"/>\n    \
+                 <item id=\"ch1\" href=\"text/chap1.xhtml\" \
+                 media-type=\"application/xhtml+xml\"/>\n    \
+                 <item id=\"ch2\" href=\"text/chap2.xhtml\" \
+                 media-type=\"application/xhtml+xml\"/>\n",
+                "    <itemref idref=\"nav\"/>\n    <itemref idref=\"ch1\"/>\n    \
+                 <itemref idref=\"ch2\"/>\n",
+            ),
+        )
+        .add(common::NAV, common::nav_xhtml())
+        .add(
+            common::CHAP1,
+            common::chapter_xhtml("Chapter One", "The first chapter."),
+        )
+        .add(
+            common::CHAP2,
+            common::chapter_xhtml("Chapter Two", "The second chapter."),
+        )
+        .build()
+}
+
+/// A navigation document in the spine is read ahead to be parsed and then
+/// sent as its chapter from those same bytes, not inflated a second time.
+#[tokio::test]
+async fn a_navigation_document_in_the_spine_is_inflated_once() {
+    let harness = common::start().await;
+    let with = harness.parse_ok(&nav_in_spine()).await;
+    let without = harness
+        .parse(
+            &nav_in_spine(),
+            pb::ParseOptions {
+                parse_navigation: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the book should parse");
+
+    assert!(common::navigation(&with).is_some());
+    let chapters = common::chapters(&with);
+    assert_eq!(chapters[0].href, common::NAV);
+    assert_eq!(chapters[0].content, common::nav_xhtml().into_bytes());
+    assert!(
+        common::resources(&with).is_empty(),
+        "the nav document is a chapter here, so it is not a resource as well"
+    );
+    assert_eq!(
+        common::status(&with).uncompressed_bytes,
+        common::status(&without).uncompressed_bytes,
+        "reading the outline must not charge the nav document twice"
+    );
+    assert_eq!(
+        common::status(&with).entries_read,
+        common::status(&without).entries_read
+    );
+}
+
+/// The default book narrated chapter by chapter from one shared overlay.
+fn shared_overlay() -> Vec<u8> {
+    let manifest = "\
+    <item id=\"ch1\" href=\"text/chap1.xhtml\" media-type=\"application/xhtml+xml\" \
+     media-overlay=\"ov\"/>\n\
+    <item id=\"ch2\" href=\"text/chap2.xhtml\" media-type=\"application/xhtml+xml\" \
+     media-overlay=\"ov\"/>\n\
+    <item id=\"ov\" href=\"overlays/chap1.smil\" media-type=\"application/smil+xml\"/>\n";
+    common::shell()
+        .add(
+            common::OPF_PATH,
+            common::package(
+                manifest,
+                "    <itemref idref=\"ch1\"/>\n    <itemref idref=\"ch2\"/>\n",
+            ),
+        )
+        .add(common::OVERLAY, common::smil_xml())
+        .add(
+            common::CHAP1,
+            common::chapter_xhtml("Chapter One", "The first chapter."),
+        )
+        .add(
+            common::CHAP2,
+            common::chapter_xhtml("Chapter Two", "The second chapter."),
+        )
+        .build()
+}
+
+/// An overlay read for its cues is not held for the rest of the call when
+/// the walk will not send it, and is inflated once however many chapters it
+/// narrates.
+///
+/// SMIL classifies as `Other`, which the default options do not send, so
+/// held for the walk it would have sat in memory until the call ended, every
+/// overlay of a narrated book at once. Debug builds assert at the end of
+/// every parse that nothing read ahead is still held.
+#[tokio::test]
+async fn an_overlay_read_for_its_cues_is_inflated_once_and_not_held() {
+    let harness = common::start().await;
+    let overlays_on = pb::ParseOptions {
+        parse_media_overlays: Some(true),
+        ..Default::default()
+    };
+
+    let parsed = harness
+        .parse(&shared_overlay(), overlays_on)
+        .await
+        .expect("the book should parse");
+    assert_eq!(
+        common::overlays(&parsed).len(),
+        2,
+        "one per narrated chapter"
+    );
+    assert!(
+        common::resources(&parsed).is_empty(),
+        "SMIL is not sent by default"
+    );
+    let unparsed = harness.parse_ok(&shared_overlay()).await;
+    assert_eq!(
+        common::status(&parsed).entries_read,
+        common::status(&unparsed).entries_read + 1,
+        "the shared overlay is inflated once, not once per chapter"
+    );
+
+    // Asked for as well, its bytes go out once, from the same inflation.
+    let everything = pb::ParseOptions {
+        parse_media_overlays: Some(true),
+        include_all_resources: Some(true),
+        ..Default::default()
+    };
+    let sent = harness
+        .parse(&shared_overlay(), everything)
+        .await
+        .expect("the book should parse");
+    let smil: Vec<&pb::Resource> = common::resources(&sent)
+        .into_iter()
+        .filter(|resource| resource.href == common::OVERLAY)
+        .collect();
+    assert_eq!(smil.len(), 1);
+    assert_eq!(smil[0].content, common::smil_xml().into_bytes());
+    assert_eq!(
+        common::status(&sent).entries_read,
+        common::status(&parsed).entries_read
+    );
+}
+
 #[tokio::test]
 async fn an_epub_2_book_falls_back_to_its_ncx() {
     let harness = common::start().await;

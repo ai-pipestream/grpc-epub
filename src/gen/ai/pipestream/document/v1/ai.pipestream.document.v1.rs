@@ -556,6 +556,18 @@ pub struct TextItemBase {
     pub source_element_name: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag="24")]
     pub source_namespace: ::core::option::Option<::prost::alloc::string::String>,
+    /// Source attribution for this item's resolved fields when more than one
+    /// engine read them. Filled today only by the PDF consensus vote
+    /// (GRPARSE_PDF_BACKEND with several targets): the carried text is the
+    /// vote winner's reading, recorded as the field's source under the
+    /// "protomolt" claimant name; one further entry per losing backend whose
+    /// words deviated inside this item (a text deviation or an order break in
+    /// the page's reconciliation) names the reading that lost. The losing
+    /// words themselves stay on the stream's PageData.reconciliation; this
+    /// list only names who disagreed, on the item where they disagreed.
+    /// Empty for single-source items. Extension beyond the upstream dialect.
+    #[prost(message, repeated, tag="25")]
+    pub field_sources: ::prost::alloc::vec::Vec<FieldSource>,
 }
 /// TitleItem represents a document title or major heading.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -907,6 +919,11 @@ pub struct PicturePieChartData {
 pub struct ChartPoint {
     #[prost(message, optional, tag="1")]
     pub value: ::core::option::Option<FloatPair>,
+    /// The bubble size at this point, for bubble charts; unset for plain
+    /// scatter points (extension beyond the upstream dialect, whose scatter
+    /// point carries coordinates only).
+    #[prost(double, optional, tag="2")]
+    pub size: ::core::option::Option<f64>,
 }
 /// PictureScatterChartData contains scatter chart data extracted from a picture.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1461,6 +1478,39 @@ pub struct FieldItem {
     /// Fieldmark parameters, a genuinely open per-field vocabulary.
     #[prost(map="string, string", tag="14")]
     pub parameters: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    // The interactive state of the field, typed (extensions beyond the
+    // upstream dialect). The upstream model keeps a PDF form widget's raw
+    // state on its parsed-page PdfWidget, outside the document; here it rides
+    // on the field item itself, so a document consumer reads the form without
+    // the page layer. Each is set only when the source states it.
+
+    /// The field's interactive type.
+    #[prost(enumeration="FormFieldKind", optional, tag="15")]
+    pub field_kind: ::core::option::Option<i32>,
+    /// The current value as text. A PDF button's value is its state name
+    /// without the slash ("Yes").
+    #[prost(string, optional, tag="16")]
+    pub value: ::core::option::Option<::prost::alloc::string::String>,
+    /// The default value as text (PDF /DV).
+    #[prost(string, optional, tag="17")]
+    pub default_value: ::core::option::Option<::prost::alloc::string::String>,
+    /// The source's field flags bitfield. For PDF it is the /Ff mask
+    /// inherited through the field hierarchy, upstream's
+    /// PdfWidget.widget_field_flags.
+    #[prost(uint32, optional, tag="18")]
+    pub field_flags: ::core::option::Option<u32>,
+    /// The widget's appearance state as the source spells it. For PDF it is
+    /// the widget's own /AS name including its leading slash ("/Yes",
+    /// "/Off"), upstream's PdfWidget.widget_appearance_state.
+    #[prost(string, optional, tag="19")]
+    pub appearance_state: ::core::option::Option<::prost::alloc::string::String>,
+    /// Whether the field refuses edits (PDF /Ff bit 1).
+    #[prost(bool, optional, tag="20")]
+    pub read_only: ::core::option::Option<bool>,
+    /// The field's tooltip or alternate description (PDF /TU), upstream's
+    /// PdfWidget.widget_description.
+    #[prost(string, optional, tag="21")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// PageItem represents metadata about a single page in the document.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3834,6 +3884,60 @@ impl Trapped {
             "TRAPPED_TRUE" => Some(Self::True),
             "TRAPPED_FALSE" => Some(Self::False),
             "TRAPPED_UNKNOWN" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+/// FormFieldKind is the interactive type of a form field (FieldItem
+/// .field_kind). For PDF it is the /FT entry refined by the /Ff button and
+/// choice bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FormFieldKind {
+    Unspecified = 0,
+    /// A free-text input (PDF /Tx).
+    Text = 1,
+    /// A two-state check box (PDF /Btn without the radio or push-button bit).
+    CheckBox = 2,
+    /// One button of a radio group (PDF /Btn with the radio bit).
+    RadioButton = 3,
+    /// A button that holds no value (PDF /Btn with the push-button bit).
+    PushButton = 4,
+    /// A drop-down choice (PDF /Ch with the combo bit).
+    ComboBox = 5,
+    /// A scrolling choice list (PDF /Ch without the combo bit).
+    ListBox = 6,
+    /// A signature field (PDF /Sig).
+    Signature = 7,
+}
+impl FormFieldKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FORM_FIELD_KIND_UNSPECIFIED",
+            Self::Text => "FORM_FIELD_KIND_TEXT",
+            Self::CheckBox => "FORM_FIELD_KIND_CHECK_BOX",
+            Self::RadioButton => "FORM_FIELD_KIND_RADIO_BUTTON",
+            Self::PushButton => "FORM_FIELD_KIND_PUSH_BUTTON",
+            Self::ComboBox => "FORM_FIELD_KIND_COMBO_BOX",
+            Self::ListBox => "FORM_FIELD_KIND_LIST_BOX",
+            Self::Signature => "FORM_FIELD_KIND_SIGNATURE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FORM_FIELD_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "FORM_FIELD_KIND_TEXT" => Some(Self::Text),
+            "FORM_FIELD_KIND_CHECK_BOX" => Some(Self::CheckBox),
+            "FORM_FIELD_KIND_RADIO_BUTTON" => Some(Self::RadioButton),
+            "FORM_FIELD_KIND_PUSH_BUTTON" => Some(Self::PushButton),
+            "FORM_FIELD_KIND_COMBO_BOX" => Some(Self::ComboBox),
+            "FORM_FIELD_KIND_LIST_BOX" => Some(Self::ListBox),
+            "FORM_FIELD_KIND_SIGNATURE" => Some(Self::Signature),
             _ => None,
         }
     }

@@ -53,13 +53,21 @@ service EpubParseService {
   // failed stream ends with a gRPC status and no `status` event:
   //
   //   RESOURCE_EXHAUSTED  the upload, entry count, total decompressed size or
-  //                       an entry's compression ratio exceeded its cap
-  //   INVALID_ARGUMENT    not a ZIP, truncated, path traversal in an entry
-  //                       name, or an EPUB whose container.xml, OPF or spine
-  //                       is missing or unusable
+  //                       an entry's compression ratio exceeded its cap, or
+  //                       the upload would take the server past the upload
+  //                       bytes it holds across every call
+  //                       (ServerLimits.max_buffered_upload_mib)
+  //   INVALID_ARGUMENT    not a ZIP, truncated, or an EPUB whose
+  //                       container.xml, OPF or spine is missing or unusable,
+  //                       path traversal in a spine href included (an
+  //                       unusable entry name or resource href only leaves
+  //                       that file out, with a warning)
   //   UNIMPLEMENTED       a ZIP that is not an EPUB, or an EPUB the server
-  //                       cannot open: DRM, entry encryption, or a
-  //                       compression method outside store and deflate
+  //                       cannot open: DRM (an encryption.xml declaring
+  //                       anything but font obfuscation), entry encryption,
+  //                       or a compression method outside store and deflate
+  //   DEADLINE_EXCEEDED   no request frame arrived within the server's idle
+  //                       timeout
   //   INTERNAL            a bug here; the parser panicked
   //
   // Events already delivered before a failure remain valid. They describe
@@ -118,7 +126,8 @@ message ParseEpubResponse {
     // per spine item in spine order, and one `PictureItem` per emitted image
     // resource; it holds no bytes. Chapter XHTML is deliberately not parsed
     // here, so the chapter groups arrive empty and the HTML collector's items
-    // merge into them downstream.
+    // merge into them downstream. The exception is a spine item that is
+    // itself an image, with no XHTML fallback: its group holds its picture.
     ai.pipestream.document.v1.Document document = 5;
 
     // The book's own table of contents, parsed from its navigation document
