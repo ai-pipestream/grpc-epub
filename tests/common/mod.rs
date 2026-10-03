@@ -588,14 +588,24 @@ pub async fn start_with_window(window: u32) -> Harness {
     start_inner(Limits::default(), Some(window)).await
 }
 
+/// Start a server running an already configured service, for the settings
+/// that are not limits (the idle timeout, say).
+pub async fn start_service(service: EpubGrpc) -> Harness {
+    serve(service, None).await
+}
+
 async fn start_inner(limits: Limits, window: Option<u32>) -> Harness {
+    serve(EpubGrpc::with_metrics(limits, Metrics::new()), window).await
+}
+
+async fn serve(service: EpubGrpc, window: Option<u32>) -> Harness {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local address");
 
-    let metrics = Metrics::new();
-    let service = EpubGrpc::with_metrics(limits, Arc::clone(&metrics)).into_service();
+    let metrics: Arc<Metrics> = service.metrics();
+    let service = service.into_service();
     tokio::spawn(async move {
         Server::builder()
             .add_service(service)

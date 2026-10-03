@@ -548,4 +548,15 @@ message ServerLimits {
   // rather than being refused, because the bound exists to cap heap, not to
   // shed load.
   uint32 max_concurrent_parses = 7;
+
+  // Upload bytes the server holds at once, in MiB, summed over every call
+  // whether it is still uploading, waiting for a parse slot or parsing. Never
+  // less than `max_document_mib`.
+  //
+  // A call whose upload would take the server past this fails with
+  // RESOURCE_EXHAUSTED while uploading, rather than waiting for room: a call
+  // that waited would stop reading its stream, and on an HTTP/2 connection it
+  // shares with other calls that would stall them too. Retry once calls in
+  // progress have finished.
+  uint32 max_buffered_upload_mib = 8;
 }

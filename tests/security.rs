@@ -12,8 +12,15 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
 use grpc_epub::Limits;
 use grpc_epub::proto::v1 as pb;
+use grpc_epub::service::EpubGrpc;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::Code;
 
 /// Roughly 8 MiB of a repeating byte, which deflate stores in a few kilobytes.
@@ -378,4 +385,239 @@ async fn an_oversized_chunk_frame_is_refused_with_advice() {
         "{}",
         status.message()
     );
+}
+
+/// One mebibyte, for the upload sizes below.
+const MIB: usize = 1024 * 1024;
+
+/// Upload frame size for the paced uploads below.
+const FRAME: usize = 64 * 1024;
+
+/// A conforming one-chapter book padded with `filler` bytes of stored,
+/// incompressible data that no manifest item names.
+///
+/// The padding is never inflated. It makes the upload large while the parse
+/// stays trivial, which is what a test about uploads wants.
+fn padded_book(filler: usize) -> Vec<u8> {
+    let padding: Vec<u8> = (0..filler)
+        .map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    common::shell()
+        .add(
+            common::OPF_PATH,
+            common::opf_xml(&[("ch1", "text/chap1.xhtml")], &[]),
+        )
+        .add(common::CHAP1, common::chapter_xhtml("One", "a"))
+        .add_stored("OEBPS/padding.bin", padding)
+        .build()
+}
+
+/// The `options` frame with default options.
+fn options_frame() -> pb::ParseEpubRequest {
+    pb::ParseEpubRequest {
+        frame: Some(pb::parse_epub_request::Frame::Options(
+            pb::ParseOptions::default(),
+        )),
+    }
+}
+
+/// One `chunk` frame.
+fn chunk_frame(bytes: &[u8]) -> pb::ParseEpubRequest {
+    pb::ParseEpubRequest {
+        frame: Some(pb::parse_epub_request::Frame::Chunk(bytes.to_vec())),
+    }
+}
+
+/// Run one call over a request stream the test feeds by hand, collecting
+/// every event.
+async fn call(
+    harness: &common::Harness,
+    frames: mpsc::Receiver<pb::ParseEpubRequest>,
+) -> tokio::task::JoinHandle<Result<Vec<pb::parse_epub_response::Event>, tonic::Status>> {
+    let mut client = harness.client.clone();
+    tokio::spawn(async move {
+        let mut stream = client
+            .parse_epub(ReceiverStream::new(frames))
+            .await?
+            .into_inner();
+        let mut events = Vec::new();
+        while let Some(response) = stream.message().await? {
+            events.push(response.event.expect("every response carries an event"));
+        }
+        Ok(events)
+    })
+}
+
+/// Limits with a 10 MiB process-wide upload budget and an 8 MiB document
+/// cap: one 7.5 MiB upload fits, and so does one 3 MiB upload, but not both
+/// at once.
+fn tight_budget() -> Limits {
+    Limits {
+        max_document_bytes: 8 * MIB as u64,
+        max_buffered_upload_bytes: 10 * MIB as u64,
+        ..Limits::default()
+    }
+}
+
+/// Start a call, push the first 7 MiB of a 7.5 MiB book through it, and leave
+/// it open. Returns the frame sender, the frames not yet sent, and the call.
+///
+/// The server reads every upload as it arrives, so once these sends have gone
+/// through it holds about 7 MiB of this call's upload, in an 8 MiB buffer.
+async fn stalled_upload(
+    harness: &common::Harness,
+    book: &[u8],
+) -> (
+    mpsc::Sender<pb::ParseEpubRequest>,
+    Vec<Vec<u8>>,
+    tokio::task::JoinHandle<Result<Vec<pb::parse_epub_response::Event>, tonic::Status>>,
+) {
+    let (tx, rx) = mpsc::channel(1);
+    let handle = call(harness, rx).await;
+    tx.send(options_frame()).await.expect("options");
+    let mut frames = book.chunks(FRAME);
+    for frame in frames.by_ref().take(7 * MIB / FRAME) {
+        tx.send(chunk_frame(frame))
+            .await
+            .expect("the upload is read");
+    }
+    (tx, frames.map(<[u8]>::to_vec).collect(), handle)
+}
+
+/// The process never holds more upload than its budget, summed over calls.
+///
+/// The per-call cap bounds one upload and the parse slots bound the
+/// inflating, and before the budget nothing bounded how many uploads were
+/// buffered at once: a client with many streams open could make the server
+/// hold an upload's worth of memory for every one of them. Here one call
+/// holds 8 MiB of a 10 MiB budget, so a second call's 3 MiB upload is refused
+/// while it arrives, although it is well under its own cap; once the first
+/// call has finished, the same upload goes through.
+#[tokio::test]
+async fn the_process_holds_no_more_upload_than_its_budget() {
+    let harness = common::start_with(tight_budget()).await;
+    let held_book = padded_book(7 * MIB + MIB / 2);
+    let (tx, rest, held) = stalled_upload(&harness, &held_book).await;
+
+    let small = padded_book(3 * MIB);
+    let status = harness
+        .parse(&small, pb::ParseOptions::default())
+        .await
+        .expect_err("the budget is spoken for");
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert!(
+        status.message().contains("across all calls"),
+        "the refusal should say it is the process-wide budget, not this call's cap: {}",
+        status.message()
+    );
+
+    for frame in rest {
+        tx.send(chunk_frame(&frame)).await.expect("frame");
+    }
+    drop(tx);
+    let events = held.await.expect("task").expect("the first call parses");
+    assert_eq!(common::status(&events).chapters_emitted, 1);
+
+    let events = harness
+        .parse(&small, pb::ParseOptions::default())
+        .await
+        .expect("the budget was given back when the first call ended");
+    assert_eq!(common::status(&events).chapters_emitted, 1);
+}
+
+/// A client that sends part of an upload and goes quiet gives its share of
+/// the budget back.
+///
+/// Without the idle timeout the share would be held for as long as HTTP/2
+/// keepalive kept the connection up.
+#[tokio::test]
+async fn an_idle_upload_gives_its_budget_back() {
+    let harness = common::start_service(
+        EpubGrpc::new(tight_budget()).with_idle_timeout(Duration::from_millis(200)),
+    )
+    .await;
+    let book = padded_book(7 * MIB + MIB / 2);
+    let (tx, _rest, idle) = stalled_upload(&harness, &book).await;
+
+    let status = tokio::time::timeout(Duration::from_secs(10), idle)
+        .await
+        .expect("the server gives up on an idle stream")
+        .expect("task")
+        .expect_err("an idle call is ended");
+    assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+    drop(tx);
+
+    let events = harness
+        .parse(&padded_book(3 * MIB), pb::ParseOptions::default())
+        .await
+        .expect("the idle call's share of the budget was given back");
+    assert_eq!(common::status(&events).chapters_emitted, 1);
+}
+
+/// A call waiting for a parse slot still has its upload read.
+///
+/// The budget fails a call rather than making it wait, and this is why. A
+/// call that stopped reading its stream while it waited would leave its
+/// frames in the HTTP/2 connection window it shares with every other call
+/// on the connection, and the calls already being read could stall behind
+/// them. So nothing waits with an unread upload: a call waits for its slot
+/// only once its upload is in.
+#[tokio::test]
+async fn an_upload_is_read_while_its_call_waits_for_a_slot() {
+    let harness = common::start_with(Limits {
+        max_concurrent_parses: 1,
+        ..Limits::default()
+    })
+    .await;
+
+    // The first call takes the only slot, and keeps it: its client reads the
+    // first event and then nothing, so the parse waits on its outbound
+    // channel with the slot in hand. Its 10 MiB of chapters is far more than
+    // the client's receive window and the outbound channel can absorb.
+    let (first_tx, first_rx) = mpsc::channel(4);
+    let mut client = harness.client.clone();
+    first_tx.send(options_frame()).await.expect("options");
+    first_tx
+        .send(chunk_frame(&common::long_book(40, 256 * 1024)))
+        .await
+        .expect("upload");
+    drop(first_tx);
+    let mut first = client
+        .parse_epub(ReceiverStream::new(first_rx))
+        .await
+        .expect("the first call opens")
+        .into_inner();
+    let opening = first.message().await.expect("no error").expect("an event");
+    assert!(matches!(
+        opening.event,
+        Some(pb::parse_epub_response::Event::Info(_))
+    ));
+
+    // The second call's whole 4 MiB upload goes in although it has no slot.
+    let book = padded_book(4 * MIB);
+    let total = book.len();
+    let taken = Arc::new(AtomicUsize::new(0));
+    let (second_tx, second_rx) = mpsc::channel(1);
+    let second = call(&harness, second_rx).await;
+    let producer = {
+        let taken = Arc::clone(&taken);
+        tokio::spawn(async move {
+            second_tx.send(options_frame()).await.expect("options");
+            for frame in book.chunks(FRAME) {
+                second_tx.send(chunk_frame(frame)).await.expect("frame");
+                taken.fetch_add(frame.len(), Ordering::Relaxed);
+            }
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(20), producer)
+        .await
+        .expect("the waiting call's upload was read in full")
+        .expect("producer");
+    assert_eq!(taken.load(Ordering::Relaxed), total);
+    assert!(!second.is_finished(), "the second call has no slot yet");
+
+    // Drain the first call; its slot passes to the second.
+    while first.message().await.expect("no error").is_some() {}
+    let events = second.await.expect("task").expect("the second call parses");
+    assert_eq!(common::status(&events).chapters_emitted, 1);
 }

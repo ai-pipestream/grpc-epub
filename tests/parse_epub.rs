@@ -358,6 +358,11 @@ async fn get_service_info_reports_the_limits_in_force() {
         grpc_epub::limits::DEFAULT_MAX_COMPRESSION_RATIO
     );
     assert!(limits.max_chunk_bytes > 0);
+    assert_eq!(
+        limits.max_buffered_upload_mib,
+        grpc_epub::limits::DEFAULT_MAX_BUFFERED_UPLOAD_MIB,
+        "the process-wide upload budget is advertised with the other limits"
+    );
 
     let ui = info.ui.expect("ui advertisement is always reported");
     assert_eq!(ui.title, "EPUB");

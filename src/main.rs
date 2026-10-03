@@ -74,7 +74,16 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
 
-    let epub = EpubGrpc::with_metrics(limits, Arc::clone(&counters)).into_service();
+    // Zero means "not set", as it does for every limit: an idle stream with
+    // no bound is the failure the timeout exists to prevent.
+    let idle_timeout = match env_usize("GRPC_EPUB_IDLE_TIMEOUT_SECONDS", 0) {
+        0 => grpc_epub::service::DEFAULT_IDLE_TIMEOUT,
+        seconds => Duration::from_secs(u64::try_from(seconds).unwrap_or(u64::MAX)),
+    };
+
+    let epub = EpubGrpc::with_metrics(limits, Arc::clone(&counters))
+        .with_idle_timeout(idle_timeout)
+        .into_service();
 
     // Health, so an orchestrator can tell "listening" from "ready". This
     // server has no dependency to warm up, so it is serving from the moment it

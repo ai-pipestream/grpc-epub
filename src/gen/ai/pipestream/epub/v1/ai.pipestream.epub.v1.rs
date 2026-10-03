@@ -489,6 +489,17 @@ pub struct ServerLimits {
     /// shed load.
     #[prost(uint32, tag="7")]
     pub max_concurrent_parses: u32,
+    /// Upload bytes the server holds at once, in MiB, summed over every call
+    /// whether it is still uploading, waiting for a parse slot or parsing. Never
+    /// less than `max_document_mib`.
+    ///
+    /// A call whose upload would take the server past this fails with
+    /// RESOURCE_EXHAUSTED while uploading, rather than waiting for room: a call
+    /// that waited would stop reading its stream, and on an HTTP/2 connection it
+    /// shares with other calls that would stall them too. Retry once calls in
+    /// progress have finished.
+    #[prost(uint32, tag="8")]
+    pub max_buffered_upload_mib: u32,
 }
 /// ResourceKind classifies a manifest entry that is not a spine chapter.
 ///

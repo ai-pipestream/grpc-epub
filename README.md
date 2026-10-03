@@ -184,9 +184,10 @@ Events already delivered stay valid.
 
 | Code | When |
 |---|---|
-| `RESOURCE_EXHAUSTED` | upload, entry count, total inflated size or an entry's compression ratio over its cap |
+| `RESOURCE_EXHAUSTED` | upload, entry count, total inflated size or an entry's compression ratio over its cap, or the server already holding as much upload as its process-wide budget allows |
 | `INVALID_ARGUMENT` | not a ZIP, truncated, path traversal in an entry name or href, or an EPUB whose `container.xml`, OPF or spine is missing or unusable |
 | `UNIMPLEMENTED` | a ZIP that is not an EPUB, or one this build cannot open: DRM, entry encryption, or a compression method outside store and deflate |
+| `DEADLINE_EXCEEDED` | no request frame arrived within the idle timeout |
 | `INTERNAL` | a bug here; the parser panicked |
 
 `grpc.health.v1.Health` is registered and reports
@@ -207,10 +208,13 @@ Events already delivered stay valid.
 | `GRPC_EPUB_COMPRESSION_RATIO_FLOOR_BYTES` | `1048576` | size an entry must exceed before the ratio rule applies |
 | `GRPC_EPUB_MAX_CHUNK_BYTES` | `16777216` | largest single inbound `chunk` frame |
 | `GRPC_EPUB_MAX_CONCURRENT_PARSES` | `8` | calls that may inflate at once; further calls wait |
+| `GRPC_EPUB_MAX_BUFFERED_UPLOAD_MIB` | document cap × parse slots (`2048`) | upload bytes the process holds at once across every call; an upload that would pass it fails with `RESOURCE_EXHAUSTED` instead of waiting; never below the document cap |
+| `GRPC_EPUB_IDLE_TIMEOUT_SECONDS` | `30` | longest wait for the next request frame; past it the call ends with `DEADLINE_EXCEEDED` and frees its share of the upload budget |
 
-Every limit is also readable at runtime through `GetServiceInfo`. The same RPC
-carries a `ui` block (`title`, `path`, `description`) advertising this
-service's tab in the shared demo shell.
+Every size limit is also readable at runtime through `GetServiceInfo` (the
+idle timeout is not on the wire). The same RPC carries a `ui` block (`title`,
+`path`, `description`) advertising this service's tab in the shared demo
+shell.
 
 ## Web demo
 
@@ -249,6 +253,14 @@ The last two are enforced against what actually comes out of the decompressor,
 not just against the sizes the archive declares, so a lying header is caught
 too. Over any of them is `RESOURCE_EXHAUSTED`, raised partway through the
 extract rather than after it.
+
+Memory is bounded per call and across calls. One upload is cut off at the
+document cap as it arrives, and the upload bytes the whole process holds,
+summed over every open stream, are capped by
+`GRPC_EPUB_MAX_BUFFERED_UPLOAD_MIB`: an upload that would pass it is refused
+with `RESOURCE_EXHAUSTED` while it arrives, so opening many streams cannot make
+the server buffer an upload's worth of memory for each. A stream that sends
+nothing for the idle timeout is ended and its share given back.
 
 Path traversal is refused, not sanitized. Entry names and OPF hrefs are
 percent-decoded, then normalized, then rejected if they escape the archive

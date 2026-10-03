@@ -53,13 +53,18 @@ service EpubParseService {
   // failed stream ends with a gRPC status and no `status` event:
   //
   //   RESOURCE_EXHAUSTED  the upload, entry count, total decompressed size or
-  //                       an entry's compression ratio exceeded its cap
+  //                       an entry's compression ratio exceeded its cap, or
+  //                       the upload would take the server past the upload
+  //                       bytes it holds across every call
+  //                       (ServerLimits.max_buffered_upload_mib)
   //   INVALID_ARGUMENT    not a ZIP, truncated, path traversal in an entry
   //                       name, or an EPUB whose container.xml, OPF or spine
   //                       is missing or unusable
   //   UNIMPLEMENTED       a ZIP that is not an EPUB, or an EPUB the server
   //                       cannot open: DRM, entry encryption, or a
   //                       compression method outside store and deflate
+  //   DEADLINE_EXCEEDED   no request frame arrived within the server's idle
+  //                       timeout
   //   INTERNAL            a bug here; the parser panicked
   //
   // Events already delivered before a failure remain valid. They describe

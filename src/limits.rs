@@ -58,10 +58,21 @@ pub const DEFAULT_MAX_CHUNK_BYTES: u64 = 16 * MIB;
 
 /// Default ceiling on concurrent inflating calls.
 ///
-/// The bound exists to cap heap, not to shed load: each in-flight call can
-/// hold its upload plus one inflated entry, so eight of them at the default
-/// caps is the memory ceiling of the process. Calls past the bound wait.
+/// The bound exists to cap heap, not to shed load: what one call inflates is
+/// bounded by its decompressed cap, so eight of them at the default caps hold
+/// at most 8 × 512 MiB of inflated bytes. Calls past the bound wait, holding
+/// their uploads, which the upload budget below bounds separately.
 pub const DEFAULT_MAX_CONCURRENT_PARSES: usize = 8;
+
+/// Default ceiling on upload bytes the whole process holds at once, across
+/// every call: as many full-size uploads as there are parse slots, 2 GiB.
+///
+/// The per-call document cap bounds one upload, and the parse slots bound the
+/// inflating; neither bounds how many uploads are buffered at once, which is
+/// one per open stream. This does. With the parse slots it makes the
+/// process's heap ceiling 2 GiB of uploads plus 8 × 512 MiB inflated.
+pub const DEFAULT_MAX_BUFFERED_UPLOAD_MIB: u32 =
+    DEFAULT_MAX_DOCUMENT_MIB * DEFAULT_MAX_CONCURRENT_PARSES as u32;
 
 /// Ceilings the process enforces, in bytes rather than the wire's MiB.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +91,10 @@ pub struct Limits {
     pub max_chunk_bytes: u64,
     /// Largest number of calls that may inflate at once.
     pub max_concurrent_parses: usize,
+    /// Largest number of upload bytes the process holds at once, summed over
+    /// every call. Never below `max_document_bytes`, or the largest upload a
+    /// call may send could never be received.
+    pub max_buffered_upload_bytes: u64,
 }
 
 impl Default for Limits {
@@ -92,6 +107,7 @@ impl Default for Limits {
             compression_ratio_floor_bytes: DEFAULT_RATIO_FLOOR_BYTES,
             max_chunk_bytes: DEFAULT_MAX_CHUNK_BYTES,
             max_concurrent_parses: DEFAULT_MAX_CONCURRENT_PARSES,
+            max_buffered_upload_bytes: u64::from(DEFAULT_MAX_BUFFERED_UPLOAD_MIB) * MIB,
         }
     }
 }
@@ -117,11 +133,24 @@ impl Limits {
     #[must_use]
     pub fn from_env() -> Self {
         let defaults = Self::default();
+        let max_document_mib = env_u64(
+            "GRPC_EPUB_MAX_DOCUMENT_MIB",
+            u64::from(DEFAULT_MAX_DOCUMENT_MIB),
+        );
+        let max_concurrent_parses = usize::try_from(env_u64(
+            "GRPC_EPUB_MAX_CONCURRENT_PARSES",
+            defaults.max_concurrent_parses as u64,
+        ))
+        .unwrap_or(defaults.max_concurrent_parses);
+        // The budget follows the two settings it is derived from unless it is
+        // set itself, and is never smaller than one full-size upload.
+        let max_buffered_upload_mib = env_u64(
+            "GRPC_EPUB_MAX_BUFFERED_UPLOAD_MIB",
+            max_document_mib.saturating_mul(max_concurrent_parses as u64),
+        )
+        .max(max_document_mib);
         Self {
-            max_document_bytes: env_u64(
-                "GRPC_EPUB_MAX_DOCUMENT_MIB",
-                u64::from(DEFAULT_MAX_DOCUMENT_MIB),
-            ) * MIB,
+            max_document_bytes: max_document_mib * MIB,
             max_uncompressed_bytes: env_u64(
                 "GRPC_EPUB_MAX_UNCOMPRESSED_MIB",
                 u64::from(DEFAULT_MAX_UNCOMPRESSED_MIB),
@@ -141,11 +170,8 @@ impl Limits {
                 DEFAULT_RATIO_FLOOR_BYTES,
             ),
             max_chunk_bytes: env_u64("GRPC_EPUB_MAX_CHUNK_BYTES", DEFAULT_MAX_CHUNK_BYTES),
-            max_concurrent_parses: usize::try_from(env_u64(
-                "GRPC_EPUB_MAX_CONCURRENT_PARSES",
-                defaults.max_concurrent_parses as u64,
-            ))
-            .unwrap_or(defaults.max_concurrent_parses),
+            max_concurrent_parses,
+            max_buffered_upload_bytes: max_buffered_upload_mib.saturating_mul(MIB),
         }
     }
 
@@ -206,6 +232,7 @@ impl Limits {
             compression_ratio_floor_bytes: self.compression_ratio_floor_bytes,
             max_chunk_bytes: self.max_chunk_bytes,
             max_concurrent_parses: u32::try_from(self.max_concurrent_parses).unwrap_or(u32::MAX),
+            max_buffered_upload_mib: mib(self.max_buffered_upload_bytes),
         }
     }
 }
@@ -299,6 +326,19 @@ mod tests {
         assert_eq!(raised.max_entries, limits.max_entries);
         assert_eq!(raised.max_compression_ratio, limits.max_compression_ratio);
         assert_eq!(raised.max_document_bytes, limits.max_document_bytes);
+    }
+
+    #[test]
+    fn the_upload_budget_is_a_full_upload_per_parse_slot() {
+        let limits = Limits::default();
+        assert_eq!(
+            limits.max_buffered_upload_bytes,
+            limits.max_document_bytes * limits.max_concurrent_parses as u64
+        );
+        assert_eq!(
+            limits.to_proto().max_buffered_upload_mib,
+            DEFAULT_MAX_BUFFERED_UPLOAD_MIB
+        );
     }
 
     #[test]
