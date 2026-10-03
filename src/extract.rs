@@ -86,6 +86,12 @@ const MAX_MIMETYPE_BYTES: u64 = 256;
 /// everything else.
 const MAX_WARNINGS: usize = 64;
 
+/// Longest stretch of a rejected entry name or href quoted in a warning.
+///
+/// A ZIP entry name can run to 64 KiB and an OPF attribute to anything, and
+/// every warning rides in the one trailer message.
+const MAX_QUOTED_CHARS: usize = 120;
+
 /// How the call ended.
 #[derive(Debug)]
 pub enum Outcome {
@@ -229,6 +235,9 @@ struct Resolved<'a> {
     entry: Option<usize>,
     /// Whether the href was an absolute URI rather than an archive path.
     remote: bool,
+    /// Why the href could not be an archive path at all, when it could not.
+    /// `path` then holds the href as written and `entry` is absent.
+    unusable: Option<href::PathError>,
 }
 
 /// Entries inflated ahead of the spine walk, held so they are not inflated
@@ -370,6 +379,14 @@ fn is_nested_archive(media_type: &str, path: &str) -> bool {
         })
 }
 
+/// `value` quoted for a warning message, cut short past [`MAX_QUOTED_CHARS`].
+fn quoted(value: &str) -> String {
+    match value.char_indices().nth(MAX_QUOTED_CHARS) {
+        Some((cut, _)) => format!("{:?}...", &value[..cut]),
+        None => format!("{value:?}"),
+    }
+}
+
 /// Look an archive path up, tolerating a producer that never percent-encoded.
 ///
 /// `resolve` decodes `%20` to a space because that is what an IRI reference
@@ -446,7 +463,7 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     sink.set_source_hash(crate::document_fold::source_hash(bytes));
 
     let mut archive = archive::open(bytes, limits)?;
-    let entries = archive::scan(&mut archive)?;
+    let archive::Scan { entries, unusable } = archive::scan(&mut archive)?;
     let index: HashMap<String, usize> = entries
         .iter()
         .enumerate()
@@ -455,6 +472,16 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
 
     let mut budget = Budget::new(limits.max_uncompressed_bytes);
     let mut warnings = Warnings::default();
+    for (name, error) in &unusable {
+        // The name goes in the message, not in `href`: it is not an archive
+        // path, and a client that treated it as one is what the traversal
+        // policy protects.
+        warnings.push(
+            pb::ParseWarningCode::UnusableEntryName,
+            "",
+            format!("archive entry {} was left out: {error}", quoted(name)),
+        );
+    }
 
     // --- Is this an EPUB at all? -------------------------------------------
     let obfuscated = match index.get(ENCRYPTION_PATH) {
@@ -552,19 +579,16 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     let mut resolved: Vec<Resolved<'_>> = Vec::with_capacity(package.manifest.len());
     let mut by_id: HashMap<&str, usize> = HashMap::with_capacity(package.manifest.len());
     for item in &package.manifest {
-        let target = href::resolve(&opf_dir, &item.href).map_err(|e| {
-            Status::invalid_argument(format!(
-                "manifest item {:?} has an unusable href {:?}: {e}",
-                item.id, item.href
-            ))
-        })?;
-        let entry = match &target {
-            Target::Entry(path) => lookup(&index, path, &opf_dir, &item.href),
-            Target::Remote(_) => None,
-        };
-        let (path, remote) = match target {
-            Target::Entry(path) => (path, false),
-            Target::Remote(uri) => (uri, true),
+        // An href that cannot be resolved names nothing. That is fatal for a
+        // spine item and a warning for anything else, decided below where the
+        // spine is known.
+        let (path, entry, remote, unusable) = match href::resolve(&opf_dir, &item.href) {
+            Ok(Target::Entry(path)) => {
+                let entry = lookup(&index, &path, &opf_dir, &item.href);
+                (path, entry, false, None)
+            }
+            Ok(Target::Remote(uri)) => (uri, None, true, None),
+            Err(error) => (item.href.clone(), None, false, Some(error)),
         };
         by_id.entry(item.id.as_str()).or_insert(resolved.len());
         resolved.push(Resolved {
@@ -572,6 +596,7 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             path,
             entry,
             remote,
+            unusable,
         });
     }
 
@@ -591,6 +616,13 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             .into());
         };
         let target = &resolved[position];
+        if let Some(error) = &target.unusable {
+            return Err(Status::invalid_argument(format!(
+                "manifest item {:?} has an unusable href {:?}: {error}",
+                target.item.id, target.item.href
+            ))
+            .into());
+        }
         if target.remote {
             return Err(Status::invalid_argument(format!(
                 "spine item {:?} points outside the archive at {:?}; remote chapters are not \
@@ -776,6 +808,19 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             continue;
         }
         let kind = classify(&target.item.media_type);
+        if let Some(error) = &target.unusable {
+            skipped += 1;
+            warnings.push(
+                pb::ParseWarningCode::MissingManifestEntry,
+                "",
+                format!(
+                    "manifest item {} has an unusable href {} ({error}); nothing is read for it",
+                    quoted(&target.item.id),
+                    quoted(&target.item.href)
+                ),
+            );
+            continue;
+        }
         if target.remote {
             skipped += 1;
             warnings.push(
@@ -967,7 +1012,11 @@ fn overlay_links(resolved: &[Resolved<'_>], by_id: &HashMap<&str, usize>) -> Vec
         .enumerate()
         .filter_map(|(position, target)| {
             let overlay = *by_id.get(target.item.media_overlay.as_str())?;
-            Some((position, overlay))
+            // An overlay whose href is no archive path has no path to report.
+            resolved[overlay]
+                .unusable
+                .is_none()
+                .then_some((position, overlay))
         })
         .collect()
 }
@@ -992,6 +1041,14 @@ fn nav_point(point: &nav::NavPoint) -> pb::NavPoint {
 
 /// Find the cover image's archive path, if the book names one.
 fn cover(resolved: &[Resolved<'_>], package: &Package) -> String {
+    // An href that is no archive path names no cover.
+    let path = |target: &Resolved<'_>| {
+        if target.unusable.is_some() {
+            String::new()
+        } else {
+            target.path.clone()
+        }
+    };
     // EPUB 3: a manifest property.
     if let Some(target) = resolved.iter().find(|target| {
         target
@@ -1000,7 +1057,7 @@ fn cover(resolved: &[Resolved<'_>], package: &Package) -> String {
             .iter()
             .any(|property| property == "cover-image")
     }) {
-        return target.path.clone();
+        return path(target);
     }
     // EPUB 2: `<meta name="cover" content="…">` naming a manifest item.
     if package.metadata.cover_id.is_empty() {
@@ -1009,7 +1066,7 @@ fn cover(resolved: &[Resolved<'_>], package: &Package) -> String {
     resolved
         .iter()
         .find(|target| target.item.id == package.metadata.cover_id)
-        .map(|target| target.path.clone())
+        .map(path)
         .unwrap_or_default()
 }
 
@@ -1137,6 +1194,15 @@ mod tests {
             "extra/inner.EPUB"
         ));
         assert!(!is_nested_archive("image/png", "images/cover.png"));
+    }
+
+    #[test]
+    fn a_long_rejected_name_is_quoted_short() {
+        assert_eq!(quoted("../x"), "\"../x\"");
+        let long = "a/".repeat(10_000);
+        let shown = quoted(&long);
+        assert!(shown.len() < 2 * MAX_QUOTED_CHARS, "{}", shown.len());
+        assert!(shown.ends_with("..."));
     }
 
     #[test]

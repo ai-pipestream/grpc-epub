@@ -185,7 +185,7 @@ Events already delivered stay valid.
 | Code | When |
 |---|---|
 | `RESOURCE_EXHAUSTED` | upload, entry count, total inflated size or an entry's compression ratio over its cap, or the server already holding as much upload as its process-wide budget allows |
-| `INVALID_ARGUMENT` | not a ZIP, truncated, path traversal in an entry name or href, or an EPUB whose `container.xml`, OPF or spine is missing or unusable |
+| `INVALID_ARGUMENT` | not a ZIP, truncated, or an EPUB whose `container.xml`, OPF or spine is missing or unusable, a spine href that escapes the archive included |
 | `UNIMPLEMENTED` | a ZIP that is not an EPUB, or one this build cannot open: DRM, entry encryption, or a compression method outside store and deflate |
 | `DEADLINE_EXCEEDED` | no request frame arrived within the idle timeout |
 | `INTERNAL` | a bug here; the parser panicked |
@@ -263,10 +263,13 @@ the server buffer an upload's worth of memory for each. A stream that sends
 nothing for the idle timeout is ended and its share given back.
 
 Path traversal is refused, not sanitized. Entry names and OPF hrefs are
-percent-decoded, then normalized, then rejected if they escape the archive
-root, are absolute, or contain a NUL or a backslash. Nothing here writes to
-disk, but the paths go out on the wire and a client that does write files would
-otherwise inherit the traversal.
+percent-decoded, then normalized (a backslash is read as the `/` a Windows zip
+tool meant), then rejected if they escape the archive root, are absolute, or
+contain a NUL. Nothing here writes to disk, but the paths go out on the wire
+and a client that does write files would otherwise inherit the traversal.
+Refusing a path is not refusing the book: an unusable spine href or rootfile
+fails the call, while an unusable entry name or resource href only leaves that
+one file out, with a warning.
 
 XXE cannot happen by construction: quick-xml has no DTD processor, so it cannot
 fetch an external entity. On top of that, a `<!DOCTYPE>` declaring an

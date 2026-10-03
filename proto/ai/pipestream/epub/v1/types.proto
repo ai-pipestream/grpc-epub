@@ -458,8 +458,10 @@ enum ParseWarningCode {
   // include options. Ordinary, not a defect.
   PARSE_WARNING_CODE_RESOURCE_KIND_EXCLUDED = 1;
 
-  // A manifest item names a file the archive does not contain, and it is not
-  // a spine item. A missing *spine* item fails the call instead.
+  // A manifest item names a file the archive does not contain, or an href
+  // that cannot be an archive path at all (empty, absolute, or escaping the
+  // archive root), and it is not a spine item. A missing or unusable *spine*
+  // item fails the call instead.
   PARSE_WARNING_CODE_MISSING_MANIFEST_ENTRY = 2;
 
   // A nested archive was found inside the EPUB and was not opened. ZIP-in-ZIP
@@ -478,6 +480,15 @@ enum ParseWarningCode {
   // obfuscates its fonts still parses; real encryption fails the call with
   // UNIMPLEMENTED instead.
   PARSE_WARNING_CODE_OBFUSCATED_RESOURCE = 5;
+
+  // An archive entry was left out because its name cannot be an archive path:
+  // it escapes the archive root, is absolute, or contains a NUL. Nothing can
+  // name such an entry, so nothing in it is read or sent; if the book needed
+  // it, the spine or container check fails the call as for a missing file.
+  // The name is quoted in `message` and `href` is empty, because the name is
+  // not a path anyone should resolve. A backslash is not such a name: it is
+  // read as the separator a Windows zip tool meant.
+  PARSE_WARNING_CODE_UNUSABLE_ENTRY_NAME = 6;
 }
 
 // ParseWarning is one non-fatal observation, carried on ParseStatus.

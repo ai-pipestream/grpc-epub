@@ -274,6 +274,15 @@ when. The central directory lists every file up front, so a dangling `idref` or
 a missing chapter is diagnosed before the stream opens rather than after three
 chapters have been delivered.
 
+**Unusable paths cost the file, not the book.** Section 5 has traversal fail
+the call. The implementation does that only where the book needs the path: an
+unusable spine href or rootfile is `INVALID_ARGUMENT`. An archive entry whose
+name escapes the root, is absolute or holds a NUL is left out with
+`UNUSABLE_ENTRY_NAME`, since nothing can name it and so nothing in it is ever
+read or sent; a non-spine manifest href that cannot be resolved is a
+`MISSING_MANIFEST_ENTRY` warning. A backslash is read as a separator, because
+that is what a zip tool on Windows means by it.
+
 **Resource ordering is by archive position.** Section 3 allows a resource to
 arrive after the chapter referencing it. The implementation emits each resource
 at the point its archive entry is reached during the spine walk, which is

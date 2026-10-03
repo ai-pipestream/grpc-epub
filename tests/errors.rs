@@ -214,6 +214,44 @@ async fn a_missing_resource_is_a_warning_not_a_failure() {
     assert_eq!(status.warnings[0].href, "OEBPS/images/gone.png");
 }
 
+/// A resource whose href cannot be an archive path is left out with a
+/// warning, like a missing one. Only a spine item's href has to be usable.
+#[tokio::test]
+async fn an_unusable_resource_href_is_a_warning_not_a_failure() {
+    let harness = common::start().await;
+    let archive = common::shell()
+        .add(
+            common::OPF_PATH,
+            common::opf_xml(
+                &[("ch1", "text/chap1.xhtml")],
+                &[
+                    ("outside", "../../outside.png", "image/png", ""),
+                    ("empty", "", "image/png", "cover-image"),
+                ],
+            ),
+        )
+        .add(common::CHAP1, common::chapter_xhtml("One", "a"))
+        .build();
+
+    let events = harness.parse_ok(&archive).await;
+    assert_eq!(common::chapters(&events).len(), 1);
+    assert_eq!(
+        common::info(&events).cover_href,
+        "",
+        "an href that is no archive path names no cover"
+    );
+    let status = common::status(&events);
+    assert_eq!(status.resources_skipped, 2);
+    assert_eq!(status.warnings.len(), 2, "{:?}", status.warnings);
+    for warning in &status.warnings {
+        assert_eq!(
+            warning.code,
+            grpc_epub::proto::v1::ParseWarningCode::MissingManifestEntry as i32
+        );
+        assert!(warning.message.contains("unusable href"), "{warning:?}");
+    }
+}
+
 /// A remote manifest resource is recorded and never fetched. No network.
 #[tokio::test]
 async fn a_remote_resource_is_recorded_and_never_fetched() {

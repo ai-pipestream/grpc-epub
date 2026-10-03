@@ -570,8 +570,10 @@ pub enum ParseWarningCode {
     /// A manifest item was not emitted because its kind was not selected by the
     /// include options. Ordinary, not a defect.
     ResourceKindExcluded = 1,
-    /// A manifest item names a file the archive does not contain, and it is not
-    /// a spine item. A missing *spine* item fails the call instead.
+    /// A manifest item names a file the archive does not contain, or an href
+    /// that cannot be an archive path at all (empty, absolute, or escaping the
+    /// archive root), and it is not a spine item. A missing or unusable *spine*
+    /// item fails the call instead.
     MissingManifestEntry = 2,
     /// A nested archive was found inside the EPUB and was not opened. ZIP-in-ZIP
     /// is a non-goal, and recursing into one is how a decompression bomb hides
@@ -587,6 +589,14 @@ pub enum ParseWarningCode {
     /// obfuscates its fonts still parses; real encryption fails the call with
     /// UNIMPLEMENTED instead.
     ObfuscatedResource = 5,
+    /// An archive entry was left out because its name cannot be an archive path:
+    /// it escapes the archive root, is absolute, or contains a NUL. Nothing can
+    /// name such an entry, so nothing in it is read or sent; if the book needed
+    /// it, the spine or container check fails the call as for a missing file.
+    /// The name is quoted in `message` and `href` is empty, because the name is
+    /// not a path anyone should resolve. A backslash is not such a name: it is
+    /// read as the separator a Windows zip tool meant.
+    UnusableEntryName = 6,
 }
 impl ParseWarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -601,6 +611,7 @@ impl ParseWarningCode {
             Self::NestedArchive => "PARSE_WARNING_CODE_NESTED_ARCHIVE",
             Self::Metadata => "PARSE_WARNING_CODE_METADATA",
             Self::ObfuscatedResource => "PARSE_WARNING_CODE_OBFUSCATED_RESOURCE",
+            Self::UnusableEntryName => "PARSE_WARNING_CODE_UNUSABLE_ENTRY_NAME",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -612,6 +623,7 @@ impl ParseWarningCode {
             "PARSE_WARNING_CODE_NESTED_ARCHIVE" => Some(Self::NestedArchive),
             "PARSE_WARNING_CODE_METADATA" => Some(Self::Metadata),
             "PARSE_WARNING_CODE_OBFUSCATED_RESOURCE" => Some(Self::ObfuscatedResource),
+            "PARSE_WARNING_CODE_UNUSABLE_ENTRY_NAME" => Some(Self::UnusableEntryName),
             _ => None,
         }
     }

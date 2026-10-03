@@ -150,20 +150,39 @@ pub struct EntryInfo {
     pub compressed_size: u64,
 }
 
+/// The central directory, read and checked.
+#[derive(Debug, Default)]
+pub struct Scan {
+    /// Every file entry with a usable name, in central-directory order.
+    pub entries: Vec<EntryInfo>,
+    /// Entries left out because their names cannot be archive paths: the name
+    /// as stored, and why.
+    pub unusable: Vec<(String, crate::href::PathError)>,
+}
+
 /// Read the central directory and check every entry name and encoding.
 ///
-/// This runs before any event is emitted, so a hostile name or an entry this
-/// build cannot decode fails the call cleanly instead of truncating a stream
-/// that has already started. Directory entries are dropped: they carry no
-/// content and their names would collide with real files after normalization.
+/// This runs before any event is emitted, so an entry this build cannot
+/// decode fails the call cleanly instead of truncating a stream that has
+/// already started. Directory entries are dropped: they carry no content and
+/// their names would collide with real files after normalization.
+///
+/// An entry whose name cannot be an archive path (one that escapes the root,
+/// is absolute, or holds a NUL) is left out and reported, not fatal. Nothing
+/// can name it, so nothing in it is ever read or sent, which is all the
+/// traversal policy needs; a stray `__MACOSX/../x` or `/mimetype` from a
+/// careless zip tool does not have to cost the reader the whole book. If the
+/// book needed that entry, the spine or the container check says so.
 ///
 /// # Errors
 ///
-/// `INVALID_ARGUMENT` for a name that escapes the archive root or is otherwise
-/// unusable, `UNIMPLEMENTED` for an encrypted entry or a compression method
-/// outside store and deflate.
-pub fn scan(archive: &mut MemoryArchive<'_>) -> Result<Vec<EntryInfo>, Status> {
-    let mut entries = Vec::with_capacity(archive.len());
+/// `UNIMPLEMENTED` for an encrypted entry or a compression method outside
+/// store and deflate.
+pub fn scan(archive: &mut MemoryArchive<'_>) -> Result<Scan, Status> {
+    let mut scan = Scan {
+        entries: Vec::with_capacity(archive.len()),
+        unusable: Vec::new(),
+    };
     for index in 0..archive.len() {
         // `by_index_raw` reads the header without building a decompressor, so
         // this pass costs a seek per entry and no inflation.
@@ -191,20 +210,23 @@ pub fn scan(archive: &mut MemoryArchive<'_>) -> Result<Vec<EntryInfo>, Status> {
         let compressed_size = entry.compressed_size();
         drop(entry);
 
-        let Some(normalized) = crate::href::check_entry_name(&name)
-            .map_err(|e| Status::invalid_argument(format!("archive entry {name:?}: {e}")))?
-        else {
-            continue; // A directory entry.
+        let normalized = match crate::href::check_entry_name(&name) {
+            Ok(Some(normalized)) => normalized,
+            Ok(None) => continue, // A directory entry.
+            Err(error) => {
+                scan.unusable.push((name, error));
+                continue;
+            }
         };
 
-        entries.push(EntryInfo {
+        scan.entries.push(EntryInfo {
             index,
             name: normalized,
             declared_size,
             compressed_size,
         });
     }
-    Ok(entries)
+    Ok(scan)
 }
 
 /// Inflate one entry under the budget.

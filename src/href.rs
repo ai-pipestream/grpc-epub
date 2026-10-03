@@ -15,6 +15,16 @@
 //! out on the wire as `Chapter.href` and `Resource.href`, where a client that
 //! *does* write files would inherit the traversal, and an entry name that
 //! escapes the archive root has no honest reading — a real EPUB never has one.
+//!
+//! Refusing a path is not the same as refusing the book. The callers decide
+//! that: an unusable spine item or rootfile fails the call, because there is
+//! no book without it, while an unusable entry name or resource href only
+//! leaves that one file out, with a warning.
+//!
+//! A backslash is read as a separator. APPNOTE requires `/` in entry names,
+//! and `\` is what a zip tool on Windows writes instead; read as a separator
+//! it names what the producer meant, and a `..\` is then caught by the
+//! traversal check like any other `../`.
 
 /// Longest path this module will accept, in bytes.
 ///
@@ -43,8 +53,7 @@ pub enum PathError {
     Absolute,
     /// The path escaped the archive root through `..`.
     Traversal,
-    /// The path contained a byte no archive path may contain: a NUL, or a
-    /// backslash, which some extractors treat as a separator and some do not.
+    /// The path contained a byte no archive path may contain: a NUL.
     IllegalByte(char),
 }
 
@@ -131,7 +140,7 @@ fn is_absolute_uri(href: &str) -> bool {
 /// # Errors
 ///
 /// Returns [`PathError`] when the href is empty, over-long, absolute, escapes
-/// the archive root, or contains a NUL or a backslash.
+/// the archive root, or contains a NUL.
 pub fn resolve(base_dir: &str, href: &str) -> Result<Target, PathError> {
     if href.len() > MAX_PATH_BYTES {
         return Err(PathError::TooLong);
@@ -161,13 +170,13 @@ pub fn normalize(base_dir: &str, path: &str) -> Result<String, PathError> {
     if path.len() + base_dir.len() + 1 > MAX_PATH_BYTES {
         return Err(PathError::TooLong);
     }
+    if path.contains('\0') {
+        return Err(PathError::IllegalByte('\0'));
+    }
+    // See the module documentation: `\` is a separator.
+    let path = path.replace('\\', "/");
     if path.starts_with('/') {
         return Err(PathError::Absolute);
-    }
-    for c in path.chars() {
-        if c == '\0' || c == '\\' {
-            return Err(PathError::IllegalByte(c));
-        }
     }
 
     let mut segments: Vec<&str> = if base_dir.is_empty() {
@@ -210,7 +219,7 @@ pub fn normalize(base_dir: &str, path: &str) -> Result<String, PathError> {
 ///
 /// Returns [`PathError`] when the name is unusable or escapes the root.
 pub fn check_entry_name(name: &str) -> Result<Option<String>, PathError> {
-    if name.ends_with('/') {
+    if name.ends_with('/') || name.ends_with('\\') {
         // A directory entry. Still checked for traversal, still not a file.
         normalize("", name)?;
         return Ok(None);
@@ -275,12 +284,31 @@ mod tests {
         assert_eq!(resolve("OEBPS", "/etc/passwd"), Err(PathError::Absolute));
         assert_eq!(check_entry_name("/etc/passwd"), Err(PathError::Absolute));
         assert_eq!(
-            check_entry_name("OEBPS\\..\\evil.xhtml"),
-            Err(PathError::IllegalByte('\\'))
-        );
-        assert_eq!(
             check_entry_name("OEBPS/nul\0.xhtml"),
             Err(PathError::IllegalByte('\0'))
+        );
+    }
+
+    #[test]
+    fn a_backslash_is_a_separator_and_cannot_hide_a_traversal() {
+        assert_eq!(
+            check_entry_name("OEBPS\\Text\\ch1.xhtml"),
+            Ok(Some("OEBPS/Text/ch1.xhtml".to_owned()))
+        );
+        assert_eq!(
+            check_entry_name("OEBPS\\..\\evil.xhtml"),
+            Ok(Some("evil.xhtml".to_owned())),
+            "inside the root, so harmless once read as the producer meant it"
+        );
+        assert_eq!(
+            check_entry_name("..\\..\\evil.xhtml"),
+            Err(PathError::Traversal)
+        );
+        assert_eq!(check_entry_name("\\evil.xhtml"), Err(PathError::Absolute));
+        assert_eq!(check_entry_name("OEBPS\\"), Ok(None), "a directory entry");
+        assert_eq!(
+            resolve("OEBPS", "Text\\ch1.xhtml"),
+            Ok(Target::Entry("OEBPS/Text/ch1.xhtml".to_owned()))
         );
     }
 

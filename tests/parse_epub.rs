@@ -307,6 +307,49 @@ async fn an_epub_2_book_parses_with_its_own_conventions() {
     );
 }
 
+/// A book zipped on Windows, every entry name written with backslashes.
+///
+/// APPNOTE says `/`; a zip tool on Windows writes `\` anyway, and most
+/// readers open the result. So does this one: the backslash is read as the
+/// separator it was meant to be, and the paths on the wire use `/`.
+#[tokio::test]
+async fn a_book_zipped_with_windows_separators_parses() {
+    let harness = common::start().await;
+    let archive = common::Builder::new()
+        .add_stored("mimetype", "application/epub+zip")
+        .add(
+            "META-INF\\container.xml",
+            common::container_xml(common::OPF_PATH),
+        )
+        .add(
+            "OEBPS\\content.opf",
+            common::opf_xml(
+                &[("ch1", "text/chap1.xhtml"), ("ch2", "text/chap2.xhtml")],
+                &[("cover-img", "images/cover.png", "image/png", "cover-image")],
+            ),
+        )
+        .add(
+            "OEBPS\\text\\chap1.xhtml",
+            common::chapter_xhtml("Chapter One", "The first chapter."),
+        )
+        .add(
+            "OEBPS\\text\\chap2.xhtml",
+            common::chapter_xhtml("Chapter Two", "The second chapter."),
+        )
+        .add("OEBPS\\images\\cover.png", common::IMAGE)
+        .build();
+
+    let events = harness.parse_ok(&archive).await;
+    let hrefs: Vec<&str> = common::chapters(&events)
+        .iter()
+        .map(|chapter| chapter.href.as_str())
+        .collect();
+    assert_eq!(hrefs, [common::CHAP1, common::CHAP2]);
+    assert_eq!(common::resources(&events)[0].href, common::COVER);
+    assert_eq!(common::resources(&events)[0].content, common::IMAGE);
+    assert!(common::status(&events).warnings.is_empty());
+}
+
 /// Percent-encoded hrefs resolve to the entry names they name.
 #[tokio::test]
 async fn a_percent_encoded_href_finds_its_entry() {

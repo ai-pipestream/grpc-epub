@@ -157,14 +157,15 @@ async fn too_many_entries_are_refused_before_inflating_anything() {
     );
 }
 
-/// An archive entry named `../../etc/passwd`.
+/// An archive entry named `../../etc/passwd`, and another named absolutely.
 ///
-/// Nothing here writes to disk, so this cannot overwrite anything in *this*
-/// process. It is refused because the name would go out on the wire as a
-/// `Chapter.href`, and a client that does write files would inherit the
-/// traversal from us.
+/// Nothing here writes to disk, so neither can overwrite anything in *this*
+/// process. Neither may go out on the wire either, because a client that does
+/// write files would inherit the traversal from us. But nothing can name
+/// such an entry, so leaving it out is enough: the book around it, which a
+/// careless zip tool did not make any less readable, still parses.
 #[tokio::test]
-async fn an_entry_name_that_escapes_the_archive_is_refused() {
+async fn an_entry_name_that_escapes_the_archive_is_left_out() {
     let harness = common::start().await;
     let archive = common::shell()
         .add(
@@ -173,12 +174,61 @@ async fn an_entry_name_that_escapes_the_archive_is_refused() {
         )
         .add(common::CHAP1, common::chapter_xhtml("One", "a"))
         .add("../../etc/passwd", "root:x:0:0::/root:/bin/sh")
+        .add("/stray.txt", "left by a zip tool")
+        .build();
+
+    let events = harness
+        .parse(
+            &archive,
+            pb::ParseOptions {
+                include_all_resources: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the book around the bad names still parses");
+    assert_eq!(common::chapters(&events).len(), 1);
+    assert!(common::resources(&events).is_empty());
+    assert!(
+        !format!("{events:?}").contains("root:x"),
+        "nothing from the escaping entry may reach the client"
+    );
+
+    let status = common::status(&events);
+    let left_out: Vec<&pb::ParseWarning> = status
+        .warnings
+        .iter()
+        .filter(|warning| warning.code == pb::ParseWarningCode::UnusableEntryName as i32)
+        .collect();
+    assert_eq!(left_out.len(), 2, "{:?}", status.warnings);
+    assert!(left_out[0].message.contains("escapes the archive root"));
+    assert!(left_out[1].message.contains("absolute"));
+    assert!(
+        left_out.iter().all(|warning| warning.href.is_empty()),
+        "a name that is no archive path is not offered as one"
+    );
+}
+
+/// The escaping name is still fatal where the book needs it: as the spine
+/// item's file it is simply not there.
+#[tokio::test]
+async fn a_spine_item_that_only_an_escaping_entry_could_supply_fails() {
+    let harness = common::start().await;
+    let archive = common::shell()
+        .add(
+            common::OPF_PATH,
+            common::opf_xml(&[("ch1", "text/chap1.xhtml")], &[]),
+        )
+        .add(
+            "../OEBPS/text/chap1.xhtml",
+            common::chapter_xhtml("One", "a"),
+        )
         .build();
 
     let status = harness.parse_err(&archive).await;
     assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
     assert!(
-        status.message().contains("escapes the archive root"),
+        status.message().contains("does not contain"),
         "{}",
         status.message()
     );

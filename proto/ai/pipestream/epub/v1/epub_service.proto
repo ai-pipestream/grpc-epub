@@ -57,9 +57,11 @@ service EpubParseService {
   //                       the upload would take the server past the upload
   //                       bytes it holds across every call
   //                       (ServerLimits.max_buffered_upload_mib)
-  //   INVALID_ARGUMENT    not a ZIP, truncated, path traversal in an entry
-  //                       name, or an EPUB whose container.xml, OPF or spine
-  //                       is missing or unusable
+  //   INVALID_ARGUMENT    not a ZIP, truncated, or an EPUB whose
+  //                       container.xml, OPF or spine is missing or unusable,
+  //                       path traversal in a spine href included (an
+  //                       unusable entry name or resource href only leaves
+  //                       that file out, with a warning)
   //   UNIMPLEMENTED       a ZIP that is not an EPUB, or an EPUB the server
   //                       cannot open: DRM (an encryption.xml declaring
   //                       anything but font obfuscation), entry encryption,
