@@ -61,8 +61,9 @@ service EpubParseService {
   //                       name, or an EPUB whose container.xml, OPF or spine
   //                       is missing or unusable
   //   UNIMPLEMENTED       a ZIP that is not an EPUB, or an EPUB the server
-  //                       cannot open: DRM, entry encryption, or a
-  //                       compression method outside store and deflate
+  //                       cannot open: DRM (an encryption.xml declaring
+  //                       anything but font obfuscation), entry encryption,
+  //                       or a compression method outside store and deflate
   //   DEADLINE_EXCEEDED   no request frame arrived within the server's idle
   //                       timeout
   //   INTERNAL            a bug here; the parser panicked

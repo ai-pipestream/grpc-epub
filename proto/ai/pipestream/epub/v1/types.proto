@@ -470,6 +470,14 @@ enum ParseWarningCode {
   // OPF metadata was present but could not be interpreted, so a field on
   // EpubInfo is empty that should not have been.
   PARSE_WARNING_CODE_METADATA = 4;
+
+  // A manifest resource was not emitted because META-INF/encryption.xml
+  // lists it under the IDPF or Adobe font-obfuscation algorithm, so its
+  // stored bytes are not its content. In practice it is an embedded font.
+  // Reported only for a resource the include options selected. A book that
+  // obfuscates its fonts still parses; real encryption fails the call with
+  // UNIMPLEMENTED instead.
+  PARSE_WARNING_CODE_OBFUSCATED_RESOURCE = 5;
 }
 
 // ParseWarning is one non-fatal observation, carried on ParseStatus.

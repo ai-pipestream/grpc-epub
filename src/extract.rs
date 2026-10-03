@@ -61,8 +61,8 @@ use crate::{nav, smil};
 /// Archive path of the container document, fixed by the EPUB specification.
 const CONTAINER_PATH: &str = "META-INF/container.xml";
 
-/// Archive path of the encryption descriptor. Its presence means DRM or font
-/// obfuscation, neither of which this service implements.
+/// Archive path of the encryption descriptor, which lists every resource the
+/// book stores encrypted or font-obfuscated. See [`obfuscated_entries`].
 const ENCRYPTION_PATH: &str = "META-INF/encryption.xml";
 
 /// Archive path of the media-type marker.
@@ -389,6 +389,55 @@ fn lookup(
     index.get(&raw).copied()
 }
 
+/// Read `META-INF/encryption.xml` as policy: the archive entries the book
+/// stores font-obfuscated, or a refusal.
+///
+/// Font obfuscation is not DRM. Retail books, and books built by InDesign or
+/// Calibre, routinely scramble the first kilobyte of each embedded font with
+/// the IDPF or Adobe algorithm, keyed by the book's own identifier, while
+/// every chapter and image stays plain; refusing them refused readable
+/// books. Any other algorithm, a record that names none, or a key wrapped for
+/// some reader's private key is real encryption, and the book is refused as a
+/// format this service does not implement.
+///
+/// Paths are relative to the container root. One that only resolves against
+/// `META-INF/`, a known producer slip, is read that way too, and one that
+/// names nothing in the archive obfuscates nothing.
+///
+/// # Errors
+///
+/// `UNIMPLEMENTED` for anything but font obfuscation, `INVALID_ARGUMENT` when
+/// the descriptor is not readable XML.
+fn obfuscated_entries(
+    descriptor: &[u8],
+    index: &HashMap<String, usize>,
+) -> Result<HashSet<usize>, Status> {
+    let records = opf::parse_encryption(descriptor)
+        .map_err(|e| Status::invalid_argument(format!("{ENCRYPTION_PATH}: {e}")))?;
+    if let Some(drm) = records.iter().find(|record| !record.is_obfuscation()) {
+        let algorithm = if drm.algorithm.is_empty() {
+            "an unnamed algorithm".to_owned()
+        } else {
+            format!("{:?}", drm.algorithm)
+        };
+        return Err(Status::unimplemented(format!(
+            "{ENCRYPTION_PATH} declares encryption with {algorithm}, which is not font \
+             obfuscation; DRM is not supported"
+        )));
+    }
+    Ok(records
+        .iter()
+        .filter_map(|record| {
+            ["", "META-INF"]
+                .into_iter()
+                .find_map(|base| match href::resolve(base, &record.uri) {
+                    Ok(Target::Entry(path)) => lookup(index, &path, base, &record.uri),
+                    _ => None,
+                })
+        })
+        .collect())
+}
+
 /// The whole parse, with every failure as a `?`.
 #[allow(clippy::too_many_lines)] // A pipeline; splitting it would hide the order.
 fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Result<(), Abort> {
@@ -408,13 +457,19 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     let mut warnings = Warnings::default();
 
     // --- Is this an EPUB at all? -------------------------------------------
-    if index.contains_key(ENCRYPTION_PATH) {
-        return Err(Status::unimplemented(
-            "the archive carries META-INF/encryption.xml; DRM and font obfuscation are not \
-             supported",
-        )
-        .into());
-    }
+    let obfuscated = match index.get(ENCRYPTION_PATH) {
+        Some(&position) => {
+            let descriptor = read_at(
+                &mut archive,
+                &entries[position],
+                limits,
+                &mut budget,
+                metrics,
+            )?;
+            obfuscated_entries(&descriptor, &index)?
+        }
+        None => HashSet::new(),
+    };
 
     let declared = read_named(
         &mut archive,
@@ -544,9 +599,17 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             ))
             .into());
         }
-        if target.entry.is_none() {
+        let Some(entry) = target.entry else {
             return Err(Status::invalid_argument(format!(
                 "spine item {:?} names {:?}, which the archive does not contain",
+                itemref.idref, target.path
+            ))
+            .into());
+        };
+        if obfuscated.contains(&entry) {
+            return Err(Status::unimplemented(format!(
+                "spine item {:?} ({:?}) is listed in {ENCRYPTION_PATH}; encrypted chapters are \
+                 not supported",
                 itemref.idref, target.path
             ))
             .into());
@@ -743,6 +806,21 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
         if !selected(kind, limits) {
             skipped += 1;
             warnings.exclude_kind(kind);
+            continue;
+        }
+        // Checked after the kind, so a font nobody asked for is reported as
+        // excluded like any other, and only one that would have gone out is
+        // reported as obfuscated.
+        if obfuscated.contains(&entry) {
+            skipped += 1;
+            warnings.push(
+                pb::ParseWarningCode::ObfuscatedResource,
+                &target.path,
+                format!(
+                    "{ENCRYPTION_PATH} lists this resource as font-obfuscated, so its stored \
+                     bytes are not its content; it was not emitted"
+                ),
+            );
             continue;
         }
         pending.push(entry);

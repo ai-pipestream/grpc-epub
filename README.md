@@ -274,8 +274,11 @@ fetch an external entity. On top of that, a `<!DOCTYPE>` declaring an
 through verbatim, so `&xxe;` reaches the client as four literal characters.
 Both halves are asserted.
 
-`META-INF/encryption.xml`, or any entry with the encryption bit set, is
-`UNIMPLEMENTED`. The `zip` crate is built without the features that decode
+Any entry with the encryption bit set, or a `META-INF/encryption.xml`
+declaring anything but font obfuscation, is `UNIMPLEMENTED`. Font obfuscation
+alone (the IDPF and Adobe algorithms, which scramble embedded fonts and leave
+text and images plain) is not DRM: the book parses and the obfuscated fonts are
+never emitted. The `zip` crate is built without the features that decode
 anything but store and deflate, so the refusal of other compression methods is
 a build flag rather than a check that can be forgotten. Nested archives are
 reported and never opened; recursing is how a bomb hides from a single-level

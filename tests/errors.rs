@@ -264,25 +264,166 @@ async fn a_remote_spine_item_is_a_caller_error() {
     );
 }
 
-/// DRM and font obfuscation both announce themselves with this file.
+/// A `META-INF/encryption.xml` holding one `EncryptedData` with the given
+/// algorithm and cipher reference.
+fn encryption_xml(algorithm: &str, uri: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"
+            xmlns:enc="http://www.w3.org/2001/04/xmlenc#">
+  <enc:EncryptedData>
+    <enc:EncryptionMethod Algorithm="{algorithm}"/>
+    <enc:CipherData><enc:CipherReference URI="{uri}"/></enc:CipherData>
+  </enc:EncryptedData>
+</encryption>"#
+    )
+}
+
+/// A one-chapter book with an embedded font and the given
+/// `META-INF/encryption.xml`.
+fn book_with_encryption(encryption: &str) -> Vec<u8> {
+    common::shell()
+        .add("META-INF/encryption.xml", encryption)
+        .add(
+            common::OPF_PATH,
+            common::opf_xml(
+                &[("ch1", "text/chap1.xhtml")],
+                &[("font", "fonts/serif.otf", "application/vnd.ms-opentype", "")],
+            ),
+        )
+        .add(common::CHAP1, common::chapter_xhtml("One", "a"))
+        .add("OEBPS/fonts/serif.otf", b"OTTO, scrambled".to_vec())
+        .build()
+}
+
+/// Options that ask for every resource, fonts included.
+fn everything() -> grpc_epub::proto::v1::ParseOptions {
+    grpc_epub::proto::v1::ParseOptions {
+        include_all_resources: Some(true),
+        ..Default::default()
+    }
+}
+
+/// Real encryption, the shape Adobe DRM takes: the chapters themselves are
+/// AES-encrypted. That is a format this service does not implement.
 #[tokio::test]
 async fn an_encrypted_book_is_unimplemented() {
     let harness = common::start().await;
-    let archive = common::shell()
-        .add(
-            "META-INF/encryption.xml",
-            r#"<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"/>"#,
-        )
-        .add(
-            common::OPF_PATH,
-            common::opf_xml(&[("ch1", "text/chap1.xhtml")], &[]),
-        )
-        .add(common::CHAP1, common::chapter_xhtml("One", "a"))
-        .build();
+    let archive = book_with_encryption(&encryption_xml(
+        "http://www.w3.org/2001/04/xmlenc#aes128-cbc",
+        "OEBPS/text/chap1.xhtml",
+    ));
 
     let status = harness.parse_err(&archive).await;
     assert_eq!(status.code(), Code::Unimplemented, "{status:?}");
     assert!(status.message().contains("DRM"), "{status:?}");
+}
+
+/// Font obfuscation is not DRM, and a book that uses it is readable.
+///
+/// Retail books and books built by InDesign or Calibre often carry an
+/// `encryption.xml` for nothing but their embedded fonts, scrambled with the
+/// IDPF algorithm while every chapter stays plain. Refusing the file refused
+/// the book.
+#[tokio::test]
+async fn a_book_with_idpf_obfuscated_fonts_parses() {
+    let harness = common::start().await;
+    let archive = book_with_encryption(&encryption_xml(
+        "http://www.idpf.org/2008/embedding",
+        "OEBPS/fonts/serif.otf",
+    ));
+
+    let events = harness.parse_ok(&archive).await;
+    assert_eq!(common::chapters(&events).len(), 1);
+    let status = common::status(&events);
+    assert_eq!(
+        status
+            .warnings
+            .iter()
+            .map(|warning| warning.code)
+            .collect::<Vec<_>>(),
+        [grpc_epub::proto::v1::ParseWarningCode::ResourceKindExcluded as i32],
+        "fonts are excluded by default, so the obfuscation never comes up"
+    );
+
+    // Asked for, the font is still not sent: its stored bytes are not a font.
+    let events = harness
+        .parse(&archive, everything())
+        .await
+        .expect("the book should parse");
+    assert!(common::resources(&events).is_empty(), "no scrambled font");
+    let status = common::status(&events);
+    assert_eq!(status.resources_skipped, 1);
+    assert_eq!(
+        status.warnings[0].code,
+        grpc_epub::proto::v1::ParseWarningCode::ObfuscatedResource as i32
+    );
+    assert_eq!(status.warnings[0].href, "OEBPS/fonts/serif.otf");
+}
+
+/// The same with Adobe's algorithm, and a cipher reference written relative
+/// to `META-INF/` rather than the container root, which some producers do.
+#[tokio::test]
+async fn a_book_with_adobe_obfuscated_fonts_parses() {
+    let harness = common::start().await;
+    let archive = book_with_encryption(&encryption_xml(
+        "http://ns.adobe.com/pdf/enc#RC",
+        "../OEBPS/fonts/serif.otf",
+    ));
+
+    let events = harness
+        .parse(&archive, everything())
+        .await
+        .expect("the book should parse");
+    assert_eq!(common::chapters(&events).len(), 1);
+    assert!(common::resources(&events).is_empty(), "no scrambled font");
+    let status = common::status(&events);
+    assert_eq!(
+        status.warnings[0].code,
+        grpc_epub::proto::v1::ParseWarningCode::ObfuscatedResource as i32
+    );
+}
+
+/// Obfuscation applied to a chapter is not a font left out, it is a chapter
+/// that cannot be read.
+#[tokio::test]
+async fn an_obfuscated_chapter_is_unimplemented() {
+    let harness = common::start().await;
+    let archive = book_with_encryption(&encryption_xml(
+        "http://www.idpf.org/2008/embedding",
+        "OEBPS/text/chap1.xhtml",
+    ));
+
+    let status = harness.parse_err(&archive).await;
+    assert_eq!(status.code(), Code::Unimplemented, "{status:?}");
+    assert!(
+        status.message().contains("encrypted chapters"),
+        "{status:?}"
+    );
+}
+
+/// A descriptor that lists nothing encrypts nothing.
+#[tokio::test]
+async fn an_encryption_descriptor_listing_nothing_changes_nothing() {
+    let harness = common::start().await;
+    let archive = book_with_encryption(
+        r#"<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"/>"#,
+    );
+
+    let events = harness.parse_ok(&archive).await;
+    assert_eq!(common::chapters(&events).len(), 1);
+}
+
+/// A descriptor that does not parse leaves no way to tell what is encrypted,
+/// so the book is refused rather than guessed at.
+#[tokio::test]
+async fn an_unreadable_encryption_descriptor_is_a_caller_error() {
+    let harness = common::start().await;
+    let archive = book_with_encryption("<encryption><EncryptedData></encryption>");
+
+    let status = harness.parse_err(&archive).await;
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert!(status.message().contains("encryption.xml"), "{status:?}");
 }
 
 /// An entry with the encryption bit set, which is what a DRM'd book's chapters

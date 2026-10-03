@@ -580,6 +580,13 @@ pub enum ParseWarningCode {
     /// OPF metadata was present but could not be interpreted, so a field on
     /// EpubInfo is empty that should not have been.
     Metadata = 4,
+    /// A manifest resource was not emitted because META-INF/encryption.xml
+    /// lists it under the IDPF or Adobe font-obfuscation algorithm, so its
+    /// stored bytes are not its content. In practice it is an embedded font.
+    /// Reported only for a resource the include options selected. A book that
+    /// obfuscates its fonts still parses; real encryption fails the call with
+    /// UNIMPLEMENTED instead.
+    ObfuscatedResource = 5,
 }
 impl ParseWarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -593,6 +600,7 @@ impl ParseWarningCode {
             Self::MissingManifestEntry => "PARSE_WARNING_CODE_MISSING_MANIFEST_ENTRY",
             Self::NestedArchive => "PARSE_WARNING_CODE_NESTED_ARCHIVE",
             Self::Metadata => "PARSE_WARNING_CODE_METADATA",
+            Self::ObfuscatedResource => "PARSE_WARNING_CODE_OBFUSCATED_RESOURCE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -603,6 +611,7 @@ impl ParseWarningCode {
             "PARSE_WARNING_CODE_MISSING_MANIFEST_ENTRY" => Some(Self::MissingManifestEntry),
             "PARSE_WARNING_CODE_NESTED_ARCHIVE" => Some(Self::NestedArchive),
             "PARSE_WARNING_CODE_METADATA" => Some(Self::Metadata),
+            "PARSE_WARNING_CODE_OBFUSCATED_RESOURCE" => Some(Self::ObfuscatedResource),
             _ => None,
         }
     }

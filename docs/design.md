@@ -281,8 +281,17 @@ deterministic per file and is what `architecture.md` means by "when their
 entries are hit". The `tests/parse_epub.rs` ordering test pins it by packing
 the same book two ways.
 
-**The DRM split.** `META-INF/encryption.xml`, or an entry with the encryption
-bit set, is `UNIMPLEMENTED`, matching the ownership table in `architecture.md`.
+**The DRM split.** An entry with the encryption bit set, or a
+`META-INF/encryption.xml` declaring any algorithm other than font obfuscation,
+is `UNIMPLEMENTED`, matching the ownership table in `architecture.md`. Font
+obfuscation (the IDPF `http://www.idpf.org/2008/embedding` and Adobe
+`http://ns.adobe.com/pdf/enc#RC` algorithms) is not DRM: it scrambles the first
+kilobyte of an embedded font with a key taken from the book's own identifier,
+and retail and tool-built books use it while their text and images stay plain.
+Such a book parses. The obfuscated resources are never emitted (fonts are
+excluded by default anyway, and one that was asked for is skipped with
+`OBFUSCATED_RESOURCE`), and obfuscation applied to a spine item is
+`UNIMPLEMENTED` like any encrypted chapter.
 A ZIP that never claimed to be an EPUB is also `UNIMPLEMENTED`; a file that
 says `application/epub+zip` and then has no container is `INVALID_ARGUMENT`,
 because that is a broken book rather than an unsupported format.
