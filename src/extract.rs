@@ -38,9 +38,16 @@
 //! and each media overlay have to be *read* before the chapters, because
 //! `navigation` and `media_overlay` are contracted to arrive before them. They
 //! are inflated once, held in [`Preread`], and handed back rather than
-//! re-inflated when the resource walk reaches their entries, so the budget
-//! counts each of them exactly once and their `resource` events still arrive
-//! in archive order like everything else.
+//! re-inflated when the walk reaches their entries, as a `resource` or as a
+//! `chapter` (a navigation document is often in the spine too), so the budget
+//! counts each of them exactly once and their events still arrive in order
+//! like everything else. One the walk will not send at all, such as an
+//! overlay whose kind was not asked for, is dropped as soon as it is parsed
+//! rather than held for the rest of the call.
+//!
+//! Every archive entry goes out at most once. Two manifest items naming the
+//! same file send its bytes once, under the first of them, and a manifest
+//! item naming a file the spine already sends as a chapter sends nothing.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -245,11 +252,14 @@ struct Resolved<'a> {
 ///
 /// The navigation document and the media overlays have to be read before the
 /// chapters in order to be emitted before them, but they are also ordinary
-/// manifest resources whose bytes go out when their archive entry is reached.
-/// Without this, each would be inflated once for parsing and once for
-/// emission, which would double what the book charges against the total
-/// decompression budget and make `ParseStatus.uncompressed_bytes` a number
-/// that answers no question.
+/// manifest resources, or spine items, whose bytes go out when the walk
+/// reaches their archive entry. Without this, each would be inflated once for
+/// parsing and once for emission, which would double what the book charges
+/// against the total decompression budget and make
+/// `ParseStatus.uncompressed_bytes` a number that answers no question.
+///
+/// Only bytes the walk will send are held, and the walk takes each back when
+/// it sends it, so nothing in here outlives the walk.
 #[derive(Default)]
 struct Preread {
     /// Inflated bytes by entry position.
@@ -257,7 +267,10 @@ struct Preread {
 }
 
 impl Preread {
-    /// Inflate an entry now, keeping the bytes for the walk that follows.
+    /// The bytes of an entry: the ones an earlier pass kept, or inflated now.
+    ///
+    /// Either way the caller owns them, and hands them back with
+    /// [`keep`](Self::keep) only if they will be needed again.
     fn read(
         &mut self,
         archive: &mut MemoryArchive<'_>,
@@ -266,11 +279,16 @@ impl Preread {
         limits: &Effective,
         budget: &mut Budget,
         metrics: &Metrics,
-    ) -> Result<&[u8], Status> {
-        if let std::collections::hash_map::Entry::Vacant(slot) = self.entries.entry(entry) {
-            slot.insert(read_at(archive, &entries[entry], limits, budget, metrics)?);
+    ) -> Result<Vec<u8>, Status> {
+        match self.entries.remove(&entry) {
+            Some(bytes) => Ok(bytes),
+            None => read_at(archive, &entries[entry], limits, budget, metrics),
         }
-        Ok(&self.entries[&entry])
+    }
+
+    /// Hold inflated bytes until the walk, or a later pass, asks for them.
+    fn keep(&mut self, entry: usize, bytes: Vec<u8>) {
+        self.entries.insert(entry, bytes);
     }
 
     /// Hand back bytes already inflated for this entry, if there are any.
@@ -718,90 +736,19 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     };
     sink.emit(pb::parse_epub_response::Event::Info(info))?;
 
-    // --- navigation and media overlays ---------------------------------------
+    // --- Plan the walk -------------------------------------------------------
     //
-    // Both are contracted to arrive before the chapters, so both are inflated
-    // here and held in `preread` for the resource walk below to reuse.
-    let mut preread = Preread::default();
-    if limits.parse_navigation
-        && let Some(source) = &navigation_source
-    {
-        let target = &resolved[source.position];
-        let bytes = preread.read(
-            &mut archive,
-            &entries,
-            source.entry,
-            limits,
-            &mut budget,
-            metrics,
-        )?;
-        let parsed = if source.from_ncx {
-            nav::parse_ncx(bytes, &target.path)
-        } else {
-            nav::parse_nav(bytes, &target.path)
-        };
-        if parsed.is_empty() {
-            warnings.push(
-                pb::ParseWarningCode::Metadata,
-                &target.path,
-                "the navigation document named no entries this server could read",
-            );
-        } else {
-            sink.emit(pb::parse_epub_response::Event::Navigation(pb::Navigation {
-                source_href: parsed.source_href.clone(),
-                toc: parsed.toc.iter().map(nav_point).collect(),
-                from_ncx: parsed.from_ncx,
-            }))?;
-        }
-    }
-
-    let overlays = overlay_links(&resolved, &by_id);
-    if limits.parse_media_overlays {
-        for (position, overlay) in &overlays {
-            let Some(entry) = resolved[*overlay].entry else {
-                continue;
-            };
-            let path = resolved[*overlay].path.clone();
-            let bytes =
-                preread.read(&mut archive, &entries, entry, limits, &mut budget, metrics)?;
-            let parsed = smil::parse_overlay(bytes, &path);
-            if parsed.is_empty() {
-                warnings.push(
-                    pb::ParseWarningCode::Metadata,
-                    &path,
-                    "the media overlay declared no cues this server could read",
-                );
-                continue;
-            }
-            sink.emit(pb::parse_epub_response::Event::MediaOverlay(
-                pb::MediaOverlay {
-                    source_href: parsed.source_href.clone(),
-                    chapter_href: resolved[*position].path.clone(),
-                    cues: parsed
-                        .cues
-                        .iter()
-                        .map(|cue| pb::MediaOverlayCue {
-                            text_href: cue.text_href.clone(),
-                            audio_href: cue.audio_href.clone(),
-                            start_time: cue.start_time,
-                            end_time: cue.end_time,
-                            identifier: cue.identifier.clone(),
-                        })
-                        .collect(),
-                },
-            ))?;
-        }
-    }
-    let overlay_href = |position: usize| -> String {
-        overlays
-            .iter()
-            .find(|(owner, _)| *owner == position)
-            .map(|(_, overlay)| resolved[*overlay].path.clone())
-            .unwrap_or_default()
-    };
-
-    // --- Plan the resource interleave ---------------------------------------
-    let mut pending: Vec<usize> = Vec::new();
+    // Before anything is read ahead, so the navigation and overlay passes know
+    // which of the entries they inflate the walk is going to send.
+    let chapter_entries: HashSet<usize> = spine
+        .iter()
+        .map(|(position, _)| {
+            resolved[*position]
+                .entry
+                .expect("checked while resolving the spine")
+        })
+        .collect();
+    let mut pending: Vec<(usize, usize)> = Vec::new();
     let mut skipped = 0u32;
     for (position, target) in resolved.iter().enumerate() {
         if spine_ids.contains(&position) {
@@ -839,6 +786,11 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             );
             continue;
         };
+        // The spine already sends this file as a chapter; a second manifest
+        // item naming it adds no bytes, so it is neither sent nor skipped.
+        if chapter_entries.contains(&entry) {
+            continue;
+        }
         if is_nested_archive(&target.item.media_type, &target.path) {
             skipped += 1;
             warnings.push(
@@ -868,17 +820,115 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             );
             continue;
         }
-        pending.push(entry);
+        pending.push((entry, position));
     }
     // Archive order, which is what makes a resource arrive when its entry is
-    // hit rather than at the end.
+    // hit rather than at the end. Two manifest items naming one file send it
+    // once, under the first of them.
     pending.sort_unstable();
-    let mut pending = pending.into_iter().peekable();
-    let position_of_entry: HashMap<usize, usize> = resolved
+    pending.dedup_by_key(|(entry, _)| *entry);
+    let will_emit: HashSet<usize> = chapter_entries
         .iter()
-        .enumerate()
-        .filter_map(|(position, target)| target.entry.map(|entry| (entry, position)))
+        .copied()
+        .chain(pending.iter().map(|(entry, _)| *entry))
         .collect();
+    let mut pending = pending.into_iter().peekable();
+
+    // --- navigation and media overlays ---------------------------------------
+    //
+    // Both are contracted to arrive before the chapters, so both are inflated
+    // here, and held in `preread` for the walk below to reuse when it is going
+    // to send them.
+    let mut preread = Preread::default();
+    if limits.parse_navigation
+        && let Some(source) = &navigation_source
+    {
+        let target = &resolved[source.position];
+        let bytes = preread.read(
+            &mut archive,
+            &entries,
+            source.entry,
+            limits,
+            &mut budget,
+            metrics,
+        )?;
+        let parsed = if source.from_ncx {
+            nav::parse_ncx(&bytes, &target.path)
+        } else {
+            nav::parse_nav(&bytes, &target.path)
+        };
+        if will_emit.contains(&source.entry) {
+            preread.keep(source.entry, bytes);
+        }
+        if parsed.is_empty() {
+            warnings.push(
+                pb::ParseWarningCode::Metadata,
+                &target.path,
+                "the navigation document named no entries this server could read",
+            );
+        } else {
+            sink.emit(pb::parse_epub_response::Event::Navigation(pb::Navigation {
+                source_href: parsed.source_href.clone(),
+                toc: parsed.toc.iter().map(nav_point).collect(),
+                from_ncx: parsed.from_ncx,
+            }))?;
+        }
+    }
+
+    let overlays = overlay_links(&resolved, &by_id);
+    if limits.parse_media_overlays {
+        // The last pair each overlay serves, so one shared by several
+        // chapters is inflated once and held no longer than it is needed.
+        let last_use: HashMap<usize, usize> = overlays
+            .iter()
+            .enumerate()
+            .filter_map(|(at, (_, overlay))| resolved[*overlay].entry.map(|entry| (entry, at)))
+            .collect();
+        for (at, (position, overlay)) in overlays.iter().enumerate() {
+            let Some(entry) = resolved[*overlay].entry else {
+                continue;
+            };
+            let path = resolved[*overlay].path.clone();
+            let bytes =
+                preread.read(&mut archive, &entries, entry, limits, &mut budget, metrics)?;
+            let parsed = smil::parse_overlay(&bytes, &path);
+            if will_emit.contains(&entry) || last_use[&entry] > at {
+                preread.keep(entry, bytes);
+            }
+            if parsed.is_empty() {
+                warnings.push(
+                    pb::ParseWarningCode::Metadata,
+                    &path,
+                    "the media overlay declared no cues this server could read",
+                );
+                continue;
+            }
+            sink.emit(pb::parse_epub_response::Event::MediaOverlay(
+                pb::MediaOverlay {
+                    source_href: parsed.source_href.clone(),
+                    chapter_href: resolved[*position].path.clone(),
+                    cues: parsed
+                        .cues
+                        .iter()
+                        .map(|cue| pb::MediaOverlayCue {
+                            text_href: cue.text_href.clone(),
+                            audio_href: cue.audio_href.clone(),
+                            start_time: cue.start_time,
+                            end_time: cue.end_time,
+                            identifier: cue.identifier.clone(),
+                        })
+                        .collect(),
+                },
+            ))?;
+        }
+    }
+    let overlay_href = |position: usize| -> String {
+        overlays
+            .iter()
+            .find(|(owner, _)| *owner == position)
+            .map(|(_, overlay)| resolved[*overlay].path.clone())
+            .unwrap_or_default()
+    };
 
     // --- Walk the spine ------------------------------------------------------
     let mut chapters = 0u32;
@@ -887,9 +937,11 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
         let target = &resolved[*position];
         let chapter_entry = target.entry.expect("checked while resolving the spine");
 
-        while pending.peek().is_some_and(|entry| *entry < chapter_entry) {
-            let entry = pending.next().expect("peeked");
-            let position = position_of_entry[&entry];
+        while pending
+            .peek()
+            .is_some_and(|(entry, _)| *entry < chapter_entry)
+        {
+            let (entry, position) = pending.next().expect("peeked");
             emit_resource(
                 &mut archive,
                 &entries[entry],
@@ -904,13 +956,18 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             emitted += 1;
         }
 
-        let content = read_at(
-            &mut archive,
-            &entries[chapter_entry],
-            limits,
-            &mut budget,
-            metrics,
-        )?;
+        // A navigation document in the spine was read ahead to be parsed;
+        // its chapter is those bytes, not a second inflation of them.
+        let content = match preread.take(chapter_entry) {
+            Some(bytes) => bytes,
+            None => read_at(
+                &mut archive,
+                &entries[chapter_entry],
+                limits,
+                &mut budget,
+                metrics,
+            )?,
+        };
         sink.emit(pb::parse_epub_response::Event::Chapter(pb::Chapter {
             spine_index: u32::try_from(spine_index).unwrap_or(u32::MAX),
             idref: itemref.idref.clone(),
@@ -925,8 +982,7 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
         chapters += 1;
     }
 
-    for entry in pending {
-        let position = position_of_entry[&entry];
+    for (entry, position) in pending {
         emit_resource(
             &mut archive,
             &entries[entry],
@@ -940,6 +996,11 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
         )?;
         emitted += 1;
     }
+
+    debug_assert!(
+        preread.entries.is_empty(),
+        "every entry held for the walk is handed back by it"
+    );
 
     // --- status --------------------------------------------------------------
     sink.emit(pb::parse_epub_response::Event::Status(pb::ParseStatus {

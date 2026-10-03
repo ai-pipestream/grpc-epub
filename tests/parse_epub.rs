@@ -350,6 +350,49 @@ async fn a_book_zipped_with_windows_separators_parses() {
     assert!(common::status(&events).warnings.is_empty());
 }
 
+/// Two manifest items naming one file send its bytes once, and an item
+/// naming a file the spine already sends as a chapter sends nothing.
+///
+/// Sloppy producers repeat manifest entries. Each repeat used to be a
+/// second `resource` event with the same bytes, inflated and charged to the
+/// budget again, and a repeat of a chapter went out as a resource as well.
+#[tokio::test]
+async fn a_file_named_twice_in_the_manifest_goes_out_once() {
+    let harness = common::start().await;
+    let archive = common::shell()
+        .add(
+            common::OPF_PATH,
+            common::opf_xml(
+                &[("ch1", "text/chap1.xhtml")],
+                &[
+                    ("cover-a", "images/cover.png", "image/png", "cover-image"),
+                    ("cover-b", "images/cover.png", "image/png", ""),
+                    ("ch1-again", "text/chap1.xhtml", "application/xhtml+xml", ""),
+                ],
+            ),
+        )
+        .add(common::CHAP1, common::chapter_xhtml("One", "a"))
+        .add(common::COVER, common::IMAGE)
+        .build();
+
+    let events = harness.parse_ok(&archive).await;
+    assert_eq!(
+        common::shape(&events),
+        ["info", "chapter", "resource", "status"]
+    );
+    let resources = common::resources(&events);
+    assert_eq!(resources[0].href, common::COVER);
+    assert_eq!(resources[0].manifest_id, "cover-a", "the first of the two");
+    let status = common::status(&events);
+    assert_eq!(status.resources_emitted, 1);
+    assert_eq!(
+        status.resources_skipped, 0,
+        "nothing was withheld; every byte went out once"
+    );
+    // mimetype, container.xml, the OPF, the chapter and the image, once each.
+    assert_eq!(status.entries_read, 5);
+}
+
 /// Percent-encoded hrefs resolve to the entry names they name.
 #[tokio::test]
 async fn a_percent_encoded_href_finds_its_entry() {
