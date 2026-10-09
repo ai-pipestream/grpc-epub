@@ -134,6 +134,128 @@ pub struct Document {
     /// beyond the upstream dialect.
     #[prost(message, repeated, tag="28")]
     pub claims: ::prost::alloc::vec::Vec<CollectorClaim>,
+    /// Which build produced this document from these bytes, and under which
+    /// options. A stored artifact keyed on this document (an item's self_ref,
+    /// a chunk, a vector) is current only while a re-parse would carry the
+    /// same identity: a new build or different options may renumber items.
+    /// Extension beyond the upstream dialect.
+    #[prost(message, optional, tag="29")]
+    pub parse: ::core::option::Option<ParseIdentity>,
+    /// Language analyses run over this document's text, each kept exactly as
+    /// the analyzer answered. Extension beyond the upstream dialect.
+    #[prost(message, repeated, tag="30")]
+    pub analyses: ::prost::alloc::vec::Vec<TextAnalysis>,
+    /// What the collectors warned about while reading this document (an
+    /// approximation they made, a part they could not read), each warning
+    /// under the collector that raised it, verbatim. Warnings are not
+    /// failures: the parse stands. Extension beyond the upstream dialect.
+    #[prost(message, repeated, tag="31")]
+    pub warnings: ::prost::alloc::vec::Vec<CollectorWarning>,
+}
+/// CollectorWarning is one warning a collector raised while reading the
+/// document.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CollectorWarning {
+    /// The collector that raised it ("libreoffice", "calamine", "pdf", ...).
+    #[prost(message, optional, tag="1")]
+    pub source: ::core::option::Option<CollectorSource>,
+    #[prost(string, tag="2")]
+    pub message: ::prost::alloc::string::String,
+}
+/// TextAnalysis is one analyzer run over a window of the document's text
+/// stream: the stream ConvertDocumentResponse.text_offsets indexes, every text
+/// item in arena order joined by a single "\n", counted in code points.
+/// The analyzer's own result is carried unchanged, so nothing it reports is
+/// lost to a translation into item meta; filling BaseMeta from it is a
+/// projection a consumer or a later stage may make.
+///
+/// A document may hold several entries over the same window: the core
+/// analyzer and each add-on (WordNet, dependency parsing) can answer
+/// separately, each under its own `source`. Every result is self-contained:
+/// an index reference inside it (a dependency arc's token, a relation's
+/// entity) resolves within that same result, so an add-on that builds on
+/// tokens or entities returns the layers it indexes. Entries share only the
+/// stream coordinates.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TextAnalysis {
+    /// The analyzer that answered: collector "opennlp", `model` the model bundle
+    /// id, `version` the analyzer build as its GetServiceInfo reports it.
+    #[prost(message, optional, tag="1")]
+    pub source: ::core::option::Option<CollectorSource>,
+    /// The parse whose text stream was analyzed. Spans are valid only against a
+    /// document with the same identity; a re-parse with a different producer or
+    /// options digest may change the stream, which makes this analysis stale.
+    #[prost(message, optional, tag="2")]
+    pub over: ::core::option::Option<ParseIdentity>,
+    /// Half-open [stream_start, stream_end) of the analyzed window within the
+    /// text stream, in code points. Every span in the result is relative to
+    /// stream_start, so stream offset = stream_start + span offset.
+    #[prost(uint64, tag="3")]
+    pub stream_start: u64,
+    #[prost(uint64, tag="4")]
+    pub stream_end: u64,
+    /// The models behind each layer of the result, keyed by the layer id the
+    /// result uses (for OpenNLP, AnnotationLayer.id: a standard id such as
+    /// "opennlp:entities" or an add-on's namespaced custom id), so tags, entity
+    /// labels, senses and subword ids stay interpretable later.
+    #[prost(map="string, message", tag="5")]
+    pub layer_sources: ::std::collections::HashMap<::prost::alloc::string::String, CollectorSource>,
+    #[prost(oneof="text_analysis::Result", tags="6, 7")]
+    pub result: ::core::option::Option<text_analysis::Result>,
+}
+/// Nested message and enum types in `TextAnalysis`.
+pub mod text_analysis {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Result {
+        /// An OpenNLP analysis, verbatim. Its raw_text is the analyzed window,
+        /// its offset_encoding is OFFSET_ENCODING_UNICODE_CODE_POINT, and every
+        /// AnnotationSpan indexes raw_text (spans found in a normalized form are
+        /// already mapped back to raw_text by the analyzer).
+        #[prost(message, tag="6")]
+        Opennlp(super::super::super::super::super::org::apache::opennlp::grpc::v1::OpenNlpDocument),
+        /// An OpenNLP analysis in the strongly typed contract: one dedicated
+        /// message per annotation kind, per-layer model provenance, and index
+        /// references declared per layer. Same offset rules as `opennlp`.
+        ///
+        /// Placeholder: collectors/opennlp_annotations.proto is a draft of a
+        /// contract OpenNLP has not published yet. Because this file is copied
+        /// byte-identical across the fleet, if the published message differs in
+        /// type, reserve number 7 and the name `opennlp_annotations` and add the
+        /// published type under a new number; never retype this field in place.
+        #[prost(message, tag="7")]
+        OpennlpAnnotations(super::super::super::super::super::org::apache::opennlp::grpc::v1::OpenNlpAnnotations),
+    }
+}
+/// ParseIdentity names the parse that produced a document. ConvertSource
+/// and the chunk RPCs fill every field; the StreamProcessDocument stream
+/// does not stamp one. Together the fields decide Chunk.chunk_key.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ParseIdentity {
+    /// The producing service's version string, as its GetServiceInfo reports
+    /// it (for gRParse "grparse-<version>-<flavor>").
+    #[prost(string, tag="1")]
+    pub producer: ::prost::alloc::string::String,
+    /// 64 lowercase hex digits: SHA-256 of the conversion options that decide
+    /// the Document, in deterministic protobuf serialization. Fields that only
+    /// shape an export, a time limit, a report or the transport (output
+    /// formats, timeouts, API headers, structure validation, chunking) and
+    /// unknown fields are left out first. An option set explicitly to the
+    /// value the server would use anyway still hashes apart from unset: equal
+    /// digests mean equal options, unequal digests can still mean equal output.
+    #[prost(string, tag="2")]
+    pub options_digest: ::prost::alloc::string::String,
+    /// 64 lowercase hex digits: SHA-256 of the server settings that change
+    /// what a parse produces (which collectors are configured, the CV models
+    /// and their tuning, the repair pass) and of the models directory's
+    /// MANIFEST, which pins every model file by its sha256. It names the
+    /// settings, not the builds of the remote collectors they point at.
+    #[prost(string, tag="3")]
+    pub settings_digest: ::prost::alloc::string::String,
+    /// 64 lowercase hex digits: SHA-256 of the source tree the server was
+    /// built from, so a build whose version was not bumped still differs.
+    /// "unknown" for a build that did not compute one.
+    #[prost(string, tag="4")]
+    pub build: ::prost::alloc::string::String,
 }
 /// DocumentOrigin contains metadata about the source document file.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -395,6 +517,15 @@ pub struct EntityMention {
     pub orig: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag="5")]
     pub label: ::core::option::Option<::prost::alloc::string::String>,
+    /// Where the mention sits in its item's own text, half-open [start, end),
+    /// counted in Unicode code points like every other span here (not UTF-8
+    /// bytes, not UTF-16 code units; a Java producer such as OpenNLP converts
+    /// with String.codePointCount). A zero-width span (start == end) is valid
+    /// and marks a position, such as an elided subject. A producer that
+    /// analyzed a normalized copy of the text may report a span widened to
+    /// whole normalized units; readers keep such a span and clamp it to the
+    /// text rather than drop the mention. gRParse never rejects a mention for
+    /// its span.
     #[prost(message, optional, tag="6")]
     pub charspan: ::core::option::Option<IntSpan>,
     #[prost(map="string, message", tag="100")]
