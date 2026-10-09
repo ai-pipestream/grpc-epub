@@ -51,6 +51,27 @@ pub mod ai {
     }
 }
 
+/// The `org.apache.opennlp` protobuf package tree that the Document schema
+/// imports: the OpenNLP analyses `Document.analyses` carries, vendored
+/// byte-identical from gRParse beside `document.proto`. Nested to match the
+/// package path for the same reason as [`ai`]; this crate never fills them.
+#[allow(clippy::all, clippy::pedantic, clippy::nursery, missing_docs)]
+pub mod org {
+    /// The `org.apache` namespace.
+    pub mod apache {
+        /// The `org.apache.opennlp` namespace.
+        pub mod opennlp {
+            /// The `org.apache.opennlp.grpc` namespace.
+            pub mod grpc {
+                /// Messages and enums for `org.apache.opennlp.grpc.v1`.
+                pub mod v1 {
+                    include!("gen/org/apache/opennlp/grpc/v1/org.apache.opennlp.grpc.v1.rs");
+                }
+            }
+        }
+    }
+}
+
 /// The `ai.pipestream.epub.v1` package: this service's own wire contract.
 pub use ai::pipestream::epub::v1;
 
