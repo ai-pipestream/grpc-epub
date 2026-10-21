@@ -33,7 +33,7 @@ tonic-reflection = "0.14.6"
 # entry encryption is refused by the decoder rather than by a check that can be
 # forgotten. `time`/`chrono` are dropped with it; entry timestamps are not on
 # the wire.
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 # Tests author every EPUB fixture in memory with the same crate that reads
