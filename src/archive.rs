@@ -298,25 +298,23 @@ pub fn scan(archive: &mut MemoryArchive<'_>) -> Result<Scan, Status> {
         // `by_index_raw` reads the header without building a decompressor, so
         // this pass costs a seek per entry and no inflation.
         let entry = archive.by_index_raw(index).map_err(|e| zip_status(&e))?;
+        let name = entry.name().map_err(|e| zip_status(&e))?.into_owned();
 
         if entry.encrypted() {
             return Err(Status::unimplemented(format!(
-                "entry {:?} is encrypted; DRM and entry obfuscation are not supported",
-                entry.name()
+                "entry {name:?} is encrypted; DRM and entry obfuscation are not supported"
             )));
         }
         match entry.compression() {
             CompressionMethod::Stored | CompressionMethod::Deflated => {}
             other => {
                 return Err(Status::unimplemented(format!(
-                    "entry {:?} uses compression method {other:?}; only store and deflate are \
-                     supported",
-                    entry.name()
+                    "entry {name:?} uses compression method {other:?}; only store and deflate are \
+                     supported"
                 )));
             }
         }
 
-        let name = entry.name().to_owned();
         let declared_size = entry.size();
         let compressed_size = entry.compressed_size().min(stored_ceiling);
         drop(entry);
@@ -380,7 +378,7 @@ pub fn read_entry(
     loop {
         let read = file
             .read(&mut chunk)
-            .map_err(|e| zip_status(&ZipError::Io(e)))?;
+            .map_err(|e| inflate_status(e, entry))?;
         if read == 0 {
             break;
         }
@@ -402,6 +400,28 @@ pub fn read_entry(
     budget.consumed += actual;
     budget.entries += 1;
     Ok(out)
+}
+
+/// The status for a read that failed while an entry inflated.
+///
+/// The zip crate stops an entry the moment it inflates past the size its
+/// central directory declares, which is the lying-header bomb, so that one
+/// failure gets the bomb status the ratio rule would have given it. The
+/// crate reports it only as `InvalidData` with this message, so the message
+/// is what tells it apart from a corrupt stream; `tests/security.rs` pins it.
+fn inflate_status(error: std::io::Error, entry: &EntryInfo) -> Status {
+    if error.kind() == std::io::ErrorKind::InvalidData
+        && error
+            .to_string()
+            .contains("larger than its declared uncompressed size")
+    {
+        return Status::resource_exhausted(format!(
+            "entry {:?} inflates past the {} bytes its header declares; this is the shape \
+             of a decompression bomb",
+            entry.name, entry.declared_size
+        ));
+    }
+    zip_status(&ZipError::Io(error))
 }
 
 /// The status a budget overrun produces.

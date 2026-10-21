@@ -74,10 +74,9 @@ async fn a_decompression_bomb_is_refused_on_its_ratio() {
 /// inflates, as soon as it passes the ratio.
 ///
 /// The header claims a thousand bytes, so nothing checked before inflating
-/// sees a problem. The ratio rule used to be applied only once the entry was
-/// whole, so the entry inflated until the total budget stopped it; with the
-/// budget at 4 MiB that is the decompressed-size cap firing. Checked on every
-/// chunk, the ratio stops the same entry at about 1.6 MiB, long before.
+/// sees a problem. The zip crate stops the entry as soon as it inflates past
+/// those thousand bytes, and that failure must come back as the bomb, not as
+/// an internal error or the 4 MiB decompressed-size cap firing.
 #[tokio::test]
 async fn a_bomb_with_a_lying_header_is_stopped_while_it_inflates() {
     let harness = common::start().await;
@@ -97,7 +96,7 @@ async fn a_bomb_with_a_lying_header_is_stopped_while_it_inflates() {
     assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
     assert!(
         status.message().contains("bomb"),
-        "the ratio, not the budget, must be what stopped it: {}",
+        "the bomb rule, not the budget, must be what stopped it: {}",
         status.message()
     );
 }
