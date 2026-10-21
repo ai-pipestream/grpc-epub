@@ -25,6 +25,8 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl git nodejs
+          # The workspace mount belongs to the runner user, not root.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust toolchain
         if: ${{ matrix.toolchain != 'stable' }}
@@ -62,6 +64,8 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl git nodejs
+          # The workspace mount belongs to the runner user, not root.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # A checksummed release download behaves the same on GitHub and Forgejo.
       - name: Install buf
