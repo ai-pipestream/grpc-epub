@@ -16,7 +16,7 @@
 # Both base images are pinned by digest (the multi-arch index) as well as by
 # tag, so a rebuild gets the bytes that were tested; bump them on purpose.
 # ---------------------------------------------------------------------------
-FROM dhi.io/rust:1@sha256:7752378607f81d7eb26672a51ed859710f30dfc15c78f8d69d583b3044f43e9e AS builder
+FROM dhi.io/rust:1@sha256:388f7105a9b592d0303af05937b4b525f48c45695e197b6c3553371cf08f7aa1 AS builder
 
 # The hardened toolchain image runs as a nonroot user; the build needs to
 # write only under /src and the cargo home, so give it a writable workspace.
@@ -45,7 +45,7 @@ RUN cargo build --release --locked
 # (`grpc.health.v1.Health/Check`, which this server registers) rather than a
 # Dockerfile HEALTHCHECK, because there is no shell here to run one with.
 # ---------------------------------------------------------------------------
-FROM dhi.io/debian-base:trixie-debian13@sha256:20079b51710f0397da5e056bfc7156b6aafc7ff3aa4ef4cbcb0b0f1df99cd8c4
+FROM dhi.io/debian-base:trixie-debian13@sha256:1bc990cfdb9a1c0b76491bb03921af347e408107e6769d49d1fc5668ad30ba5c
 
 COPY --from=builder /src/target/release/grpc-epub /usr/local/bin/grpc-epub
 
