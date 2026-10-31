@@ -151,6 +151,16 @@ pub struct Document {
     /// failures: the parse stands. Extension beyond the upstream dialect.
     #[prost(message, repeated, tag="31")]
     pub warnings: ::prost::alloc::vec::Vec<CollectorWarning>,
+    /// Every decode step of every generative collector that read this
+    /// document, one entry per page per collector, kept whole beside the
+    /// items those steps produced. Nothing a model returns is dropped: the
+    /// items above are a reading of these steps, and a consumer that wants
+    /// the model's own output, its per-token confidence or the steps a logit
+    /// rule overrode finds them here. Merges append; entries from different
+    /// collectors never collide because each names its source. Extension
+    /// beyond the upstream dialect.
+    #[prost(message, repeated, tag="32")]
+    pub generation_traces: ::prost::alloc::vec::Vec<GenerationTrace>,
 }
 /// CollectorWarning is one warning a collector raised while reading the
 /// document.
@@ -403,6 +413,14 @@ pub struct CollectorSource {
     pub raw_score_kind: ::core::option::Option<::prost::alloc::string::String>,
     /// How many samples the score aggregates, so a three-token mean and a
     /// three-thousand-token mean stay distinguishable.
+    ///
+    /// A generative collector (a document VLM decoding token by token) has no
+    /// self-reported quality score; its only confidence signal is the
+    /// log-probability of each token it chose. Such a collector sets
+    /// raw_score to the aggregate over the item's tokens, raw_score_kind to
+    /// the aggregate's name ("mean_logprob"), and raw_score_samples to the
+    /// token count. The per-token values themselves are in
+    /// Document.generation_traces.
     #[prost(uint64, optional, tag="7")]
     pub raw_score_samples: ::core::option::Option<u64>,
 }
@@ -699,6 +717,27 @@ pub struct TextItemBase {
     /// Empty for single-source items. Extension beyond the upstream dialect.
     #[prost(message, repeated, tag="25")]
     pub field_sources: ::prost::alloc::vec::Vec<FieldSource>,
+    /// Markup attributes in source order, including lexical presence and locations.
+    #[prost(message, repeated, tag="26")]
+    pub source_attributes: ::prost::alloc::vec::Vec<SourceAttribute>,
+}
+/// A markup attribute's decoded value and source spelling. Presence distinguishes
+/// a bare attribute from an explicitly empty value without inventing source bytes.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SourceAttribute {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub name_raw: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="3")]
+    pub value: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag="4")]
+    pub name_span: ::core::option::Option<ByteSpan>,
+    #[prost(message, optional, tag="5")]
+    pub value_span: ::core::option::Option<ByteSpan>,
+    /// Absent when an older producer cannot distinguish lexical value presence.
+    #[prost(bool, optional, tag="6")]
+    pub value_present: ::core::option::Option<bool>,
 }
 /// TitleItem represents a document title or major heading.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1395,6 +1434,24 @@ pub struct TableData {
     /// the upstream dialect.
     #[prost(message, optional, tag="10")]
     pub record_layout: ::core::option::Option<RecordLayoutMeta>,
+    /// Named source table declarations, distinct from the sheet-wide cell grid.
+    #[prost(message, repeated, tag="11")]
+    pub declared_tables: ::prost::alloc::vec::Vec<DeclaredSheetTable>,
+}
+/// One named table declared by a workbook, preserving its own schema and bands.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeclaredSheetTable {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    /// Absolute sheet coordinates with inclusive last row and column.
+    #[prost(message, optional, tag="2")]
+    pub range: ::core::option::Option<GridSpan>,
+    #[prost(uint32, tag="3")]
+    pub header_row_count: u32,
+    #[prost(uint32, tag="4")]
+    pub totals_row_count: u32,
+    #[prost(string, repeated, tag="5")]
+    pub columns: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// TableRow represents a single row in the table.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1898,6 +1955,21 @@ pub struct DocumentMeta {
     pub field_sources: ::prost::alloc::vec::Vec<FieldSource>,
     #[prost(map="string, string", tag="100")]
     pub extra: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Source-declared workbook/document properties, retained as typed metadata.
+    #[prost(string, optional, tag="36")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="37")]
+    pub category: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="38")]
+    pub content_status: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="39")]
+    pub revision: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="40")]
+    pub application_version: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="41")]
+    pub company: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="42")]
+    pub manager: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Identifier is one source-scoped identifier.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1971,6 +2043,17 @@ pub struct CellValue {
     /// The source's display format string for the value.
     #[prost(string, optional, tag="10")]
     pub number_format: ::core::option::Option<::prost::alloc::string::String>,
+    /// The source formula alongside its cached typed result in `kind`. Older
+    /// producers may instead use the legacy `formula` arm without a cached value.
+    #[prost(string, optional, tag="11")]
+    pub formula_source: ::core::option::Option<::prost::alloc::string::String>,
+    /// Source workbook style index when the reader exposes it.
+    #[prost(uint32, optional, tag="12")]
+    pub style_id: ::core::option::Option<u32>,
+    /// Source number-format identifier, including reserved/localized formats
+    /// whose display code is unavailable.
+    #[prost(uint32, optional, tag="13")]
+    pub number_format_id: ::core::option::Option<u32>,
     #[prost(oneof="cell_value::Kind", tags="1, 2, 3, 4, 5")]
     pub kind: ::core::option::Option<cell_value::Kind>,
 }
@@ -2141,7 +2224,9 @@ pub struct GenerationSource {
     #[prost(string, optional, tag="2")]
     pub endpoint: ::core::option::Option<::prost::alloc::string::String>,
     /// The provider's stop reason, verbatim; a length stop means the content
-    /// is truncated.
+    /// is truncated. This is the raw companion of `stop_reason`: it is kept
+    /// even when stop_reason classifies it, and it is the only carrier when
+    /// the value has no VlmStopReason.
     #[prost(string, optional, tag="3")]
     pub finish_reason: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint64, optional, tag="4")]
@@ -2150,6 +2235,66 @@ pub struct GenerationSource {
     pub completion_tokens: ::core::option::Option<u64>,
     #[prost(double, optional, tag="6")]
     pub temperature: ::core::option::Option<f64>,
+    /// Why the generation ended early, when it did; unset when it ran to its
+    /// natural end or the producer does not say.
+    #[prost(enumeration="GenerationTruncation", optional, tag="7")]
+    pub truncation: ::core::option::Option<i32>,
+    /// finish_reason classified the way docling 2.140 classifies a VLM
+    /// response (VlmPrediction.stop_reason). UNSPECIFIED when the producer
+    /// gave no stop reason or one docling has no name for; finish_reason then
+    /// keeps the verbatim value.
+    #[prost(enumeration="VlmStopReason", tag="8")]
+    pub stop_reason: i32,
+}
+/// GenerationTrace is one page of one generative collector's decode: every
+/// step it took on that page, in order, exactly as chosen, the closing
+/// end-of-sequence step included. Steps are numbered document-wide per
+/// collector, so a page's steps run first_step .. first_step + len(steps) - 1
+/// and the pages of one collector tile its whole decode with no gap. The
+/// field numbers 1 to 4 match the Unlimited-OCR collector's PageTokens, and
+/// GenerationStep matches its TokenStep, so that record maps here without
+/// loss.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GenerationTrace {
+    /// The page the steps read, as keyed in Document.pages.
+    #[prost(int32, tag="1")]
+    pub page_no: i32,
+    /// Document-wide index of steps\[0\] within this collector's decode.
+    #[prost(uint64, tag="2")]
+    pub first_step: u64,
+    /// The steps, in decode order.
+    #[prost(message, repeated, tag="3")]
+    pub steps: ::prost::alloc::vec::Vec<GenerationStep>,
+    /// The steps decoded to text, special tokens kept: the model's raw
+    /// output for the page, byte for byte.
+    #[prost(string, tag="4")]
+    pub text: ::prost::alloc::string::String,
+    /// The collector and model that produced the steps.
+    #[prost(message, optional, tag="5")]
+    pub source: ::core::option::Option<CollectorSource>,
+}
+/// GenerationStep is one decode step.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GenerationStep {
+    /// The chosen token id, in the model's own vocabulary.
+    #[prost(uint32, tag="1")]
+    pub token: u32,
+    /// The token's vocabulary entry before byte decoding ("Ġpage").
+    #[prost(string, tag="2")]
+    pub piece: ::prost::alloc::string::String,
+    /// Log-probability of the chosen token under the raw logits.
+    #[prost(float, tag="3")]
+    pub logprob: f32,
+    /// The model's own top token under the raw logits. Equal to token unless
+    /// a decoding rule overrode it.
+    #[prost(uint32, tag="4")]
+    pub model_token: u32,
+    /// Log-probability of the model's top token.
+    #[prost(float, tag="5")]
+    pub model_logprob: f32,
+    /// Which decoding rule, if any, chose the token instead of the model.
+    #[prost(enumeration="GenerationIntervention", tag="6")]
+    pub intervention: i32,
 }
 /// OutlineEntry is one row of the source's own table of contents.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2651,6 +2796,18 @@ pub enum DocItemLabel {
     FieldValue = 28,
     FieldHint = 29,
     Marker = 30,
+    /// The three below have no upstream name. Producers put them on the item
+    /// type a consumer that does not know them still reads sensibly, and the
+    /// canonical renderer writes the nearest upstream label.
+    /// A stamp or seal impression; carried on a PictureItem, rendered as
+    /// "picture".
+    Seal = 31,
+    /// Marginal or sidebar text set apart from the body flow; carried on a
+    /// TextItem, rendered as "text".
+    Aside = 32,
+    /// An algorithm or pseudocode listing; carried on a CodeItem (or a
+    /// TextItem), rendered as "code".
+    Algorithm = 33,
 }
 impl DocItemLabel {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2690,6 +2847,9 @@ impl DocItemLabel {
             Self::FieldValue => "DOC_ITEM_LABEL_FIELD_VALUE",
             Self::FieldHint => "DOC_ITEM_LABEL_FIELD_HINT",
             Self::Marker => "DOC_ITEM_LABEL_MARKER",
+            Self::Seal => "DOC_ITEM_LABEL_SEAL",
+            Self::Aside => "DOC_ITEM_LABEL_ASIDE",
+            Self::Algorithm => "DOC_ITEM_LABEL_ALGORITHM",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2726,6 +2886,9 @@ impl DocItemLabel {
             "DOC_ITEM_LABEL_FIELD_VALUE" => Some(Self::FieldValue),
             "DOC_ITEM_LABEL_FIELD_HINT" => Some(Self::FieldHint),
             "DOC_ITEM_LABEL_MARKER" => Some(Self::Marker),
+            "DOC_ITEM_LABEL_SEAL" => Some(Self::Seal),
+            "DOC_ITEM_LABEL_ASIDE" => Some(Self::Aside),
+            "DOC_ITEM_LABEL_ALGORITHM" => Some(Self::Algorithm),
             _ => None,
         }
     }
@@ -3982,6 +4145,120 @@ impl VerticalAlignment {
             "VERTICAL_ALIGNMENT_TOP" => Some(Self::Top),
             "VERTICAL_ALIGNMENT_MIDDLE" => Some(Self::Middle),
             "VERTICAL_ALIGNMENT_BOTTOM" => Some(Self::Bottom),
+            _ => None,
+        }
+    }
+}
+/// VlmStopReason mirrors docling's VlmStopReason (docling 2.140): why a VLM
+/// generation ended. Upstream's "unspecified" member is the zero value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum VlmStopReason {
+    Unspecified = 0,
+    /// The token budget ran out ("length"); the content is truncated.
+    Length = 1,
+    /// A configured stop sequence matched ("stop_sequence").
+    StopSequence = 2,
+    /// The model emitted its end-of-text token ("end_of_sequence"; OpenAI
+    /// "stop").
+    EndOfSequence = 3,
+    /// The provider withheld content under its safety policy
+    /// ("content_filter").
+    ContentFiltered = 4,
+    /// The inference call failed and produced no output ("inference_error").
+    InferenceError = 5,
+}
+impl VlmStopReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "VLM_STOP_REASON_UNSPECIFIED",
+            Self::Length => "VLM_STOP_REASON_LENGTH",
+            Self::StopSequence => "VLM_STOP_REASON_STOP_SEQUENCE",
+            Self::EndOfSequence => "VLM_STOP_REASON_END_OF_SEQUENCE",
+            Self::ContentFiltered => "VLM_STOP_REASON_CONTENT_FILTERED",
+            Self::InferenceError => "VLM_STOP_REASON_INFERENCE_ERROR",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "VLM_STOP_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "VLM_STOP_REASON_LENGTH" => Some(Self::Length),
+            "VLM_STOP_REASON_STOP_SEQUENCE" => Some(Self::StopSequence),
+            "VLM_STOP_REASON_END_OF_SEQUENCE" => Some(Self::EndOfSequence),
+            "VLM_STOP_REASON_CONTENT_FILTERED" => Some(Self::ContentFiltered),
+            "VLM_STOP_REASON_INFERENCE_ERROR" => Some(Self::InferenceError),
+            _ => None,
+        }
+    }
+}
+/// GenerationTruncation names why a model generation was cut short.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum GenerationTruncation {
+    Unspecified = 0,
+    /// The generation kept repeating the same short unit and was cancelled
+    /// while streaming; the content is the output before the repeated tail.
+    Repetition = 1,
+}
+impl GenerationTruncation {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "GENERATION_TRUNCATION_UNSPECIFIED",
+            Self::Repetition => "GENERATION_TRUNCATION_REPETITION",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "GENERATION_TRUNCATION_UNSPECIFIED" => Some(Self::Unspecified),
+            "GENERATION_TRUNCATION_REPETITION" => Some(Self::Repetition),
+            _ => None,
+        }
+    }
+}
+/// GenerationIntervention names the decoding rule that overrode a model's
+/// top token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum GenerationIntervention {
+    /// The producer did not say.
+    Unspecified = 0,
+    /// The model's top token was chosen.
+    None = 1,
+    /// A no-repeat n-gram rule banned the model's top token.
+    RepeatBan = 2,
+    /// A structural guard (page count, per-page step cap) chose the token.
+    PageGuard = 3,
+}
+impl GenerationIntervention {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "GENERATION_INTERVENTION_UNSPECIFIED",
+            Self::None => "GENERATION_INTERVENTION_NONE",
+            Self::RepeatBan => "GENERATION_INTERVENTION_REPEAT_BAN",
+            Self::PageGuard => "GENERATION_INTERVENTION_PAGE_GUARD",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "GENERATION_INTERVENTION_UNSPECIFIED" => Some(Self::Unspecified),
+            "GENERATION_INTERVENTION_NONE" => Some(Self::None),
+            "GENERATION_INTERVENTION_REPEAT_BAN" => Some(Self::RepeatBan),
+            "GENERATION_INTERVENTION_PAGE_GUARD" => Some(Self::PageGuard),
             _ => None,
         }
     }
