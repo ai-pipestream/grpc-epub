@@ -151,6 +151,16 @@ pub struct Document {
     /// failures: the parse stands. Extension beyond the upstream dialect.
     #[prost(message, repeated, tag="31")]
     pub warnings: ::prost::alloc::vec::Vec<CollectorWarning>,
+    /// Every decode step of every generative collector that read this
+    /// document, one entry per page per collector, kept whole beside the
+    /// items those steps produced. Nothing a model returns is dropped: the
+    /// items above are a reading of these steps, and a consumer that wants
+    /// the model's own output, its per-token confidence or the steps a logit
+    /// rule overrode finds them here. Merges append; entries from different
+    /// collectors never collide because each names its source. Extension
+    /// beyond the upstream dialect.
+    #[prost(message, repeated, tag="32")]
+    pub generation_traces: ::prost::alloc::vec::Vec<GenerationTrace>,
 }
 /// CollectorWarning is one warning a collector raised while reading the
 /// document.
@@ -403,6 +413,14 @@ pub struct CollectorSource {
     pub raw_score_kind: ::core::option::Option<::prost::alloc::string::String>,
     /// How many samples the score aggregates, so a three-token mean and a
     /// three-thousand-token mean stay distinguishable.
+    ///
+    /// A generative collector (a document VLM decoding token by token) has no
+    /// self-reported quality score; its only confidence signal is the
+    /// log-probability of each token it chose. Such a collector sets
+    /// raw_score to the aggregate over the item's tokens, raw_score_kind to
+    /// the aggregate's name ("mean_logprob"), and raw_score_samples to the
+    /// token count. The per-token values themselves are in
+    /// Document.generation_traces.
     #[prost(uint64, optional, tag="7")]
     pub raw_score_samples: ::core::option::Option<u64>,
 }
@@ -2228,6 +2246,56 @@ pub struct GenerationSource {
     #[prost(enumeration="VlmStopReason", tag="8")]
     pub stop_reason: i32,
 }
+/// GenerationTrace is one page of one generative collector's decode: every
+/// step it took on that page, in order, exactly as chosen, the closing
+/// end-of-sequence step included. Steps are numbered document-wide per
+/// collector, so a page's steps run first_step .. first_step + len(steps) - 1
+/// and the pages of one collector tile its whole decode with no gap. The
+/// field numbers 1 to 4 match the Unlimited-OCR collector's PageTokens, and
+/// GenerationStep matches its TokenStep, so that record maps here without
+/// loss.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GenerationTrace {
+    /// The page the steps read, as keyed in Document.pages.
+    #[prost(int32, tag="1")]
+    pub page_no: i32,
+    /// Document-wide index of steps\[0\] within this collector's decode.
+    #[prost(uint64, tag="2")]
+    pub first_step: u64,
+    /// The steps, in decode order.
+    #[prost(message, repeated, tag="3")]
+    pub steps: ::prost::alloc::vec::Vec<GenerationStep>,
+    /// The steps decoded to text, special tokens kept: the model's raw
+    /// output for the page, byte for byte.
+    #[prost(string, tag="4")]
+    pub text: ::prost::alloc::string::String,
+    /// The collector and model that produced the steps.
+    #[prost(message, optional, tag="5")]
+    pub source: ::core::option::Option<CollectorSource>,
+}
+/// GenerationStep is one decode step.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GenerationStep {
+    /// The chosen token id, in the model's own vocabulary.
+    #[prost(uint32, tag="1")]
+    pub token: u32,
+    /// The token's vocabulary entry before byte decoding ("Ġpage").
+    #[prost(string, tag="2")]
+    pub piece: ::prost::alloc::string::String,
+    /// Log-probability of the chosen token under the raw logits.
+    #[prost(float, tag="3")]
+    pub logprob: f32,
+    /// The model's own top token under the raw logits. Equal to token unless
+    /// a decoding rule overrode it.
+    #[prost(uint32, tag="4")]
+    pub model_token: u32,
+    /// Log-probability of the model's top token.
+    #[prost(float, tag="5")]
+    pub model_logprob: f32,
+    /// Which decoding rule, if any, chose the token instead of the model.
+    #[prost(enumeration="GenerationIntervention", tag="6")]
+    pub intervention: i32,
+}
 /// OutlineEntry is one row of the source's own table of contents.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OutlineEntry {
@@ -2728,6 +2796,18 @@ pub enum DocItemLabel {
     FieldValue = 28,
     FieldHint = 29,
     Marker = 30,
+    /// The three below have no upstream name. Producers put them on the item
+    /// type a consumer that does not know them still reads sensibly, and the
+    /// canonical renderer writes the nearest upstream label.
+    /// A stamp or seal impression; carried on a PictureItem, rendered as
+    /// "picture".
+    Seal = 31,
+    /// Marginal or sidebar text set apart from the body flow; carried on a
+    /// TextItem, rendered as "text".
+    Aside = 32,
+    /// An algorithm or pseudocode listing; carried on a CodeItem (or a
+    /// TextItem), rendered as "code".
+    Algorithm = 33,
 }
 impl DocItemLabel {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2767,6 +2847,9 @@ impl DocItemLabel {
             Self::FieldValue => "DOC_ITEM_LABEL_FIELD_VALUE",
             Self::FieldHint => "DOC_ITEM_LABEL_FIELD_HINT",
             Self::Marker => "DOC_ITEM_LABEL_MARKER",
+            Self::Seal => "DOC_ITEM_LABEL_SEAL",
+            Self::Aside => "DOC_ITEM_LABEL_ASIDE",
+            Self::Algorithm => "DOC_ITEM_LABEL_ALGORITHM",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2803,6 +2886,9 @@ impl DocItemLabel {
             "DOC_ITEM_LABEL_FIELD_VALUE" => Some(Self::FieldValue),
             "DOC_ITEM_LABEL_FIELD_HINT" => Some(Self::FieldHint),
             "DOC_ITEM_LABEL_MARKER" => Some(Self::Marker),
+            "DOC_ITEM_LABEL_SEAL" => Some(Self::Seal),
+            "DOC_ITEM_LABEL_ASIDE" => Some(Self::Aside),
+            "DOC_ITEM_LABEL_ALGORITHM" => Some(Self::Algorithm),
             _ => None,
         }
     }
@@ -4135,6 +4221,44 @@ impl GenerationTruncation {
         match value {
             "GENERATION_TRUNCATION_UNSPECIFIED" => Some(Self::Unspecified),
             "GENERATION_TRUNCATION_REPETITION" => Some(Self::Repetition),
+            _ => None,
+        }
+    }
+}
+/// GenerationIntervention names the decoding rule that overrode a model's
+/// top token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum GenerationIntervention {
+    /// The producer did not say.
+    Unspecified = 0,
+    /// The model's top token was chosen.
+    None = 1,
+    /// A no-repeat n-gram rule banned the model's top token.
+    RepeatBan = 2,
+    /// A structural guard (page count, per-page step cap) chose the token.
+    PageGuard = 3,
+}
+impl GenerationIntervention {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "GENERATION_INTERVENTION_UNSPECIFIED",
+            Self::None => "GENERATION_INTERVENTION_NONE",
+            Self::RepeatBan => "GENERATION_INTERVENTION_REPEAT_BAN",
+            Self::PageGuard => "GENERATION_INTERVENTION_PAGE_GUARD",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "GENERATION_INTERVENTION_UNSPECIFIED" => Some(Self::Unspecified),
+            "GENERATION_INTERVENTION_NONE" => Some(Self::None),
+            "GENERATION_INTERVENTION_REPEAT_BAN" => Some(Self::RepeatBan),
+            "GENERATION_INTERVENTION_PAGE_GUARD" => Some(Self::PageGuard),
             _ => None,
         }
     }
