@@ -1748,6 +1748,12 @@ pub struct PageQuality {
     /// Rotation the producer detected and applied, degrees clockwise.
     #[prost(double, optional, tag="4")]
     pub rotation_degrees: ::core::option::Option<f64>,
+    /// True when this page's embedded text layer was dropped and replaced by
+    /// full-page OCR because replace_broken_text_layer was set and the layer
+    /// was incomplete. Distinct from a low parse_score: that score still
+    /// describes the PDF layer, not the replacement.
+    #[prost(bool, optional, tag="5")]
+    pub text_layer_replaced: ::core::option::Option<bool>,
 }
 // ============================================================================
 // Model extensions
