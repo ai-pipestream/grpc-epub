@@ -629,6 +629,7 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     // positions that differ only when the chapter is the spine item's
     // fallback; see [`chapter_source`].
     let mut spine: Vec<(usize, usize, &opf::SpineItem)> = Vec::with_capacity(package.spine.len());
+    let mut repeats = Repeats::default();
     for itemref in &package.spine {
         let Some(&position) = by_id.get(itemref.idref.as_str()) else {
             return Err(Status::invalid_argument(format!(
@@ -650,7 +651,9 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
                 ))
                 .into());
             }
-            spine.push((position, source, itemref));
+            if repeats.first_time(entry) {
+                spine.push((position, source, itemref));
+            }
             continue;
         }
         // Nothing in the chain is in the archive; say why for the spine item
@@ -676,6 +679,18 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             itemref.idref, target.path
         ))
         .into());
+    }
+
+    for (entry, count) in repeats.reported() {
+        let path = &entries[entry].name;
+        warnings.push(
+            pb::ParseWarningCode::Metadata,
+            path,
+            format!(
+                "the spine names {path:?} {count} more times after its first itemref; a chapter \
+                 is sent once, so the repeats were dropped"
+            ),
+        );
     }
 
     // --- info ---------------------------------------------------------------
@@ -1040,6 +1055,49 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
         warnings: warnings.entries,
     }))?;
     Ok(())
+}
+
+/// The archive entries the spine has already claimed as chapters.
+///
+/// Every archive entry goes out at most once, and the spine is the one place
+/// a package can ask for the same entry twice: an itemref repeated, or two
+/// itemrefs whose fallback chains meet in one file. Honouring each repeat
+/// would send the entry once per itemref, and the per-entry ratio rule
+/// cannot see that, so a spine a few hundred bytes long could cost the whole
+/// decompression budget. The first itemref keeps the chapter; the repeats
+/// are counted here and reported on the trailer, once per entry.
+#[derive(Default)]
+struct Repeats {
+    /// Repeat count by archive entry, for every entry the spine named.
+    counts: HashMap<usize, u32>,
+    /// Entries named more than once, in the order their first repeat came.
+    repeated: Vec<usize>,
+}
+
+impl Repeats {
+    /// Claim `entry` for the chapter walk; `false` when the spine already has.
+    fn first_time(&mut self, entry: usize) -> bool {
+        match self.counts.get_mut(&entry) {
+            None => {
+                self.counts.insert(entry, 0);
+                true
+            }
+            Some(count) => {
+                if *count == 0 {
+                    self.repeated.push(entry);
+                }
+                *count = count.saturating_add(1);
+                false
+            }
+        }
+    }
+
+    /// Every entry the spine repeated, with how many times, in order.
+    fn reported(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
+        self.repeated
+            .iter()
+            .map(|entry| (*entry, self.counts[entry]))
+    }
 }
 
 /// Longest manifest fallback chain followed from a spine item.
