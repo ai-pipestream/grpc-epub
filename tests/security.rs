@@ -553,6 +553,80 @@ async fn a_nested_archive_is_reported_and_never_opened() {
     assert_eq!(status.warnings[0].href, "OEBPS/extra/inner.epub");
 }
 
+/// A spine that names one chapter over and over.
+///
+/// Every archive entry goes out at most once; that is the invariant the
+/// zip-bomb rules price against, because the ratio rule is per entry and the
+/// total budget is what one inflation of each costs. An `itemref` repeated
+/// sixty-four times asks for one small entry sixty-four times, and a spine
+/// that long deflates to a few dozen bytes: the book goes out at the
+/// spine's size times the chapter's, with the ratio rule never consulted,
+/// until the total budget stops it. The chapter is emitted once and the
+/// repeats are reported.
+#[tokio::test]
+async fn a_spine_that_repeats_a_chapter_sends_it_once() {
+    let harness = common::start().await;
+    let repeats = 64;
+    let manifest = r#"    <item id="ch1" href="text/chap1.xhtml" media-type="application/xhtml+xml"/>
+"#;
+    let itemrefs = "    <itemref idref=\"ch1\"/>\n".repeat(repeats);
+    let chapter = common::chapter_xhtml("One", &"prose ".repeat(500));
+    let archive = common::shell()
+        .add(common::OPF_PATH, common::package(manifest, &itemrefs))
+        .add(common::CHAP1, chapter.as_str())
+        .build();
+    assert!(
+        archive.len() < 2048,
+        "the whole book, repeated spine included, uploads in under two kilobytes, got {}",
+        archive.len()
+    );
+
+    let started = std::time::Instant::now();
+    let events = harness.parse_ok(&archive).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a one-chapter book is not a second's work"
+    );
+
+    let chapters = common::chapters(&events);
+    assert_eq!(
+        chapters.len(),
+        1,
+        "one chapter, however often the spine names it"
+    );
+    assert_eq!(chapters[0].content, chapter.as_bytes());
+    let sent: usize = chapters.iter().map(|chapter| chapter.content.len()).sum();
+    assert!(
+        sent <= chapter.len(),
+        "{sent} bytes of chapters went out for a {} byte chapter",
+        chapter.len()
+    );
+
+    let status = common::status(&events);
+    assert_eq!(status.chapters_emitted, 1);
+    assert_eq!(
+        status.entries_read, 4,
+        "mimetype, container, OPF and the chapter, inflated once each"
+    );
+    assert_eq!(common::info(&events).spine_item_count, 1);
+    assert_eq!(
+        status.warnings.len(),
+        1,
+        "the repeats are reported once, not once per repeat: {:?}",
+        status.warnings
+    );
+    assert_eq!(
+        status.warnings[0].code,
+        pb::ParseWarningCode::Metadata as i32
+    );
+    assert_eq!(status.warnings[0].href, common::CHAP1);
+    assert!(
+        status.warnings[0].message.contains("63"),
+        "{}",
+        status.warnings[0].message
+    );
+}
+
 /// A request cannot raise a limit past the server's own.
 #[tokio::test]
 async fn a_request_cannot_widen_the_servers_caps() {
