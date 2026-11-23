@@ -215,6 +215,10 @@ Events already delivered stay valid.
 | `GRPC_EPUB_IDLE_TIMEOUT_SECONDS` | `30` | longest wait for the next request frame; past it the call ends with `DEADLINE_EXCEEDED` and frees its share of the upload budget |
 | `GRPC_EPUB_UPLOAD_TIMEOUT_SECONDS` | `300` | longest a call's whole upload may take, options frame included; past it the call ends with `DEADLINE_EXCEEDED` and frees its share of the upload budget, however steadily it was sending |
 
+A numeric variable that is set and is not a whole number (`20k`, `64MiB`)
+stops the server at startup with an error naming it, rather than running it
+on the default. A limit set to `0` means the default, as it always has.
+
 Every size limit is also readable at runtime through `GetServiceInfo` (the
 idle and upload timeouts are not on the wire; both are in the startup line).
 The same RPC carries a `ui` block (`title`, `path`, `description`)

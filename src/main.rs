@@ -33,19 +33,19 @@ const DEFAULT_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
 /// Default seconds between metrics lines. Zero disables them.
 const DEFAULT_METRICS_INTERVAL_SECS: u64 = 60;
 
-/// Read a `usize` environment variable, falling back to `default`.
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+/// Read a `usize` environment variable as written, zero included:
+/// `default` when it is unset, and an error naming it when it is set and is
+/// not a whole number.
+fn env_usize(name: &str, default: usize) -> Result<usize, String> {
+    let value = grpc_epub::limits::env_whole(name, default as u64)?;
+    usize::try_from(value).map_err(|_| format!("{name}={value} is too large for this machine"))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workers = env_usize(
         "GRPC_EPUB_WORKERS",
         std::thread::available_parallelism().map_or(4, usize::from),
-    );
+    )?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -60,7 +60,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("GRPC_EPUB_ADDR")
         .unwrap_or_else(|_| DEFAULT_ADDR.to_owned())
         .parse()?;
-    let limits = Limits::from_env();
+    let limits = Limits::from_env()?;
 
     let counters: Arc<Metrics> = Metrics::new();
     metrics::spawn_reporter(
@@ -69,14 +69,14 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             u64::try_from(env_usize(
                 "GRPC_EPUB_METRICS_INTERVAL_SECS",
                 usize::try_from(DEFAULT_METRICS_INTERVAL_SECS).unwrap_or(60),
-            ))
+            )?)
             .unwrap_or(DEFAULT_METRICS_INTERVAL_SECS),
         ),
     );
 
     // Zero means "not set", as it does for every limit: an idle stream with
     // no bound is the failure the timeout exists to prevent.
-    let idle_timeout = match env_usize("GRPC_EPUB_IDLE_TIMEOUT_SECONDS", 0) {
+    let idle_timeout = match env_usize("GRPC_EPUB_IDLE_TIMEOUT_SECONDS", 0)? {
         0 => grpc_epub::service::DEFAULT_IDLE_TIMEOUT,
         seconds => Duration::from_secs(u64::try_from(seconds).unwrap_or(u64::MAX)),
     };
@@ -84,7 +84,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // The same reading: zero is the default, never "unbounded", because an
     // upload trickled in just inside the idle timeout is the failure this one
     // exists to prevent.
-    let upload_timeout = match env_usize("GRPC_EPUB_UPLOAD_TIMEOUT_SECONDS", 0) {
+    let upload_timeout = match env_usize("GRPC_EPUB_UPLOAD_TIMEOUT_SECONDS", 0)? {
         0 => grpc_epub::service::DEFAULT_UPLOAD_TIMEOUT,
         seconds => Duration::from_secs(u64::try_from(seconds).unwrap_or(u64::MAX)),
     };
@@ -119,7 +119,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let window = u32::try_from(env_usize(
         "GRPC_EPUB_WINDOW_BYTES",
         DEFAULT_WINDOW_BYTES as usize,
-    ))
+    )?)
     .unwrap_or(DEFAULT_WINDOW_BYTES);
 
     eprintln!(

@@ -315,15 +315,19 @@ impl Preread {
 struct Warnings {
     /// Warnings gathered so far, capped at [`MAX_WARNINGS`].
     entries: Vec<pb::ParseWarning>,
+    /// Warnings raised past the cap, counted rather than listed.
+    dropped: u64,
     /// Resource kinds already reported as excluded, so the trailer carries one
     /// warning per kind rather than one per file.
     reported_kinds: HashSet<i32>,
 }
 
 impl Warnings {
-    /// Record a warning, dropping it once the cap is reached.
+    /// Record a warning, counting it instead of listing it once the cap is
+    /// reached.
     fn push(&mut self, code: pb::ParseWarningCode, href: &str, message: impl Into<String>) {
         if self.entries.len() >= MAX_WARNINGS {
+            self.dropped += 1;
             return;
         }
         self.entries.push(pb::ParseWarning {
@@ -408,6 +412,45 @@ fn is_nested_archive(media_type: &str, path: &str) -> bool {
         .is_some_and(|extension| {
             extension.eq_ignore_ascii_case("zip") || extension.eq_ignore_ascii_case("epub")
         })
+}
+
+/// Report what the package document got wrong that would otherwise read as
+/// an ordinary default: a `unique-identifier` that names no `dc:identifier`,
+/// and attributes that did not parse.
+fn package_warnings(package: &Package, opf_path: &str, warnings: &mut Warnings) {
+    let names_one = package
+        .metadata
+        .identifiers
+        .iter()
+        .any(|identifier| identifier.id == package.unique_identifier_id);
+    if package.unique_identifier_id.is_empty() {
+        warnings.push(
+            pb::ParseWarningCode::Metadata,
+            opf_path,
+            "the package names no unique-identifier, so EpubInfo.unique_identifier is empty",
+        );
+    } else if !names_one {
+        warnings.push(
+            pb::ParseWarningCode::Metadata,
+            opf_path,
+            format!(
+                "the package unique-identifier names the id {}, which no dc:identifier \
+                 carries, so EpubInfo.unique_identifier is empty",
+                quoted(&package.unique_identifier_id)
+            ),
+        );
+    }
+    if package.malformed_attributes > 0 {
+        warnings.push(
+            pb::ParseWarningCode::Metadata,
+            opf_path,
+            format!(
+                "{} elements of the package document hold an attribute that does not parse; \
+                 those attributes were read as absent",
+                package.malformed_attributes
+            ),
+        );
+    }
 }
 
 /// `value` quoted for a warning message, cut short past [`MAX_QUOTED_CHARS`].
@@ -605,6 +648,7 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
     let package: Package = opf::parse_package(&opf_bytes)
         .map_err(|e| Status::invalid_argument(format!("{opf_path}: {e}")))?;
     let opf_dir = href::parent_dir(&opf_path).to_owned();
+    package_warnings(&package, &opf_path, &mut warnings);
 
     // --- Resolve the manifest ----------------------------------------------
     let mut resolved: Vec<Resolved<'_>> = Vec::with_capacity(package.manifest.len());
@@ -621,7 +665,19 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             Ok(Target::Remote(uri)) => (uri, None, true, None),
             Err(error) => (item.href.clone(), None, false, Some(error)),
         };
-        by_id.entry(item.id.as_str()).or_insert(resolved.len());
+        if by_id.contains_key(item.id.as_str()) {
+            warnings.push(
+                pb::ParseWarningCode::Metadata,
+                &item.href,
+                format!(
+                    "the manifest declares the id {} more than once; a reference to it \
+                     resolves to the first item with it",
+                    quoted(&item.id)
+                ),
+            );
+        } else {
+            by_id.insert(item.id.as_str(), resolved.len());
+        }
         resolved.push(Resolved {
             item,
             path,
@@ -983,6 +1039,17 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
                     ),
                 );
             }
+            if parsed.unreadable_clocks > 0 {
+                warnings.push(
+                    pb::ParseWarningCode::Metadata,
+                    &path,
+                    format!(
+                        "{} clip bounds in the media overlay are not SMIL clock values; those \
+                         cues carry no start or end time rather than a zero one",
+                        parsed.unreadable_clocks
+                    ),
+                );
+            }
             sink.emit(pb::parse_epub_response::Event::MediaOverlay(
                 pb::MediaOverlay {
                     source_href: parsed.source_href.clone(),
@@ -1104,6 +1171,7 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
         uncompressed_bytes: budget.consumed(),
         entries_read: budget.entries(),
         warnings: warnings.entries,
+        warnings_dropped: warnings.dropped,
     }))?;
     Ok(())
 }
@@ -1477,5 +1545,10 @@ mod tests {
             warnings.push(pb::ParseWarningCode::Metadata, "x", format!("{i}"));
         }
         assert_eq!(warnings.entries.len(), MAX_WARNINGS);
+        assert_eq!(
+            warnings.dropped,
+            MAX_WARNINGS as u64 + 1,
+            "every warning past the cap is counted"
+        );
     }
 }

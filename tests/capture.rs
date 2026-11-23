@@ -538,8 +538,8 @@ async fn asking_for_media_overlays_yields_cue_level_timings() {
         overlay.cues[0].audio_href, "OEBPS/audio/chap1.mp3",
         "resolved against the overlay's own directory, not the OPF's"
     );
-    assert!((overlay.cues[0].end_time - 12.5).abs() < f64::EPSILON);
-    assert!((overlay.cues[1].start_time - 12.5).abs() < f64::EPSILON);
+    assert!((overlay.cues[0].end_time.expect("stated") - 12.5).abs() < f64::EPSILON);
+    assert!((overlay.cues[1].start_time.expect("stated") - 12.5).abs() < f64::EPSILON);
 
     // The alignment is available even though the recording itself was not
     // requested: audio is excluded by the default include options.
@@ -734,4 +734,63 @@ async fn a_media_overlay_that_breaks_part_way_is_reported_incomplete() {
         "{:?}",
         status.warnings
     );
+}
+
+/// The `PARSE_WARNING_CODE_METADATA` warnings of a parse, as (href, message).
+fn metadata_warnings(events: &[pb::parse_epub_response::Event]) -> Vec<(String, String)> {
+    common::status(events)
+        .warnings
+        .iter()
+        .filter(|warning| warning.code == pb::ParseWarningCode::Metadata as i32)
+        .map(|warning| (warning.href.clone(), warning.message.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn package_defaults_the_opf_got_wrong_are_reported() {
+    // Three silent defaults in one package:
+    // - `unique-identifier` names an id no `dc:identifier` carries;
+    // - two manifest items share the id `ch1`;
+    // - an item's attribute is not quoted.
+    // Each used to read as an ordinary book.
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="nosuch">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>T</dc:title>
+    <dc:identifier id="bookid">urn:isbn:9780000000000</dc:identifier>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="text/chap1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch1" href="text/chap2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="cover-img" href="images/cover.png" media-type=image/png/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#;
+    let book = common::shell()
+        .add(common::OPF_PATH, opf)
+        .add(
+            common::CHAP1,
+            common::chapter_xhtml("Chapter One", "The first chapter."),
+        )
+        .add(
+            common::CHAP2,
+            common::chapter_xhtml("Chapter Two", "The second chapter."),
+        )
+        .add(common::COVER, common::IMAGE)
+        .build();
+    let harness = common::start().await;
+    let events = harness.parse_ok(&book).await;
+    let warnings = metadata_warnings(&events);
+    let said = |needle: &str| warnings.iter().any(|(_, message)| message.contains(needle));
+    assert!(
+        said("nosuch"),
+        "the dangling unique-identifier: {warnings:?}"
+    );
+    assert!(said("ch1"), "the duplicated manifest id: {warnings:?}");
+    assert!(said("attribute"), "the malformed attribute: {warnings:?}");
+
+    // The sound book raises none of these.
+    let sound = harness.parse_ok(&common::minimal()).await;
+    assert_eq!(metadata_warnings(&sound), Vec::<(String, String)>::new());
 }

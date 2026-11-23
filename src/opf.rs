@@ -278,6 +278,10 @@ pub struct Package {
     /// The `<spine toc="…">` attribute: the manifest `id` of the EPUB 2 NCX.
     /// Empty for a book that ships only an EPUB 3 nav document.
     pub toc_idref: String,
+    /// Elements whose attribute list did not parse (an unquoted value, a
+    /// name with no value). The attributes that did parse are read; the
+    /// broken ones read as absent, so the count is what says they existed.
+    pub malformed_attributes: u32,
 }
 
 /// Build a reader with the settings both documents are parsed under.
@@ -958,12 +962,19 @@ pub fn parse_package(bytes: &[u8]) -> Result<Package, XmlError> {
     let mut reader = reader(bytes);
     let mut buf = Vec::new();
     let mut parser = PackageParser::default();
+    let mut malformed_attributes = 0u32;
 
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::DocType(dtd) => check_doctype(dtd.as_ref())?,
-            Event::Start(start) => parser.open(&start, false)?,
-            Event::Empty(start) => parser.open(&start, true)?,
+            Event::Start(start) => {
+                malformed_attributes += u32::from(has_malformed_attribute(&start));
+                parser.open(&start, false)?;
+            }
+            Event::Empty(start) => {
+                malformed_attributes += u32::from(has_malformed_attribute(&start));
+                parser.open(&start, true)?;
+            }
             Event::End(end) => parser.close(end.local_name().as_ref()),
             Event::Text(text) if parser.collecting.is_some() => {
                 parser.text.push_text(text.as_ref());
@@ -987,7 +998,16 @@ pub fn parse_package(bytes: &[u8]) -> Result<Package, XmlError> {
         return Err(XmlError::EmptySpine);
     }
     parser.finish_metadata();
+    parser.package.malformed_attributes = malformed_attributes;
     Ok(parser.package)
+}
+
+/// True when an element's attribute list holds one that does not parse.
+fn has_malformed_attribute(start: &BytesStart<'_>) -> bool {
+    start
+        .attributes()
+        .with_checks(false)
+        .any(|attr| attr.is_err())
 }
 
 #[cfg(test)]
