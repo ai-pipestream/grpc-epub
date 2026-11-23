@@ -409,12 +409,17 @@ pub struct MediaOverlayCue {
     #[prost(string, tag="2")]
     pub audio_href: ::prost::alloc::string::String,
     /// Offset into `audio_href` where the cue starts, in seconds. Parsed from
-    /// SMIL `clipBegin`, whose clock values this server normalizes.
-    #[prost(double, tag="3")]
-    pub start_time: f64,
-    /// Offset into `audio_href` where the cue ends, in seconds.
-    #[prost(double, tag="4")]
-    pub end_time: f64,
+    /// SMIL `clipBegin`, whose clock values this server normalizes. Unset when
+    /// the overlay states no readable `clipBegin`, which means "from the start
+    /// of the file"; a value present and unreadable is also reported as a
+    /// METADATA warning naming the overlay.
+    #[prost(double, optional, tag="3")]
+    pub start_time: ::core::option::Option<f64>,
+    /// Offset into `audio_href` where the cue ends, in seconds. Unset when the
+    /// overlay states no readable `clipEnd`, which means "to the end of the
+    /// file".
+    #[prost(double, optional, tag="4")]
+    pub end_time: ::core::option::Option<f64>,
     /// The `<par>` element's `id`, empty when it had none.
     #[prost(string, tag="5")]
     pub identifier: ::prost::alloc::string::String,
@@ -481,6 +486,11 @@ pub struct ParseStatus {
     /// Non-fatal observations, in the order they occurred.
     #[prost(message, repeated, tag="6")]
     pub warnings: ::prost::alloc::vec::Vec<ParseWarning>,
+    /// Warnings raised past the cap on `warnings` and not listed there. Zero
+    /// when every warning is listed, so a trailer that stops listing still
+    /// says how many more there were.
+    #[prost(uint64, tag="7")]
+    pub warnings_dropped: u64,
 }
 /// ServerLimits reports the ceilings a server actually enforces.
 ///
@@ -673,10 +683,11 @@ pub enum ParseWarningCode {
     /// read as the separator a Windows zip tool meant.
     UnusableEntryName = 6,
     /// A navigation document, NCX or media overlay stopped being readable part
-    /// way through, so the `navigation` or `media_overlay` event sent for it
-    /// holds only what came before the break: the entries or cues after it are
-    /// missing. `href` names the file, and `message` says why the read stopped
-    /// (the XML error, or the cue cap) and at which byte. A file that yielded
+    /// way through, or reached a cap, so the `navigation` or `media_overlay`
+    /// event sent for it holds only part of it. `href` names the file, and
+    /// `message` says why: the XML error or the entry or cue cap, with the byte
+    /// it stopped at, or how many table-of-contents entries were nested too
+    /// deep to read. A file that yielded
     /// nothing at all before breaking is reported as METADATA instead, and no
     /// event is sent for it.
     IncompleteStructure = 7,

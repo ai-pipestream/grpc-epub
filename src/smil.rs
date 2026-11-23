@@ -57,11 +57,14 @@ pub struct Cue {
     /// when the `<par>` carried no audio, which is legal and means the text is
     /// shown without narration.
     pub audio_href: String,
-    /// Offset into `audio_href` where the cue starts, in seconds.
-    pub start_time: f64,
-    /// Offset into `audio_href` where the cue ends, in seconds. Zero when the
-    /// overlay declared no `clipEnd`, which means "to the end of the file".
-    pub end_time: f64,
+    /// Offset into `audio_href` where the cue starts, in seconds. `None` when
+    /// the overlay declared no readable `clipBegin`, which means "from the
+    /// start of the file".
+    pub start_time: Option<f64>,
+    /// Offset into `audio_href` where the cue ends, in seconds. `None` when
+    /// the overlay declared no readable `clipEnd`, which means "to the end of
+    /// the file".
+    pub end_time: Option<f64>,
     /// The `<par>` element's `id`, empty when it had none.
     pub identifier: String,
 }
@@ -77,6 +80,9 @@ pub struct Overlay {
     /// XML error it stopped on, or the cue cap. The cues before it are kept
     /// in `cues`, and the ones after it are missing.
     pub broken_at: Option<String>,
+    /// Clock values that were present and could not be read. Each one is
+    /// left unset on its cue rather than read as zero.
+    pub unreadable_clocks: u32,
 }
 
 impl Overlay {
@@ -93,8 +99,21 @@ impl Overlay {
     /// would double-count nothing and under-count every gap.
     #[must_use]
     pub fn duration_ms(&self) -> f64 {
-        self.cues.iter().map(|cue| cue.end_time).fold(0.0, f64::max) * 1000.0
+        self.cues
+            .iter()
+            .filter_map(|cue| cue.end_time)
+            .fold(0.0, f64::max)
+            * 1000.0
     }
+}
+
+/// A clip bound as written: `Ok(None)` when the attribute is absent, `Err`
+/// when it is present and is not a clock value.
+fn clock(raw: &str) -> Result<Option<f64>, ()> {
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    parse_clock(raw).map(Some).ok_or(())
 }
 
 /// Parse a SMIL clock value into seconds.
@@ -201,6 +220,7 @@ pub fn parse_overlay(bytes: &[u8], source_href: &str) -> Overlay {
         source_href: source_href.to_owned(),
         cues: Vec::new(),
         broken_at: None,
+        unreadable_clocks: 0,
     };
     let mut current: Option<Cue> = None;
 
@@ -238,13 +258,16 @@ pub fn parse_overlay(bytes: &[u8], source_href: &str) -> Overlay {
                     "audio" => {
                         if let Some(cue) = current.as_mut() {
                             cue.audio_href = resolve_src(&base_dir, &attribute(&start, "src"));
-                            // An absent or unreadable clip bound means "from
-                            // the start" and "to the end", which is what the
-                            // zero default already says.
-                            cue.start_time =
-                                parse_clock(&attribute(&start, "clipBegin")).unwrap_or(0.0);
-                            cue.end_time =
-                                parse_clock(&attribute(&start, "clipEnd")).unwrap_or(0.0);
+                            // An absent clip bound means "from the start" or
+                            // "to the end" and stays unset. An unreadable one
+                            // stays unset too, and is counted: reading it as
+                            // zero would look exactly like the absent one.
+                            let begin = clock(&attribute(&start, "clipBegin"));
+                            let end = clock(&attribute(&start, "clipEnd"));
+                            overlay.unreadable_clocks +=
+                                u32::from(begin.is_err()) + u32::from(end.is_err());
+                            cue.start_time = begin.unwrap_or(None);
+                            cue.end_time = end.unwrap_or(None);
                         }
                     }
                     _ => {}
@@ -283,7 +306,10 @@ pub fn parse_overlay(bytes: &[u8], source_href: &str) -> Overlay {
 /// timing, and dropping it would understate how much narration the book holds,
 /// so a non-zero `clipEnd` is enough on its own.
 fn push(cues: &mut Vec<Cue>, cue: Cue) {
-    if cue.text_href.is_empty() && cue.audio_href.is_empty() && cue.end_time == 0.0 {
+    if cue.text_href.is_empty()
+        && cue.audio_href.is_empty()
+        && cue.end_time.is_none_or(|end| end == 0.0)
+    {
         return;
     }
     cues.push(cue);
@@ -342,12 +368,12 @@ mod tests {
             first.audio_href, "OEBPS/audio/ch1.mp3",
             "`..` resolves against the overlay's own directory"
         );
-        assert!((first.start_time - 0.0).abs() < f64::EPSILON);
-        assert!((first.end_time - 12.5).abs() < f64::EPSILON);
+        assert!((first.start_time.expect("stated") - 0.0).abs() < f64::EPSILON);
+        assert!((first.end_time.expect("stated") - 12.5).abs() < f64::EPSILON);
 
         let second = &overlay.cues[1];
-        assert!((second.start_time - 12.5).abs() < f64::EPSILON);
-        assert!((second.end_time - 20.0).abs() < f64::EPSILON);
+        assert!((second.start_time.expect("stated") - 12.5).abs() < f64::EPSILON);
+        assert!((second.end_time.expect("stated") - 20.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -430,6 +456,27 @@ mod tests {
         assert_eq!(overlay.cues.len(), 1, "the timing is still true");
         assert_eq!(overlay.cues[0].text_href, "");
         assert_eq!(overlay.cues[0].audio_href, "");
-        assert!((overlay.cues[0].end_time - 2.0).abs() < f64::EPSILON);
+        assert!((overlay.cues[0].end_time.expect("stated") - 2.0).abs() < f64::EPSILON);
+    }
+
+    /// A clock value the parser cannot read used to come back as 0.0, the
+    /// same as an attribute the source never wrote.
+    #[test]
+    fn an_unreadable_clock_is_absent_and_counted_not_zero() {
+        let smil = br#"<smil><body>
+            <par id="p1"><text src="c1.xhtml#s1"/>
+              <audio src="a.mp3" clipBegin="1:02:03,5" clipEnd="1:02:09"/></par>
+            <par id="p2"><text src="c1.xhtml#s2"/><audio src="a.mp3"/></par>
+        </body></smil>"#;
+        let overlay = parse_overlay(smil, "OEBPS/ch1.smil");
+        assert_eq!(overlay.cues.len(), 2);
+        assert_eq!(overlay.cues[0].start_time, None, "unreadable is not zero");
+        assert!((overlay.cues[0].end_time.expect("readable") - 3729.0).abs() < 1e-9);
+        assert_eq!(
+            (overlay.cues[1].start_time, overlay.cues[1].end_time),
+            (None, None),
+            "absent stays absent"
+        );
+        assert_eq!(overlay.unreadable_clocks, 1);
     }
 }

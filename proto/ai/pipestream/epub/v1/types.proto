@@ -473,11 +473,16 @@ message MediaOverlayCue {
   string audio_href = 2;
 
   // Offset into `audio_href` where the cue starts, in seconds. Parsed from
-  // SMIL `clipBegin`, whose clock values this server normalizes.
-  double start_time = 3;
+  // SMIL `clipBegin`, whose clock values this server normalizes. Unset when
+  // the overlay states no readable `clipBegin`, which means "from the start
+  // of the file"; a value present and unreadable is also reported as a
+  // METADATA warning naming the overlay.
+  optional double start_time = 3;
 
-  // Offset into `audio_href` where the cue ends, in seconds.
-  double end_time = 4;
+  // Offset into `audio_href` where the cue ends, in seconds. Unset when the
+  // overlay states no readable `clipEnd`, which means "to the end of the
+  // file".
+  optional double end_time = 4;
 
   // The `<par>` element's `id`, empty when it had none.
   string identifier = 5;
@@ -543,10 +548,11 @@ enum ParseWarningCode {
   PARSE_WARNING_CODE_UNUSABLE_ENTRY_NAME = 6;
 
   // A navigation document, NCX or media overlay stopped being readable part
-  // way through, so the `navigation` or `media_overlay` event sent for it
-  // holds only what came before the break: the entries or cues after it are
-  // missing. `href` names the file, and `message` says why the read stopped
-  // (the XML error, or the cue cap) and at which byte. A file that yielded
+  // way through, or reached a cap, so the `navigation` or `media_overlay`
+  // event sent for it holds only part of it. `href` names the file, and
+  // `message` says why: the XML error or the entry or cue cap, with the byte
+  // it stopped at, or how many table-of-contents entries were nested too
+  // deep to read. A file that yielded
   // nothing at all before breaking is reported as METADATA instead, and no
   // event is sent for it.
   PARSE_WARNING_CODE_INCOMPLETE_STRUCTURE = 7;
@@ -592,6 +598,11 @@ message ParseStatus {
 
   // Non-fatal observations, in the order they occurred.
   repeated ParseWarning warnings = 6;
+
+  // Warnings raised past the cap on `warnings` and not listed there. Zero
+  // when every warning is listed, so a trailer that stops listing still
+  // says how many more there were.
+  uint64 warnings_dropped = 7;
 }
 
 // ServerLimits reports the ceilings a server actually enforces.

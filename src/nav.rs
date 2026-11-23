@@ -229,6 +229,8 @@ pub fn parse_nav(bytes: &[u8], source_href: &str) -> Navigation {
     let mut in_label = false;
     let mut label = Text::default();
     let mut entries = 0usize;
+    // List items nested past MAX_DEPTH, which are not read.
+    let mut too_deep = 0usize;
 
     // A malformed nav document costs the book the rest of its outline and
     // nothing else. Whatever was read before the error is kept, because a
@@ -264,6 +266,8 @@ pub fn parse_nav(bytes: &[u8], source_href: &str) -> Navigation {
                                 point: NavPoint::default(),
                                 depth,
                             });
+                        } else {
+                            too_deep += 1;
                         }
                     }
                     // The first titling element wins: a list item may hold an
@@ -294,9 +298,12 @@ pub fn parse_nav(bytes: &[u8], source_href: &str) -> Navigation {
                     }
                 }
                 if let Some(open) = stack.pop_if(|open| open.depth == depth)
-                    && entries < MAX_ENTRIES
                     && !open.point.label.is_empty()
                 {
+                    if entries >= MAX_ENTRIES {
+                        navigation.broken_at = Some(entry_cap(&reader));
+                        break;
+                    }
                     entries += 1;
                     attach(&mut stack, &mut roots, open.point);
                 }
@@ -319,6 +326,9 @@ pub fn parse_nav(bytes: &[u8], source_href: &str) -> Navigation {
         }
     }
 
+    if navigation.broken_at.is_none() {
+        navigation.broken_at = left_out_deep(too_deep);
+    }
     navigation.toc = nest(roots);
     navigation
 }
@@ -342,6 +352,8 @@ pub fn parse_ncx(bytes: &[u8], source_href: &str) -> Navigation {
     let mut in_text = false;
     let mut label = Text::default();
     let mut entries = 0usize;
+    // Nav points nested past MAX_DEPTH, which are not read.
+    let mut too_deep = 0usize;
 
     // Same policy as the nav document: read as far as the bytes allow, and
     // say where they stopped allowing it.
@@ -373,11 +385,15 @@ pub fn parse_ncx(bytes: &[u8], source_href: &str) -> Navigation {
                         in_map = true;
                         map_depth = depth;
                     }
-                    "navPoint" if in_map && stack.len() < MAX_DEPTH => {
-                        stack.push(Open {
-                            point: NavPoint::default(),
-                            depth,
-                        });
+                    "navPoint" if in_map => {
+                        if stack.len() < MAX_DEPTH {
+                            stack.push(Open {
+                                point: NavPoint::default(),
+                                depth,
+                            });
+                        } else {
+                            too_deep += 1;
+                        }
                     }
                     // Only a `<text>` inside a nav point is a label. The NCX
                     // header carries `<docTitle><text>` too, and reading that
@@ -413,9 +429,12 @@ pub fn parse_ncx(bytes: &[u8], source_href: &str) -> Navigation {
                     }
                 }
                 if let Some(open) = stack.pop_if(|open| open.depth == depth)
-                    && entries < MAX_ENTRIES
                     && !open.point.label.is_empty()
                 {
+                    if entries >= MAX_ENTRIES {
+                        broken_at = Some(entry_cap(&reader));
+                        break;
+                    }
                     entries += 1;
                     attach(&mut stack, &mut roots, open.point);
                 }
@@ -434,8 +453,22 @@ pub fn parse_ncx(bytes: &[u8], source_href: &str) -> Navigation {
         source_href: source_href.to_owned(),
         toc: nest(roots),
         from_ncx: true,
-        broken_at,
+        broken_at: broken_at.or_else(|| left_out_deep(too_deep)),
     }
+}
+
+/// Why a table of contents stopped at [`MAX_ENTRIES`], and where.
+fn entry_cap(reader: &Reader<&[u8]>) -> String {
+    format!(
+        "stopped at the cap of {MAX_ENTRIES} entries (at byte {})",
+        reader.buffer_position()
+    )
+}
+
+/// The entries left out for nesting past [`MAX_DEPTH`], if any were.
+fn left_out_deep(too_deep: usize) -> Option<String> {
+    (too_deep > 0)
+        .then(|| format!("{too_deep} entries nested deeper than {MAX_DEPTH} levels were left out"))
 }
 
 /// Describe a read error with the byte offset it was found at.
@@ -500,6 +533,53 @@ mod tests {
         let navigation = parse_ncx(ncx, "OEBPS/toc.ncx");
         assert_eq!(navigation.toc.len(), 1);
         assert!(navigation.broken_at.is_some());
+    }
+
+    /// A table of contents past the entry cap. It used to come back cut
+    /// at 5,000 entries with nothing saying more existed.
+    #[test]
+    fn a_table_of_contents_past_its_cap_says_so() {
+        use std::fmt::Write as _;
+        let mut items = String::new();
+        for n in 0..MAX_ENTRIES + 10 {
+            write!(items, r#"<li><a href="c{n}.xhtml">Entry {n}</a></li>"#)
+                .expect("a String takes any write");
+        }
+        let nav =
+            format!(r#"<html><body><nav epub:type="toc"><ol>{items}</ol></nav></body></html>"#);
+        let navigation = parse_nav(nav.as_bytes(), "OEBPS/nav.xhtml");
+        assert_eq!(navigation.toc.len(), MAX_ENTRIES);
+        let cut = navigation.broken_at.expect("the cap is reported");
+        assert!(cut.contains("5000"), "{cut}");
+
+        let mut points = String::new();
+        for n in 0..MAX_ENTRIES + 10 {
+            write!(
+                points,
+                r#"<navPoint id="p{n}"><navLabel><text>E{n}</text></navLabel><content src="c{n}.xhtml"/></navPoint>"#
+            )
+            .expect("a String takes any write");
+        }
+        let ncx = format!("<ncx><navMap>{points}</navMap></ncx>");
+        let navigation = parse_ncx(ncx.as_bytes(), "OEBPS/toc.ncx");
+        assert_eq!(navigation.toc.len(), MAX_ENTRIES);
+        assert!(navigation.broken_at.is_some_and(|cut| cut.contains("5000")));
+    }
+
+    /// Entries nested past the depth cap. They were left out silently.
+    #[test]
+    fn entries_nested_past_the_depth_cap_are_reported() {
+        let open: String = (0..MAX_DEPTH + 3)
+            .map(|n| format!(r#"<li><a href="c{n}.xhtml">Level {n}</a><ol>"#))
+            .collect();
+        let close = "</ol></li>".repeat(MAX_DEPTH + 3);
+        let nav = format!(
+            r#"<html><body><nav epub:type="toc"><ol>{open}{close}</ol></nav></body></html>"#
+        );
+        let navigation = parse_nav(nav.as_bytes(), "OEBPS/nav.xhtml");
+        let left_out = navigation.broken_at.expect("the deep entries are reported");
+        assert!(left_out.contains("3 entries"), "{left_out}");
+        assert!(left_out.contains("32"), "{left_out}");
     }
 
     const NAV: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>

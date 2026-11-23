@@ -316,7 +316,7 @@ impl DocumentFold {
                 overlay
                     .cues
                     .iter()
-                    .map(|cue| cue.end_time)
+                    .filter_map(|cue| cue.end_time)
                     .fold(0.0, f64::max)
                     * 1000.0,
             );
@@ -332,8 +332,14 @@ impl DocumentFold {
                         let mut entry = std::collections::BTreeMap::new();
                         entry.insert("text_href".to_owned(), text(&cue.text_href));
                         entry.insert("audio_href".to_owned(), text(&cue.audio_href));
-                        entry.insert("start_time".to_owned(), number(cue.start_time));
-                        entry.insert("end_time".to_owned(), number(cue.end_time));
+                        // A bound the overlay did not state readably is left
+                        // out, not written as zero.
+                        if let Some(start) = cue.start_time {
+                            entry.insert("start_time".to_owned(), number(start));
+                        }
+                        if let Some(end) = cue.end_time {
+                            entry.insert("end_time".to_owned(), number(end));
+                        }
                         if !cue.identifier.is_empty() {
                             entry.insert("id".to_owned(), text(&cue.identifier));
                         }
@@ -2042,15 +2048,15 @@ mod tests {
                     pb::MediaOverlayCue {
                         text_href: "OEBPS/text/chap1.xhtml#s1".to_owned(),
                         audio_href: "OEBPS/audio/ch1.mp3".to_owned(),
-                        start_time: 0.0,
-                        end_time: 12.5,
+                        start_time: Some(0.0),
+                        end_time: Some(12.5),
                         identifier: "p1".to_owned(),
                     },
                     pb::MediaOverlayCue {
                         text_href: "OEBPS/text/chap1.xhtml#s2".to_owned(),
                         audio_href: "OEBPS/audio/ch1.mp3".to_owned(),
-                        start_time: 12.5,
-                        end_time: 20.0,
+                        start_time: Some(12.5),
+                        end_time: Some(20.0),
                         identifier: "p2".to_owned(),
                     },
                 ],

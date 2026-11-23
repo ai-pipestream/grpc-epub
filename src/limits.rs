@@ -114,15 +114,46 @@ impl Default for Limits {
 
 /// Read a `u64` environment variable, falling back to `default`.
 ///
-/// A value that does not parse is ignored rather than fatal, and a zero is
-/// treated as "not set": no limit here has a meaningful zero, and silently
-/// running with an unbounded cap because of a typo is the failure mode worth
+/// A zero is treated as "not set": no limit here has a meaningful zero, and
+/// silently running with an unbounded cap is the failure mode worth
 /// designing out.
-fn env_u64(name: &str, default: u64) -> u64 {
-    match std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok()) {
-        Some(0) | None => default,
-        Some(value) => value,
+///
+/// # Errors
+///
+/// A value that is set and does not parse is an error naming the variable
+/// and its value, so a typo such as `20k` stops startup rather than running
+/// the server with a limit nobody asked for.
+pub fn env_u64(name: &str, default: u64) -> Result<u64, String> {
+    match env_whole(name, default)? {
+        0 => Ok(default),
+        value => Ok(value),
     }
+}
+
+/// Read a whole-number environment variable as written, zero included:
+/// `default` when it is unset.
+///
+/// # Errors
+///
+/// As [`env_u64`]: a value that is set and does not parse.
+pub fn env_whole(name: &str, default: u64) -> Result<u64, String> {
+    setting_u64(name, std::env::var(name), default)
+}
+
+/// Parse one setting's value as [`env_u64`] reads it.
+fn setting_u64(
+    name: &str,
+    value: Result<String, std::env::VarError>,
+    default: u64,
+) -> Result<u64, String> {
+    let raw = match value {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(default),
+        Err(std::env::VarError::NotUnicode(raw)) => raw.to_string_lossy().into_owned(),
+    };
+    raw.trim().parse::<u64>().map_err(|_| {
+        format!("{name}={raw:?} is not a whole number; unset it to use the default of {default}")
+    })
 }
 
 impl Limits {
@@ -130,49 +161,53 @@ impl Limits {
     /// falling back to the defaults above.
     ///
     /// See the README for the full list.
-    #[must_use]
-    pub fn from_env() -> Self {
+    ///
+    /// # Errors
+    ///
+    /// A variable that is set and is not a whole number, named with its
+    /// value.
+    pub fn from_env() -> Result<Self, String> {
         let defaults = Self::default();
         let max_document_mib = env_u64(
             "GRPC_EPUB_MAX_DOCUMENT_MIB",
             u64::from(DEFAULT_MAX_DOCUMENT_MIB),
-        );
+        )?;
         let max_concurrent_parses = usize::try_from(env_u64(
             "GRPC_EPUB_MAX_CONCURRENT_PARSES",
             defaults.max_concurrent_parses as u64,
-        ))
+        )?)
         .unwrap_or(defaults.max_concurrent_parses);
         // The budget follows the two settings it is derived from unless it is
         // set itself, and is never smaller than one full-size upload.
         let max_buffered_upload_mib = env_u64(
             "GRPC_EPUB_MAX_BUFFERED_UPLOAD_MIB",
             max_document_mib.saturating_mul(max_concurrent_parses as u64),
-        )
+        )?
         .max(max_document_mib);
-        Self {
+        Ok(Self {
             max_document_bytes: max_document_mib * MIB,
             max_uncompressed_bytes: env_u64(
                 "GRPC_EPUB_MAX_UNCOMPRESSED_MIB",
                 u64::from(DEFAULT_MAX_UNCOMPRESSED_MIB),
-            ) * MIB,
+            )? * MIB,
             max_entries: u32::try_from(env_u64(
                 "GRPC_EPUB_MAX_ENTRIES",
                 u64::from(DEFAULT_MAX_ENTRIES),
-            ))
+            )?)
             .unwrap_or(u32::MAX),
             max_compression_ratio: u32::try_from(env_u64(
                 "GRPC_EPUB_MAX_COMPRESSION_RATIO",
                 u64::from(DEFAULT_MAX_COMPRESSION_RATIO),
-            ))
+            )?)
             .unwrap_or(u32::MAX),
             compression_ratio_floor_bytes: env_u64(
                 "GRPC_EPUB_COMPRESSION_RATIO_FLOOR_BYTES",
                 DEFAULT_RATIO_FLOOR_BYTES,
-            ),
-            max_chunk_bytes: env_u64("GRPC_EPUB_MAX_CHUNK_BYTES", DEFAULT_MAX_CHUNK_BYTES),
+            )?,
+            max_chunk_bytes: env_u64("GRPC_EPUB_MAX_CHUNK_BYTES", DEFAULT_MAX_CHUNK_BYTES)?,
             max_concurrent_parses,
             max_buffered_upload_bytes: max_buffered_upload_mib.saturating_mul(MIB),
-        }
+        })
     }
 
     /// Resolve a caller's options against these ceilings.
@@ -280,6 +315,21 @@ impl Default for Effective {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_setting_that_does_not_parse_is_an_error_naming_it() {
+        let refused = setting_u64("GRPC_EPUB_MAX_ENTRIES", Ok("20k".to_owned()), 10_000)
+            .expect_err("a typo is not the default");
+        assert!(refused.contains("GRPC_EPUB_MAX_ENTRIES"), "{refused}");
+        assert!(refused.contains("20k"), "{refused}");
+        assert_eq!(setting_u64("X", Ok("20000".to_owned()), 10_000), Ok(20_000));
+        assert_eq!(setting_u64("X", Ok("0".to_owned()), 10_000), Ok(0));
+        assert_eq!(
+            setting_u64("X", Err(std::env::VarError::NotPresent), 7),
+            Ok(7)
+        );
+    }
+
     use super::*;
 
     #[test]
