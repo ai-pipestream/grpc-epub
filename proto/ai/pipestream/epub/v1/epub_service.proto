@@ -67,7 +67,9 @@ service EpubParseService {
   //                       anything but font obfuscation), entry encryption,
   //                       or a compression method outside store and deflate
   //   DEADLINE_EXCEEDED   no request frame arrived within the server's idle
-  //                       timeout
+  //                       timeout, or the client took no response event
+  //                       for 30 s while the book was being sent, so the
+  //                       events it did receive are not the whole book
   //   INTERNAL            a bug here; the parser panicked
   //
   // Events already delivered before a failure remain valid. They describe

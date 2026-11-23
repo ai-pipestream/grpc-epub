@@ -104,16 +104,24 @@ const MAX_QUOTED_CHARS: usize = 120;
 pub enum Outcome {
     /// A `status` trailer was delivered. The stream ends cleanly.
     Complete,
-    /// The client stopped reading. Nothing further can be said to it.
+    /// The client hung up. Nothing further can be said to it.
     Abandoned,
+    /// The client is still there but took nothing for the whole stall
+    /// window, so the book was cut short. The call must end with this
+    /// DEADLINE_EXCEEDED status: a reader that is slow rather than gone
+    /// drains what was buffered and must not then see a clean end.
+    Stalled(Box<Status>),
     /// The call must end with this gRPC status.
     Failed(Box<Status>),
 }
 
-/// Internal control flow: either the client is gone or the call has failed.
+/// Internal control flow: the client is gone, has stalled, or the call has
+/// failed.
 enum Abort {
-    /// The client stopped reading.
+    /// The client hung up.
     Gone,
+    /// The client took nothing for the whole stall window.
+    Stalled,
     /// The call must end with this status.
     Failed(Box<Status>),
 }
@@ -209,11 +217,11 @@ impl Sink {
         };
         match runtime.block_on(self.tx.send_timeout(message, self.stall)) {
             Ok(()) => Ok(()),
-            // A client that has read nothing for the whole stall window has
-            // abandoned the call. Reporting a status to it would mean sending
-            // on the channel it is not draining, so there is nothing useful
-            // left to do but free the thread.
-            Err(_) => Err(Abort::Gone),
+            Err(mpsc::error::SendTimeoutError::Closed(_)) => Err(Abort::Gone),
+            // A client that has read nothing for the whole stall window may
+            // be slow rather than gone. The thread is freed either way, and
+            // the stall is reported so the call does not end as a success.
+            Err(mpsc::error::SendTimeoutError::Timeout(_)) => Err(Abort::Stalled),
         }
     }
 }
@@ -228,6 +236,11 @@ pub fn run(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> 
     match parse(bytes, limits, metrics, sink) {
         Ok(()) => Outcome::Complete,
         Err(Abort::Gone) => Outcome::Abandoned,
+        Err(Abort::Stalled) => Outcome::Stalled(Box::new(Status::deadline_exceeded(format!(
+            "the client took no event for {} ms while the book was being sent, so the parse \
+             stopped and the events already delivered are not the whole book",
+            sink.stall.as_millis()
+        )))),
         Err(Abort::Failed(status)) => Outcome::Failed(status),
     }
 }
