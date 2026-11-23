@@ -507,7 +507,7 @@ impl DocumentFold {
         for entry in info
             .metadata
             .iter()
-            .filter(|entry| entry.element == "title")
+            .filter(|entry| reads(entry) && entry.element == "title")
         {
             let kind = refined(entry, "title-type");
             if !kind.is_empty() && kind != "main" {
@@ -516,11 +516,9 @@ impl DocumentFold {
         }
         // Sort names and roles, keyed by the name they qualify, so a consumer
         // can answer "who is the illustrator" without re-reading the OPF.
-        for entry in info
-            .metadata
-            .iter()
-            .filter(|entry| matches!(entry.element.as_str(), "creator" | "contributor"))
-        {
+        for entry in info.metadata.iter().filter(|entry| {
+            reads(entry) && matches!(entry.element.as_str(), "creator" | "contributor")
+        }) {
             let role = refined(entry, "role");
             let file_as = refined(entry, "file-as");
             if !role.is_empty() {
@@ -843,11 +841,21 @@ fn insert_text(fields: &mut HashMap<String, Value>, key: &str, value: &str) {
     }
 }
 
+/// Whether `entry` is a Dublin Core element or a package-level property,
+/// the only forms the typed readings come from. An EPUB 2 `name` meta or a
+/// vendor element can share a name with one, and a refinement that lost its
+/// target refines nothing here.
+fn reads(entry: &pb::MetadataEntry) -> bool {
+    let vendor = entry.form == pb::MetadataForm::MetaName as i32
+        || entry.form == pb::MetadataForm::OtherElement as i32;
+    !vendor && entry.refines.is_empty()
+}
+
 /// The value of the first metadata entry with this element name, or `""`.
 fn first<'a>(info: &'a pb::EpubInfo, element: &str) -> &'a str {
     info.metadata
         .iter()
-        .find(|entry| entry.element == element)
+        .find(|entry| reads(entry) && entry.element == element)
         .map_or("", |entry| entry.value.as_str())
 }
 
@@ -887,7 +895,7 @@ fn authors(info: &pb::EpubInfo) -> Vec<String> {
     let creators: Vec<&pb::MetadataEntry> = info
         .metadata
         .iter()
-        .filter(|entry| entry.element == "creator")
+        .filter(|entry| reads(entry) && entry.element == "creator")
         .collect();
     if creators.is_empty() {
         // An EPUB whose metadata tail did not survive, or a caller folding
@@ -914,7 +922,7 @@ fn credits(info: &pb::EpubInfo) -> Option<Value> {
     let entries: Vec<&pb::MetadataEntry> = info
         .metadata
         .iter()
-        .filter(|entry| matches!(entry.element.as_str(), "creator" | "contributor"))
+        .filter(|entry| reads(entry) && matches!(entry.element.as_str(), "creator" | "contributor"))
         .filter(|entry| !refined(entry, "role").is_empty() || !refined(entry, "file-as").is_empty())
         .collect();
     if entries.is_empty() {
@@ -1869,6 +1877,39 @@ mod tests {
             "dcterms:created is a claim about creation; dc:date is a claim about anything"
         );
         assert_eq!(meta.created, datetime::parse("1843-10-15T00:00:00Z"));
+    }
+
+    /// An EPUB 2 `name` meta, a vendor element or an orphaned refinement can
+    /// share a name with the Dublin Core element the fold reads, and must not
+    /// be read as it.
+    #[test]
+    fn only_dublin_core_and_property_entries_feed_the_typed_readings() {
+        let mut info = expressive_info();
+        let before = {
+            let mut fold = DocumentFold::new("0.1.0");
+            fold.consume(&pb::parse_epub_response::Event::Info(info.clone()));
+            fold.take().source_meta.expect("source meta")
+        };
+        for (form, refines) in [
+            (pb::MetadataForm::MetaName, ""),
+            (pb::MetadataForm::OtherElement, ""),
+            (pb::MetadataForm::MetaProperty, "nobody"),
+        ] {
+            for element in ["creator", "dcterms:created", "title"] {
+                info.metadata.push(pb::MetadataEntry {
+                    form: form as i32,
+                    refines: refines.to_owned(),
+                    element: element.to_owned(),
+                    value: "1999-01-01T00:00:00Z".to_owned(),
+                    ..Default::default()
+                });
+            }
+        }
+        let mut fold = DocumentFold::new("0.1.0");
+        fold.consume(&pb::parse_epub_response::Event::Info(info));
+        let after = fold.take().source_meta.expect("source meta");
+        assert_eq!(after.authors, before.authors);
+        assert_eq!(after.created_raw, before.created_raw);
     }
 
     #[test]

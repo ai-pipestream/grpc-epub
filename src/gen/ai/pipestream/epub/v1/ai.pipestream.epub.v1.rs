@@ -144,8 +144,10 @@ pub struct MetadataRefinement {
 /// opinion first, the same way EmailInfo carries its full header list.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MetadataEntry {
-    /// Local name for a Dublin Core element (`title`, `creator`, `rights`), or
-    /// the `property` for a bare EPUB 3 `<meta>` (`dcterms:modified`).
+    /// Local name for a Dublin Core element (`title`, `creator`, `rights`), the
+    /// `property` for a bare EPUB 3 `<meta>` (`dcterms:modified`), the `name`
+    /// of an EPUB 2 `<meta name content>` (`calibre:series`), or the name as
+    /// written of any other element (`calibre:custom`). `form` says which.
     #[prost(string, tag="1")]
     pub element: ::prost::alloc::string::String,
     /// The element's text content, trimmed but otherwise verbatim.
@@ -160,6 +162,18 @@ pub struct MetadataEntry {
     /// Everything refining this element, in document order.
     #[prost(message, repeated, tag="5")]
     pub refinements: ::prost::alloc::vec::Vec<MetadataRefinement>,
+    /// Which kind of OPF element this entry was read from. Two entries can
+    /// share an `element` across forms (`<dc:title>` and `<meta name="title">`),
+    /// and only DUBLIN_CORE and META_PROPERTY entries feed the scalar fields of
+    /// EpubInfo. UNSPECIFIED only from a server older than this field.
+    #[prost(enumeration="MetadataForm", tag="6")]
+    pub form: i32,
+    /// For a refining `<meta>` whose `refines` names an id no element carries,
+    /// that id, without the leading `#`. Such a refinement is kept as an entry
+    /// of its own, after every other entry, rather than dropped. Empty for
+    /// every other entry.
+    #[prost(string, tag="7")]
+    pub refines: ::prost::alloc::string::String,
 }
 /// EpubInfo is the opening event of every successful stream.
 ///
@@ -572,6 +586,52 @@ impl ResourceKind {
             "RESOURCE_KIND_AUDIO" => Some(Self::Audio),
             "RESOURCE_KIND_VIDEO" => Some(Self::Video),
             "RESOURCE_KIND_OTHER" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+/// MetadataForm is the kind of OPF element a MetadataEntry was read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MetadataForm {
+    /// Never sent by this server.
+    Unspecified = 0,
+    /// A Dublin Core element such as `<dc:title>`. `element` is its local name
+    /// and `value` its text.
+    DublinCore = 1,
+    /// An EPUB 3 `<meta property="…">`. `element` is the property and `value`
+    /// the text.
+    MetaProperty = 2,
+    /// An EPUB 2 `<meta name="…" content="…"/>`, which is how calibre records a
+    /// series and its index. `element` is `name` and `value` is `content`. The
+    /// `<meta name="cover">` convention is also read into `cover_href`.
+    MetaName = 3,
+    /// Any other element in `<metadata>`, usually a vendor's own namespace.
+    /// `element` is the name as written, prefix included, and `value` its text.
+    OtherElement = 4,
+}
+impl MetadataForm {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "METADATA_FORM_UNSPECIFIED",
+            Self::DublinCore => "METADATA_FORM_DUBLIN_CORE",
+            Self::MetaProperty => "METADATA_FORM_META_PROPERTY",
+            Self::MetaName => "METADATA_FORM_META_NAME",
+            Self::OtherElement => "METADATA_FORM_OTHER_ELEMENT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "METADATA_FORM_UNSPECIFIED" => Some(Self::Unspecified),
+            "METADATA_FORM_DUBLIN_CORE" => Some(Self::DublinCore),
+            "METADATA_FORM_META_PROPERTY" => Some(Self::MetaProperty),
+            "METADATA_FORM_META_NAME" => Some(Self::MetaName),
+            "METADATA_FORM_OTHER_ELEMENT" => Some(Self::OtherElement),
             _ => None,
         }
     }

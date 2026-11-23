@@ -191,8 +191,10 @@ message MetadataRefinement {
 // this service has no opinion about does not need this service to grow an
 // opinion first, the same way EmailInfo carries its full header list.
 message MetadataEntry {
-  // Local name for a Dublin Core element (`title`, `creator`, `rights`), or
-  // the `property` for a bare EPUB 3 `<meta>` (`dcterms:modified`).
+  // Local name for a Dublin Core element (`title`, `creator`, `rights`), the
+  // `property` for a bare EPUB 3 `<meta>` (`dcterms:modified`), the `name`
+  // of an EPUB 2 `<meta name content>` (`calibre:series`), or the name as
+  // written of any other element (`calibre:custom`). `form` says which.
   string element = 1;
 
   // The element's text content, trimmed but otherwise verbatim.
@@ -206,6 +208,41 @@ message MetadataEntry {
 
   // Everything refining this element, in document order.
   repeated MetadataRefinement refinements = 5;
+
+  // Which kind of OPF element this entry was read from. Two entries can
+  // share an `element` across forms (`<dc:title>` and `<meta name="title">`),
+  // and only DUBLIN_CORE and META_PROPERTY entries feed the scalar fields of
+  // EpubInfo. UNSPECIFIED only from a server older than this field.
+  MetadataForm form = 6;
+
+  // For a refining `<meta>` whose `refines` names an id no element carries,
+  // that id, without the leading `#`. Such a refinement is kept as an entry
+  // of its own, after every other entry, rather than dropped. Empty for
+  // every other entry.
+  string refines = 7;
+}
+
+// MetadataForm is the kind of OPF element a MetadataEntry was read from.
+enum MetadataForm {
+  // Never sent by this server.
+  METADATA_FORM_UNSPECIFIED = 0;
+
+  // A Dublin Core element such as `<dc:title>`. `element` is its local name
+  // and `value` its text.
+  METADATA_FORM_DUBLIN_CORE = 1;
+
+  // An EPUB 3 `<meta property="…">`. `element` is the property and `value`
+  // the text.
+  METADATA_FORM_META_PROPERTY = 2;
+
+  // An EPUB 2 `<meta name="…" content="…"/>`, which is how calibre records a
+  // series and its index. `element` is `name` and `value` is `content`. The
+  // `<meta name="cover">` convention is also read into `cover_href`.
+  METADATA_FORM_META_NAME = 3;
+
+  // Any other element in `<metadata>`, usually a vendor's own namespace.
+  // `element` is the name as written, prefix included, and `value` its text.
+  METADATA_FORM_OTHER_ELEMENT = 4;
 }
 
 // EpubInfo is the opening event of every successful stream.

@@ -144,8 +144,12 @@ pub struct Refinement {
 /// first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MetaEntry {
-    /// Local name for a Dublin Core element (`title`, `rights`), or the
-    /// `property` for a bare EPUB 3 `<meta>` (`dcterms:modified`).
+    /// Which kind of OPF element this was read from.
+    pub form: MetaForm,
+    /// Local name for a Dublin Core element (`title`, `rights`), the
+    /// `property` for a bare EPUB 3 `<meta>` (`dcterms:modified`), the `name`
+    /// for an EPUB 2 `<meta name content>`, or the name as written for any
+    /// other element (`calibre:custom`).
     pub element: String,
     /// The element's text content, verbatim and trimmed.
     pub value: String,
@@ -155,6 +159,23 @@ pub struct MetaEntry {
     pub scheme: String,
     /// Everything refining this element, in document order.
     pub refinements: Vec<Refinement>,
+    /// For a refinement whose target no element carries, the id it refines.
+    /// Such a refinement is kept as an entry of its own rather than dropped.
+    pub refines: String,
+}
+
+/// The kinds of element `<metadata>` holds, as [`MetaEntry::form`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MetaForm {
+    /// A Dublin Core element: `<dc:title>`, `<dc:creator>`.
+    #[default]
+    DublinCore,
+    /// An EPUB 3 `<meta property="…">`, refining or package-level.
+    MetaProperty,
+    /// An EPUB 2 `<meta name="…" content="…"/>`. The value is `content`.
+    MetaName,
+    /// Any other element, such as a vendor's own namespace.
+    OtherElement,
 }
 
 impl MetaEntry {
@@ -658,26 +679,42 @@ impl PackageParser {
     /// Handle a start tag inside `<metadata>`.
     fn open_metadata(&mut self, start: &BytesStart<'_>, name: &str, empty: bool) {
         let pending = if name == "meta" {
-            // EPUB 2's cover convention. EPUB 3 uses a manifest property
-            // instead, which the manifest arm already collects.
-            if attribute(start, "name").eq_ignore_ascii_case("cover") {
-                let content = attribute(start, "content");
-                if !content.is_empty() && self.package.metadata.cover_id.is_empty() {
-                    self.package.metadata.cover_id = content;
-                }
-                return;
-            }
             // EPUB 3's `<meta property="…">`, which is both the refinement
             // mechanism and the home of package-level properties such as
-            // `dcterms:modified`. A `<meta>` with neither `name` nor
-            // `property` says nothing anyone can read.
+            // `dcterms:modified`.
             let property = attribute(start, "property");
             if property.is_empty() {
+                // EPUB 2's `<meta name="…" content="…"/>`. The value is an
+                // attribute, so the entry is complete at the start tag.
+                // A `<meta>` with neither `name` nor `property` says nothing
+                // anyone can read.
+                let meta_name = attribute(start, "name");
+                if meta_name.is_empty() {
+                    return;
+                }
+                let content = attribute(start, "content");
+                // EPUB 2's cover convention. EPUB 3 uses a manifest property
+                // instead, which the manifest arm already collects.
+                if meta_name.eq_ignore_ascii_case("cover")
+                    && !content.is_empty()
+                    && self.package.metadata.cover_id.is_empty()
+                {
+                    self.package.metadata.cover_id.clone_from(&content);
+                }
+                self.package.metadata.entries.push(MetaEntry {
+                    form: MetaForm::MetaName,
+                    element: meta_name,
+                    value: content,
+                    id: attribute(start, "id"),
+                    scheme: attribute(start, "scheme"),
+                    ..MetaEntry::default()
+                });
                 return;
             }
             Pending {
                 local: name.to_owned(),
                 entry: MetaEntry {
+                    form: MetaForm::MetaProperty,
                     element: property,
                     id: attribute(start, "id"),
                     scheme: attribute(start, "scheme"),
@@ -687,7 +724,22 @@ impl PackageParser {
                     .trim_start_matches('#')
                     .to_owned(),
             }
-        } else if DUBLIN_CORE.contains(&name) {
+        } else if !DUBLIN_CORE.contains(&name) {
+            // Anything else a producer put in `<metadata>`, a vendor's own
+            // namespace most often. Kept under the name as written, because
+            // that is the only name it has here.
+            Pending {
+                local: name.to_owned(),
+                entry: MetaEntry {
+                    form: MetaForm::OtherElement,
+                    element: start.name().as_ref().to_owned(),
+                    id: attribute(start, "id"),
+                    scheme: attribute(start, "scheme"),
+                    ..MetaEntry::default()
+                },
+                refines: String::new(),
+            }
+        } else {
             Pending {
                 local: name.to_owned(),
                 entry: MetaEntry {
@@ -703,8 +755,6 @@ impl PackageParser {
                 },
                 refines: String::new(),
             }
-        } else {
-            return;
         };
 
         self.text.take();
@@ -773,6 +823,17 @@ impl PackageParser {
                 .find(|entry| entry.id == target)
             {
                 entry.refinements.push(refinement);
+            } else {
+                // Nothing carries the id it refines. It is still something
+                // the OPF said, so it is kept, naming the id it was for.
+                self.package.metadata.entries.push(MetaEntry {
+                    form: MetaForm::MetaProperty,
+                    element: refinement.property,
+                    value: refinement.value,
+                    scheme: refinement.scheme,
+                    refines: target,
+                    ..MetaEntry::default()
+                });
             }
         }
         derive(&mut self.package.metadata);
@@ -800,18 +861,26 @@ fn epub2_refinements(start: &BytesStart<'_>) -> Vec<Refinement> {
 /// which is the reading every EPUB reader implements for a book that declares
 /// two publishers.
 fn derive(metadata: &mut Metadata) {
+    /// Whether `entry` is the Dublin Core element or package-level property
+    /// `element`. A `name` meta or a vendor element that happens to share
+    /// the name is not, and neither is a refinement that lost its target.
+    fn reads(entry: &MetaEntry, element: &str) -> bool {
+        entry.element == element
+            && matches!(entry.form, MetaForm::DublinCore | MetaForm::MetaProperty)
+            && entry.refines.is_empty()
+    }
     /// The first entry with this element name, or `""`.
     fn first<'a>(entries: &'a [MetaEntry], element: &str) -> &'a str {
         entries
             .iter()
-            .find(|entry| entry.element == element)
+            .find(|entry| reads(entry, element))
             .map_or("", |entry| entry.value.as_str())
     }
     /// Every value with this element name, in document order.
     fn every(entries: &[MetaEntry], element: &str) -> Vec<String> {
         entries
             .iter()
-            .filter(|entry| entry.element == element)
+            .filter(|entry| reads(entry, element))
             .map(|entry| entry.value.clone())
             .collect()
     }
@@ -819,7 +888,7 @@ fn derive(metadata: &mut Metadata) {
     fn credited(entries: &[MetaEntry], element: &str) -> Vec<Contributor> {
         entries
             .iter()
-            .filter(|entry| entry.element == element)
+            .filter(|entry| reads(entry, element))
             .map(|entry| Contributor {
                 name: entry.value.clone(),
                 role: entry.refined("role").to_owned(),
@@ -832,7 +901,7 @@ fn derive(metadata: &mut Metadata) {
 
     metadata.titles = entries
         .iter()
-        .filter(|entry| entry.element == "title")
+        .filter(|entry| reads(entry, "title"))
         .map(|entry| Title {
             value: entry.value.clone(),
             title_type: entry.refined("title-type").to_owned(),
@@ -855,7 +924,7 @@ fn derive(metadata: &mut Metadata) {
     metadata.subjects = every(&entries, "subject");
     metadata.identifiers = entries
         .iter()
-        .filter(|entry| entry.element == "identifier")
+        .filter(|entry| reads(entry, "identifier"))
         .map(|entry| Identifier {
             value: entry.value.clone(),
             id: entry.id.clone(),
@@ -959,6 +1028,69 @@ mod tests {
     <itemref idref="ch2" linear="no"/>
   </spine>
 </package>"#;
+
+    /// `EpubInfo.metadata` promises every metadata element the OPF declared.
+    /// Three kinds used to be dropped with no word: EPUB 2 `name`/`content`
+    /// metas (calibre's series among them), elements outside Dublin Core, and
+    /// refinements of an id nothing carries.
+    #[test]
+    fn every_metadata_element_is_kept_whatever_its_form() {
+        let opf = br##"<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:calibre="http://calibre.kovidgoyal.net/2009/metadata">
+    <dc:title id="t">The Real Title</dc:title>
+    <dc:identifier id="id">urn:uuid:1</dc:identifier>
+    <meta name="cover" content="cover-img"/>
+    <meta name="calibre:series" content="Chronicles"/>
+    <meta name="calibre:series_index" content="2"/>
+    <meta name="title" content="Not the title"/>
+    <calibre:custom id="c">kept &amp; verbatim</calibre:custom>
+    <meta property="title-type" refines="#t">main</meta>
+    <meta property="role" refines="#nobody" scheme="marc:relators">aut</meta>
+  </metadata>
+  <manifest><item id="ch1" href="c1.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"##;
+        let package = parse_package(opf).unwrap();
+        let metadata = &package.metadata;
+        let rows: Vec<(MetaForm, &str, &str, &str)> = metadata
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.form,
+                    entry.element.as_str(),
+                    entry.value.as_str(),
+                    entry.refines.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (MetaForm::DublinCore, "title", "The Real Title", ""),
+                (MetaForm::DublinCore, "identifier", "urn:uuid:1", ""),
+                (MetaForm::MetaName, "cover", "cover-img", ""),
+                (MetaForm::MetaName, "calibre:series", "Chronicles", ""),
+                (MetaForm::MetaName, "calibre:series_index", "2", ""),
+                (MetaForm::MetaName, "title", "Not the title", ""),
+                (
+                    MetaForm::OtherElement,
+                    "calibre:custom",
+                    "kept & verbatim",
+                    ""
+                ),
+                (MetaForm::MetaProperty, "role", "aut", "nobody"),
+            ]
+        );
+        // The refinement that found its target is attached, not repeated.
+        assert_eq!(metadata.entries[0].refined("title-type"), "main");
+        // An unmatched refinement keeps its scheme.
+        assert_eq!(metadata.entries[7].scheme, "marc:relators");
+        // A `name` meta is not read as the Dublin Core element it shares a
+        // name with, and the cover convention still works.
+        assert_eq!(metadata.title, "The Real Title");
+        assert_eq!(metadata.cover_id, "cover-img");
+    }
 
     #[test]
     fn container_yields_the_opf_path() {
