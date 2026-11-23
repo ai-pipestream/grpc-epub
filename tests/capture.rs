@@ -602,3 +602,136 @@ async fn the_build_advertises_what_it_can_now_read() {
         );
     }
 }
+
+/// A navigation document that breaks part way through used to arrive as a
+/// shorter outline with nothing to say it was cut. The outline still carries
+/// what came before the break, and the trailer now says it is incomplete.
+#[tokio::test]
+async fn a_navigation_document_that_breaks_part_way_is_reported_incomplete() {
+    let broken_nav = common::nav_xhtml().replace(
+        "<ol><li><a href=\"text/chap2.xhtml#part2\">",
+        "<!x><ol><li><a href=\"text/chap2.xhtml#part2\">",
+    );
+    assert_ne!(broken_nav, common::nav_xhtml(), "the fixture changed shape");
+    let book = common::shell()
+        .add(
+            common::OPF_PATH,
+            common::opf_xml(
+                &[("ch1", "text/chap1.xhtml"), ("ch2", "text/chap2.xhtml")],
+                &[
+                    ("cover-img", "images/cover.png", "image/png", "cover-image"),
+                    ("nav", "nav.xhtml", "application/xhtml+xml", "nav"),
+                ],
+            ),
+        )
+        .add(common::NAV, broken_nav)
+        .add(
+            common::CHAP1,
+            common::chapter_xhtml("Chapter One", "The first chapter."),
+        )
+        .add(
+            common::CHAP2,
+            common::chapter_xhtml("Chapter Two", "The second chapter."),
+        )
+        .add(common::COVER, common::IMAGE)
+        .build();
+
+    let harness = common::start().await;
+    let events = harness.parse_ok(&book).await;
+    let navigation = common::navigation(&events).expect("a navigation event");
+    assert_eq!(
+        navigation.toc.len(),
+        1,
+        "the entry before the break is kept"
+    );
+    assert!(
+        navigation.toc[0].children.is_empty(),
+        "the nested entry after the break is not"
+    );
+
+    let incomplete: Vec<&pb::ParseWarning> = common::status(&events)
+        .warnings
+        .iter()
+        .filter(|warning| warning.code == pb::ParseWarningCode::IncompleteStructure as i32)
+        .collect();
+    assert_eq!(
+        incomplete.len(),
+        1,
+        "{:?}",
+        common::status(&events).warnings
+    );
+    assert_eq!(incomplete[0].href, common::NAV);
+    assert!(
+        incomplete[0].message.contains("at byte"),
+        "{}",
+        incomplete[0].message
+    );
+
+    // The sound book reports nothing of the kind.
+    let sound = harness.parse_ok(&common::with_nav()).await;
+    assert!(
+        !common::status(&sound)
+            .warnings
+            .iter()
+            .any(|warning| warning.code == pb::ParseWarningCode::IncompleteStructure as i32)
+    );
+}
+
+/// The same for a media overlay: the cues before the break go out, and the
+/// trailer says the narration alignment is incomplete.
+#[tokio::test]
+async fn a_media_overlay_that_breaks_part_way_is_reported_incomplete() {
+    let broken_smil = common::smil_xml().replace("<par id=\"p2\">", "<!x><par id=\"p2\">");
+    assert_ne!(broken_smil, common::smil_xml(), "the fixture changed shape");
+    let manifest = "\
+    <item id=\"ch1\" href=\"text/chap1.xhtml\" media-type=\"application/xhtml+xml\" \
+     media-overlay=\"ov1\"/>\n\
+    <item id=\"ch2\" href=\"text/chap2.xhtml\" media-type=\"application/xhtml+xml\"/>\n\
+    <item id=\"ov1\" href=\"overlays/chap1.smil\" media-type=\"application/smil+xml\"/>\n";
+    let book = common::shell()
+        .add(
+            common::OPF_PATH,
+            common::package(
+                manifest,
+                "    <itemref idref=\"ch1\"/>\n    <itemref idref=\"ch2\"/>\n",
+            ),
+        )
+        .add(common::OVERLAY, broken_smil)
+        .add(
+            common::CHAP1,
+            common::chapter_xhtml("Chapter One", "The first chapter."),
+        )
+        .add(
+            common::CHAP2,
+            common::chapter_xhtml("Chapter Two", "The second chapter."),
+        )
+        .build();
+
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &book,
+            pb::ParseOptions {
+                parse_media_overlays: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the book should parse");
+    let overlays = common::overlays(&events);
+    assert_eq!(overlays.len(), 1);
+    assert_eq!(
+        overlays[0].cues.len(),
+        1,
+        "the cue before the break is kept"
+    );
+    let status = common::status(&events);
+    assert!(
+        status.warnings.iter().any(|warning| {
+            warning.code == pb::ParseWarningCode::IncompleteStructure as i32
+                && warning.href == common::OVERLAY
+        }),
+        "{:?}",
+        status.warnings
+    );
+}

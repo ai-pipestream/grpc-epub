@@ -612,6 +612,14 @@ pub enum ParseWarningCode {
     /// not a path anyone should resolve. A backslash is not such a name: it is
     /// read as the separator a Windows zip tool meant.
     UnusableEntryName = 6,
+    /// A navigation document, NCX or media overlay stopped being readable part
+    /// way through, so the `navigation` or `media_overlay` event sent for it
+    /// holds only what came before the break: the entries or cues after it are
+    /// missing. `href` names the file, and `message` says why the read stopped
+    /// (the XML error, or the cue cap) and at which byte. A file that yielded
+    /// nothing at all before breaking is reported as METADATA instead, and no
+    /// event is sent for it.
+    IncompleteStructure = 7,
 }
 impl ParseWarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -627,6 +635,7 @@ impl ParseWarningCode {
             Self::Metadata => "PARSE_WARNING_CODE_METADATA",
             Self::ObfuscatedResource => "PARSE_WARNING_CODE_OBFUSCATED_RESOURCE",
             Self::UnusableEntryName => "PARSE_WARNING_CODE_UNUSABLE_ENTRY_NAME",
+            Self::IncompleteStructure => "PARSE_WARNING_CODE_INCOMPLETE_STRUCTURE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -639,6 +648,7 @@ impl ParseWarningCode {
             "PARSE_WARNING_CODE_METADATA" => Some(Self::Metadata),
             "PARSE_WARNING_CODE_OBFUSCATED_RESOURCE" => Some(Self::ObfuscatedResource),
             "PARSE_WARNING_CODE_UNUSABLE_ENTRY_NAME" => Some(Self::UnusableEntryName),
+            "PARSE_WARNING_CODE_INCOMPLETE_STRUCTURE" => Some(Self::IncompleteStructure),
             _ => None,
         }
     }

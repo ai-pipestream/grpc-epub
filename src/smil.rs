@@ -73,6 +73,10 @@ pub struct Overlay {
     pub source_href: String,
     /// Every cue, in document order.
     pub cues: Vec<Cue>,
+    /// Why the read stopped before the end of the document, when it did: the
+    /// XML error it stopped on, or the cue cap. The cues before it are kept
+    /// in `cues`, and the ones after it are missing.
+    pub broken_at: Option<String>,
 }
 
 impl Overlay {
@@ -196,11 +200,20 @@ pub fn parse_overlay(bytes: &[u8], source_href: &str) -> Overlay {
     let mut overlay = Overlay {
         source_href: source_href.to_owned(),
         cues: Vec::new(),
+        broken_at: None,
     };
     let mut current: Option<Cue> = None;
 
-    // A malformed overlay costs the cues past the break and nothing else.
-    while let Ok(event) = reader.read_event_into(&mut buf) {
+    // A malformed overlay costs the cues past the break and nothing else,
+    // and the break is kept so the caller is told the cues are not all there.
+    loop {
+        let event = match reader.read_event_into(&mut buf) {
+            Ok(event) => event,
+            Err(err) => {
+                overlay.broken_at = Some(crate::nav::read_error(&reader, &err));
+                break;
+            }
+        };
         match event {
             // `<text>` and `<audio>` are empty elements and `<par>` is not, so
             // both start forms have to reach the same arms.
@@ -248,6 +261,10 @@ pub fn parse_overlay(bytes: &[u8], source_href: &str) -> Overlay {
             _ => {}
         }
         if overlay.cues.len() >= MAX_CUES {
+            overlay.broken_at = Some(format!(
+                "stopped at the cap of {MAX_CUES} cues (at byte {})",
+                reader.buffer_position()
+            ));
             break;
         }
         buf.clear();
@@ -275,6 +292,23 @@ fn push(cues: &mut Vec<Cue>, cue: Cue) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An overlay with an XML error after its first cue. Before the fix the
+    /// one cue came back as the whole narration.
+    #[test]
+    fn an_overlay_that_breaks_part_way_says_where() {
+        let smil = br#"<smil><body><seq>
+            <par id="p1"><text src="c1.xhtml#s1"/><audio src="a.mp3" clipBegin="0s" clipEnd="5s"/></par>
+            <!x>
+            <par id="p2"><text src="c1.xhtml#s2"/><audio src="a.mp3" clipBegin="5s" clipEnd="9s"/></par>
+        </seq></body></smil>"#;
+        let overlay = parse_overlay(smil, "OEBPS/smil/c1.smil");
+        assert_eq!(overlay.cues.len(), 1);
+        assert!(overlay.broken_at.is_some());
+
+        let whole = parse_overlay(SMIL, "OEBPS/smil/c1.smil");
+        assert_eq!(whole.broken_at, None);
+    }
 
     const SMIL: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 <smil xmlns="http://www.w3.org/ns/SMIL" xmlns:epub="http://www.idpf.org/2007/ops" version="3.0">
