@@ -266,7 +266,7 @@ impl pb::epub_parse_service_server::EpubParseService for EpubGrpc {
                     metrics.parse_failed();
                     None
                 }
-                Ok(Outcome::Failed(status)) => {
+                Ok(Outcome::Stalled(status) | Outcome::Failed(status)) => {
                     metrics.parse_failed();
                     Some(*status)
                 }
@@ -275,13 +275,16 @@ impl pb::epub_parse_service_server::EpubParseService for EpubGrpc {
                     Some(Status::internal(panic_detail(join)))
                 }
             };
-            if let Some(status) = status {
-                let _ = supervisor.send(Err(status)).await;
-            }
             drop(permit);
             // The parse thread has returned and dropped the upload with it,
             // so its share of the budget is free again.
             drop(upload);
+            // Freed first: a stalled client may never make room for the
+            // status, and the slot and the budget must not wait on it. Only
+            // this small task does, and only for one more stall window.
+            if let Some(status) = status {
+                let _ = supervisor.send_timeout(Err(status), CONSUMER_STALL).await;
+            }
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))

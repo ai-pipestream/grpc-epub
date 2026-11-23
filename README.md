@@ -190,7 +190,7 @@ Events already delivered stay valid.
 | `RESOURCE_EXHAUSTED` | upload, entry count, total inflated size or an entry's compression ratio over its cap, or the server already holding as much upload as its process-wide budget allows |
 | `INVALID_ARGUMENT` | not a ZIP, truncated, or an EPUB whose `container.xml`, OPF or spine is missing or unusable, a spine href that escapes the archive included |
 | `UNIMPLEMENTED` | a ZIP that is not an EPUB, or one this build cannot open: DRM, entry encryption, or a compression method outside store and deflate |
-| `DEADLINE_EXCEEDED` | no request frame arrived within the idle timeout, or the whole upload was not in within the upload timeout |
+| `DEADLINE_EXCEEDED` | no request frame arrived within the idle timeout, the whole upload was not in within the upload timeout, or the client took no response event for 30 s while the book was being sent (the events it did receive are not the whole book) |
 | `INTERNAL` | a bug here; the parser panicked |
 
 `grpc.health.v1.Health` is registered and reports

@@ -262,3 +262,54 @@ async fn dropping_the_stream_early_frees_the_parser() {
         "the parser finished the whole book for a client that had gone away"
     );
 }
+
+/// A reader that stops taking events for longer than the stall window must
+/// not be told the book ended cleanly.
+///
+/// Before the fix the parser gave up exactly as it does for a client that has
+/// gone, the stream ended with gRPC OK, and a slow but live reader that came
+/// back drained the buffered chapters and saw a successful, shorter book. The
+/// outcome now names the stall, and the service turns it into
+/// DEADLINE_EXCEEDED.
+#[tokio::test]
+async fn a_reader_that_stalls_past_the_window_is_not_reported_as_gone() {
+    let archive = common::long_book(CHAPTERS, CHAPTER_BYTES);
+    let metrics = Metrics::new();
+    let (tx, mut rx) = mpsc::channel(1);
+    let parser = tokio::task::spawn_blocking(move || {
+        let sink = Sink::new(tx, Duration::from_millis(100), None);
+        extract::run(&archive, &Effective::default(), &metrics, &sink)
+    });
+
+    // Take `info`, then read nothing until the parser has given up.
+    rx.recv()
+        .await
+        .expect("a stream always opens")
+        .expect("no error");
+    let outcome = parser.await.expect("the parser thread");
+    let extract::Outcome::Stalled(status) = outcome else {
+        panic!("a stalled reader must be reported as stalled, got {outcome:?}");
+    };
+    assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+    assert!(status.message().contains("100 ms"), "{}", status.message());
+    drop(rx);
+}
+
+/// A reader that has gone is still just gone: there is nobody to tell.
+#[tokio::test]
+async fn a_reader_that_hangs_up_is_reported_as_gone() {
+    let archive = common::long_book(CHAPTERS, CHAPTER_BYTES);
+    let metrics = Metrics::new();
+    let (tx, rx) = mpsc::channel(1);
+    drop(rx);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let sink = Sink::new(tx, Duration::from_secs(10), None);
+        extract::run(&archive, &Effective::default(), &metrics, &sink)
+    })
+    .await
+    .expect("the parser thread");
+    assert!(
+        matches!(outcome, extract::Outcome::Abandoned),
+        "{outcome:?}"
+    );
+}
