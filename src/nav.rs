@@ -79,6 +79,10 @@ pub struct Navigation {
     pub toc: Vec<NavPoint>,
     /// Whether this came from an EPUB 2 NCX rather than a nav document.
     pub from_ncx: bool,
+    /// The XML error the read stopped on, when it stopped before the end of
+    /// the document. The entries read before it are kept in `toc`, and the
+    /// ones after it are missing.
+    pub broken_at: Option<String>,
 }
 
 impl Navigation {
@@ -208,6 +212,7 @@ pub fn parse_nav(bytes: &[u8], source_href: &str) -> Navigation {
         source_href: source_href.to_owned(),
         toc: Vec::new(),
         from_ncx: false,
+        broken_at: None,
     };
     // Which `<nav>` the parser is inside, if any. A nav document holds several
     // and only the `toc` one is wanted; `epub:type` is the discriminator, and
@@ -225,10 +230,18 @@ pub fn parse_nav(bytes: &[u8], source_href: &str) -> Navigation {
     let mut label = Text::default();
     let mut entries = 0usize;
 
-    // A malformed nav document costs the book its outline and nothing else.
-    // Whatever was read before the error is kept: a truncated table of
-    // contents is more useful than none.
-    while let Ok(event) = reader.read_event_into(&mut buf) {
+    // A malformed nav document costs the book the rest of its outline and
+    // nothing else. Whatever was read before the error is kept, because a
+    // truncated table of contents is more useful than none, and the error is
+    // kept with it so the caller is told the outline is not whole.
+    loop {
+        let event = match reader.read_event_into(&mut buf) {
+            Ok(event) => event,
+            Err(err) => {
+                navigation.broken_at = Some(read_error(&reader, &err));
+                break;
+            }
+        };
         match event {
             Event::Start(start) => {
                 depth += 1;
@@ -330,8 +343,17 @@ pub fn parse_ncx(bytes: &[u8], source_href: &str) -> Navigation {
     let mut label = Text::default();
     let mut entries = 0usize;
 
-    // Same policy as the nav document: read as far as the bytes allow.
-    while let Ok(event) = reader.read_event_into(&mut buf) {
+    // Same policy as the nav document: read as far as the bytes allow, and
+    // say where they stopped allowing it.
+    let mut broken_at = None;
+    loop {
+        let event = match reader.read_event_into(&mut buf) {
+            Ok(event) => event,
+            Err(err) => {
+                broken_at = Some(read_error(&reader, &err));
+                break;
+            }
+        };
         match event {
             // `<content src="…"/>` is an empty element and `<navPoint>` is
             // not, so the two arms differ only in whether they open a level.
@@ -412,7 +434,13 @@ pub fn parse_ncx(bytes: &[u8], source_href: &str) -> Navigation {
         source_href: source_href.to_owned(),
         toc: nest(roots),
         from_ncx: true,
+        broken_at,
     }
+}
+
+/// Describe a read error with the byte offset it was found at.
+pub(crate) fn read_error(reader: &Reader<&[u8]>, err: &quick_xml::Error) -> String {
+    format!("{err} (at byte {})", reader.error_position())
 }
 
 /// Renumber depths after the tree is built.
@@ -437,6 +465,42 @@ fn nest(mut roots: Vec<NavPoint>) -> Vec<NavPoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A nav document with an XML error after its second entry. Before the
+    /// fix the outline came back with two entries and nothing to say there
+    /// were more.
+    #[test]
+    fn a_nav_document_that_breaks_part_way_says_where() {
+        let nav = br#"<html><body><nav epub:type="toc"><ol>
+            <li><a href="c1.xhtml">One</a></li>
+            <li><a href="c2.xhtml">Two</a></li>
+            <!x>
+            <li><a href="c3.xhtml">Three</a></li>
+        </ol></nav></body></html>"#;
+        let navigation = parse_nav(nav, "OEBPS/nav.xhtml");
+        assert_eq!(
+            navigation.toc.len(),
+            2,
+            "what came before the error is kept"
+        );
+        let broken = navigation.broken_at.expect("the break is reported");
+        assert!(broken.contains("at byte"), "{broken}");
+
+        let whole = parse_nav(NAV, "OEBPS/nav.xhtml");
+        assert_eq!(whole.broken_at, None, "a sound document reports no break");
+    }
+
+    #[test]
+    fn an_ncx_that_breaks_part_way_says_where() {
+        let ncx = br#"<ncx><navMap>
+            <navPoint id="a"><navLabel><text>One</text></navLabel><content src="c1.xhtml"/></navPoint>
+            <!x>
+            <navPoint id="b"><navLabel><text>Two</text></navLabel><content src="c2.xhtml"/></navPoint>
+        </navMap></ncx>"#;
+        let navigation = parse_ncx(ncx, "OEBPS/toc.ncx");
+        assert_eq!(navigation.toc.len(), 1);
+        assert!(navigation.broken_at.is_some());
+    }
 
     const NAV: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">

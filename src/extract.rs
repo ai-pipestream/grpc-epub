@@ -893,9 +893,27 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             warnings.push(
                 pb::ParseWarningCode::Metadata,
                 &target.path,
-                "the navigation document named no entries this server could read",
+                match &parsed.broken_at {
+                    Some(broken) => {
+                        format!("the navigation document broke before naming any entry: {broken}")
+                    }
+                    None => {
+                        "the navigation document named no entries this server could read".to_owned()
+                    }
+                },
             );
         } else {
+            if let Some(broken) = &parsed.broken_at {
+                warnings.push(
+                    pb::ParseWarningCode::IncompleteStructure,
+                    &target.path,
+                    format!(
+                        "the navigation document stopped being readable part way through, so \
+                         the outline holds only the {} entries before the break: {broken}",
+                        parsed.flatten().len()
+                    ),
+                );
+            }
             sink.emit(pb::parse_epub_response::Event::Navigation(pb::Navigation {
                 source_href: parsed.source_href.clone(),
                 toc: parsed.toc.iter().map(nav_point).collect(),
@@ -928,9 +946,27 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
                 warnings.push(
                     pb::ParseWarningCode::Metadata,
                     &path,
-                    "the media overlay declared no cues this server could read",
+                    match &parsed.broken_at {
+                        Some(broken) => {
+                            format!("the media overlay broke before declaring any cue: {broken}")
+                        }
+                        None => {
+                            "the media overlay declared no cues this server could read".to_owned()
+                        }
+                    },
                 );
                 continue;
+            }
+            if let Some(broken) = &parsed.broken_at {
+                warnings.push(
+                    pb::ParseWarningCode::IncompleteStructure,
+                    &path,
+                    format!(
+                        "the media overlay stopped being readable part way through, so it \
+                         holds only the {} cues before the break: {broken}",
+                        parsed.cues.len()
+                    ),
+                );
             }
             sink.emit(pb::parse_epub_response::Event::MediaOverlay(
                 pb::MediaOverlay {
