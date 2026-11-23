@@ -37,6 +37,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 
 use crate::href::{self, Target};
+use crate::opf::Text;
 
 /// Largest number of entries read from one navigation document.
 ///
@@ -221,7 +222,7 @@ pub fn parse_nav(bytes: &[u8], source_href: &str) -> Navigation {
     // list item. Nesting comes from `<ol>`/`<li>`, never from these: an
     // anchor closes before the sublist that follows it opens.
     let mut in_label = false;
-    let mut label = String::new();
+    let mut label = Text::default();
     let mut entries = 0usize;
 
     // A malformed nav document costs the book its outline and nothing else.
@@ -268,16 +269,16 @@ pub fn parse_nav(bytes: &[u8], source_href: &str) -> Navigation {
                     _ => {}
                 }
             }
-            Event::Text(text) if in_label => {
-                label.push_str(text.as_ref());
-            }
+            Event::Text(text) if in_label => label.push_text(text.as_ref()),
+            Event::CData(data) if in_label => label.push_text(data.as_ref()),
+            Event::GeneralRef(reference) if in_label => label.push_ref(&reference),
             Event::End(end) => {
                 if in_label && matches!(end.local_name().as_ref(), "a" | "span") {
                     in_label = false;
+                    let text = label.take();
                     if let Some(open) = stack.last_mut() {
-                        open.point.label = collapse(&label);
+                        open.point.label = collapse(&text);
                     }
-                    label.clear();
                 }
                 if let Some(open) = stack.pop_if(|open| open.depth == depth)
                     && entries < MAX_ENTRIES
@@ -326,7 +327,7 @@ pub fn parse_ncx(bytes: &[u8], source_href: &str) -> Navigation {
     let mut in_map = false;
     let mut map_depth = 0usize;
     let mut in_text = false;
-    let mut label = String::new();
+    let mut label = Text::default();
     let mut entries = 0usize;
 
     // Same policy as the nav document: read as far as the bytes allow.
@@ -376,18 +377,18 @@ pub fn parse_ncx(bytes: &[u8], source_href: &str) -> Navigation {
                     _ => {}
                 }
             }
-            Event::Text(text) if in_text => {
-                label.push_str(text.as_ref());
-            }
+            Event::Text(text) if in_text => label.push_text(text.as_ref()),
+            Event::CData(data) if in_text => label.push_text(data.as_ref()),
+            Event::GeneralRef(reference) if in_text => label.push_ref(&reference),
             Event::End(end) => {
                 if end.local_name().as_ref() == "text" && in_text {
                     in_text = false;
+                    let text = label.take();
                     if let Some(open) = stack.last_mut()
                         && open.point.label.is_empty()
                     {
-                        open.point.label = collapse(&label);
+                        open.point.label = collapse(&text);
                     }
-                    label.clear();
                 }
                 if let Some(open) = stack.pop_if(|open| open.depth == depth)
                     && entries < MAX_ENTRIES
@@ -593,6 +594,63 @@ mod tests {
                 point.label
             );
         }
+    }
+
+    #[test]
+    fn nav_labels_keep_references_and_cdata() {
+        // A reference arrives as its own event, not inside the text around
+        // it: a label reader that takes text alone loses every one of them.
+        let nav = br#"<html><body><nav epub:type="toc"><ol>
+            <li><a href="c1.xhtml">Crime &amp; Punishment</a></li>
+            <li><a href="c2.xhtml">Caf&#233; &#x2014; menu</a></li>
+            <li><a href="c3.xhtml"><![CDATA[Q & A]]></a></li>
+            <li><a href="c4.xhtml">Tom&nbsp;Jones</a></li>
+        </ol></nav></body></html>"#;
+        let navigation = parse_nav(nav, "OEBPS/nav.xhtml");
+        let labels: Vec<&str> = navigation
+            .toc
+            .iter()
+            .map(|point| point.label.as_str())
+            .collect();
+        // The last is an entity only a DTD could resolve, and no DTD is ever
+        // consulted: it stays as written, as it does in the OPF.
+        assert_eq!(
+            labels,
+            [
+                "Crime & Punishment",
+                "Caf\u{e9} \u{2014} menu",
+                "Q & A",
+                "Tom&nbsp;Jones"
+            ]
+        );
+    }
+
+    #[test]
+    fn ncx_labels_keep_references_and_cdata() {
+        let ncx = br#"<ncx><navMap>
+            <navPoint id="a" playOrder="1">
+                <navLabel><text>Crime &amp; Punishment</text></navLabel>
+                <content src="c1.xhtml"/>
+            </navPoint>
+            <navPoint id="b" playOrder="2">
+                <navLabel><text>Caf&#233; &#x2014; menu</text></navLabel>
+                <content src="c2.xhtml"/>
+            </navPoint>
+            <navPoint id="c" playOrder="3">
+                <navLabel><text><![CDATA[Q & A]]></text></navLabel>
+                <content src="c3.xhtml"/>
+            </navPoint>
+        </navMap></ncx>"#;
+        let navigation = parse_ncx(ncx, "OEBPS/toc.ncx");
+        let labels: Vec<&str> = navigation
+            .toc
+            .iter()
+            .map(|point| point.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            ["Crime & Punishment", "Caf\u{e9} \u{2014} menu", "Q & A"]
+        );
     }
 
     #[test]
