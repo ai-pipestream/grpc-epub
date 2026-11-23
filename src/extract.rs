@@ -738,6 +738,8 @@ fn parse(bytes: &[u8], limits: &Effective, metrics: &Metrics, sink: &Sink) -> Re
             .entries
             .iter()
             .map(|entry| pb::MetadataEntry {
+                form: metadata_form(entry.form) as i32,
+                refines: entry.refines.clone(),
                 element: entry.element.clone(),
                 value: entry.value.clone(),
                 id: entry.id.clone(),
@@ -1329,6 +1331,16 @@ fn read_named(
         return Ok(None);
     };
     archive::read_entry(archive, &entries[position], limits, budget).map(Some)
+}
+
+/// The wire form of an OPF metadata element's kind.
+const fn metadata_form(form: opf::MetaForm) -> pb::MetadataForm {
+    match form {
+        opf::MetaForm::DublinCore => pb::MetadataForm::DublinCore,
+        opf::MetaForm::MetaProperty => pb::MetadataForm::MetaProperty,
+        opf::MetaForm::MetaName => pb::MetadataForm::MetaName,
+        opf::MetaForm::OtherElement => pb::MetadataForm::OtherElement,
+    }
 }
 
 #[cfg(test)]
