@@ -304,11 +304,11 @@ fn attribute(start: &BytesStart<'_>, name: &str) -> String {
 /// Exists so the entity policy lives in exactly one place. See the module
 /// documentation.
 #[derive(Default)]
-struct Text(String);
+pub(crate) struct Text(String);
 
 impl Text {
     /// Append a text fragment.
-    fn push_text(&mut self, raw: &str) {
+    pub(crate) fn push_text(&mut self, raw: &str) {
         self.0.push_str(raw);
     }
 
@@ -318,7 +318,7 @@ impl Text {
     /// Everything else is copied through as the literal `&name;` it was
     /// written as, because resolving it would mean consulting a DTD and
     /// consulting a DTD is the whole of XXE.
-    fn push_ref(&mut self, reference: &BytesRef<'_>) {
+    pub(crate) fn push_ref(&mut self, reference: &BytesRef<'_>) {
         if let Ok(Some(resolved)) = reference.resolve_char_ref() {
             self.0.push(resolved);
             return;
@@ -338,8 +338,13 @@ impl Text {
         }
     }
 
+    /// Drop whatever has accumulated.
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
     /// Take the accumulated text, trimmed, and reset.
-    fn take(&mut self) -> String {
+    pub(crate) fn take(&mut self) -> String {
         let value = self.0.trim().to_owned();
         self.0.clear();
         value
