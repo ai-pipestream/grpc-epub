@@ -2556,6 +2556,27 @@ pub struct MediaMeta {
     pub speakers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, optional, tag="3")]
     pub codec: ::core::option::Option<::prost::alloc::string::String>,
+    /// The audio stream's sample rate and channel count, as the container
+    /// states them. Unset when the stream was not probed: unknown, not zero.
+    #[prost(uint32, optional, tag="4")]
+    pub sample_rate_hz: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag="5")]
+    pub channels: ::core::option::Option<u32>,
+    /// Whether the container also holds a video stream. Unset when the
+    /// container was not probed.
+    #[prost(bool, optional, tag="6")]
+    pub has_video: ::core::option::Option<bool>,
+    /// The video stream's codec, when has_video is true and the probe names it.
+    #[prost(string, optional, tag="7")]
+    pub video_codec: ::core::option::Option<::prost::alloc::string::String>,
+    /// The duration the container declares, in the unit of duration_ms.
+    /// duration_ms is what was transcribed; a declared duration that is longer
+    /// means the transcript stops before the media does.
+    #[prost(double, optional, tag="8")]
+    pub declared_duration_ms: ::core::option::Option<f64>,
+    /// The number of tokens the transcription model produced for this media.
+    #[prost(uint64, optional, tag="9")]
+    pub token_count: ::core::option::Option<u64>,
 }
 /// GenerationSource attributes model-generated content to its generation.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3219,6 +3240,10 @@ pub enum WarningCode {
     /// A page render handed to the in-process models could not be decoded or
     /// was over the size cap; page_no was not read by them.
     PageRenderUnreadable = 37,
+    /// The model call for page_no failed (the endpoint refused it, timed out
+    /// or returned an error), so there is no model output for the page at
+    /// all. The page has no items from that service.
+    PageModelCallFailed = 38,
     // -- Items -----------------------------------------------------------
 
     /// The table-structure model stopped before the end of the table at
@@ -3331,6 +3356,7 @@ impl WarningCode {
             Self::PictureOcrAtPageResolution => "WARNING_CODE_PICTURE_OCR_AT_PAGE_RESOLUTION",
             Self::EnrichmentCropMissing => "WARNING_CODE_ENRICHMENT_CROP_MISSING",
             Self::PageRenderUnreadable => "WARNING_CODE_PAGE_RENDER_UNREADABLE",
+            Self::PageModelCallFailed => "WARNING_CODE_PAGE_MODEL_CALL_FAILED",
             Self::TableStructureTruncated => "WARNING_CODE_TABLE_STRUCTURE_TRUNCATED",
             Self::TableGridOmitted => "WARNING_CODE_TABLE_GRID_OMITTED",
             Self::SheetCellsNotAdopted => "WARNING_CODE_SHEET_CELLS_NOT_ADOPTED",
@@ -3379,6 +3405,7 @@ impl WarningCode {
             "WARNING_CODE_PICTURE_OCR_AT_PAGE_RESOLUTION" => Some(Self::PictureOcrAtPageResolution),
             "WARNING_CODE_ENRICHMENT_CROP_MISSING" => Some(Self::EnrichmentCropMissing),
             "WARNING_CODE_PAGE_RENDER_UNREADABLE" => Some(Self::PageRenderUnreadable),
+            "WARNING_CODE_PAGE_MODEL_CALL_FAILED" => Some(Self::PageModelCallFailed),
             "WARNING_CODE_TABLE_STRUCTURE_TRUNCATED" => Some(Self::TableStructureTruncated),
             "WARNING_CODE_TABLE_GRID_OMITTED" => Some(Self::TableGridOmitted),
             "WARNING_CODE_SHEET_CELLS_NOT_ADOPTED" => Some(Self::SheetCellsNotAdopted),
