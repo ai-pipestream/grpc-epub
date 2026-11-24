@@ -1359,6 +1359,10 @@ pub struct PictureMeta {
     /// verbatim.
     #[prost(string, optional, tag="13")]
     pub alt_text: ::core::option::Option<::prost::alloc::string::String>,
+    /// The id the source's own packaging gives the image resource (an EPUB
+    /// manifest item id, an office relationship id).
+    #[prost(string, optional, tag="14")]
+    pub source_id: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(map="string, message", tag="100")]
     pub custom_fields: ::std::collections::HashMap<::prost::alloc::string::String, ::prost_types::Value>,
 }
@@ -2145,6 +2149,35 @@ pub struct DocumentMeta {
     /// What an XML source is, beyond its namespaces and schema locations.
     #[prost(message, optional, tag="47")]
     pub xml: ::core::option::Option<XmlDocumentMeta>,
+    /// The publisher the source names.
+    #[prost(string, optional, tag="48")]
+    pub publisher: ::core::option::Option<::prost::alloc::string::String>,
+    /// The picture that is the work's cover (a book's cover image, an office
+    /// file's thumbnail), when the source marks one.
+    #[prost(message, optional, tag="49")]
+    pub cover: ::core::option::Option<RefItem>,
+    /// What an EPUB package says about its own files.
+    #[prost(message, optional, tag="50")]
+    pub epub: ::core::option::Option<EpubPackageMeta>,
+}
+/// EpubPackageMeta names the files an EPUB package is built from, as paths
+/// inside the container.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EpubPackageMeta {
+    /// The package document.
+    #[prost(string, optional, tag="1")]
+    pub opf_href: ::core::option::Option<::prost::alloc::string::String>,
+    /// The navigation document (EPUB 3) and the NCX table of contents
+    /// (EPUB 2), where the package has them.
+    #[prost(string, optional, tag="2")]
+    pub nav_href: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="3")]
+    pub ncx_href: ::core::option::Option<::prost::alloc::string::String>,
+    /// The id the package's unique-identifier attribute names: the
+    /// Identifier.id of the one entry in DocumentMeta.identifiers that the
+    /// package declares as its own.
+    #[prost(string, optional, tag="4")]
+    pub unique_identifier_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// HistoryDate is one dated event in a source's history.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2244,6 +2277,11 @@ pub struct Identifier {
     /// The scope the source attaches (electronic vs print ISSN).
     #[prost(string, optional, tag="3")]
     pub scope: ::core::option::Option<::prost::alloc::string::String>,
+    /// The identifier's own id in the source (the id attribute of an EPUB
+    /// dc:identifier), when it has one, so another field can name this
+    /// identifier.
+    #[prost(string, optional, tag="4")]
+    pub id: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Classification is one classification code the source declares.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -3033,11 +3071,12 @@ pub struct MediaOverlayCue {
     pub text_href: ::prost::alloc::string::String,
     #[prost(string, tag="2")]
     pub audio_href: ::prost::alloc::string::String,
-    /// The clip's start and end in the audio file, in seconds.
-    #[prost(double, tag="3")]
-    pub start_seconds: f64,
-    #[prost(double, tag="4")]
-    pub end_seconds: f64,
+    /// The clip's start and end in the audio file, in seconds. Unset when the
+    /// overlay's clock value does not parse; zero is a real start.
+    #[prost(double, optional, tag="3")]
+    pub start_seconds: ::core::option::Option<f64>,
+    #[prost(double, optional, tag="4")]
+    pub end_seconds: ::core::option::Option<f64>,
     /// The cue's own id in the overlay document.
     #[prost(string, optional, tag="5")]
     pub id: ::core::option::Option<::prost::alloc::string::String>,
