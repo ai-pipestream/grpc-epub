@@ -325,6 +325,11 @@ pub struct DocumentOrigin {
     /// source declared it or the collector detected it (an IANA charset name).
     #[prost(string, optional, tag="9")]
     pub source_encoding: ::core::option::Option<::prost::alloc::string::String>,
+    /// The media type the caller declared for the source. It is the caller's
+    /// claim, kept apart from `mimetype`, which is what the producer settled
+    /// on.
+    #[prost(string, optional, tag="10")]
+    pub declared_mimetype: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// GroupItem represents a logical grouping of document elements.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -498,7 +503,7 @@ pub struct CollectorClaim {
 /// SourceType is a union of possible source descriptors.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SourceType {
-    #[prost(oneof="source_type::Source", tags="1, 2, 3, 4")]
+    #[prost(oneof="source_type::Source", tags="1, 2, 3, 4, 5")]
     pub source: ::core::option::Option<source_type::Source>,
 }
 /// Nested message and enum types in `SourceType`.
@@ -517,7 +522,24 @@ pub mod source_type {
         /// upstream dialect).
         #[prost(message, tag="4")]
         Xml(super::XmlSource),
+        /// Which part of a MIME message the content came from (extension beyond
+        /// the upstream dialect).
+        #[prost(message, tag="5")]
+        MimePart(super::MimePartSource),
     }
+}
+/// MimePartSource locates content in the MIME message it was read from.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MimePartSource {
+    /// The part's position in the message's part tree ("1.2").
+    #[prost(string, tag="1")]
+    pub part_id: ::prost::alloc::string::String,
+    /// The part's Content-ID, without its angle brackets, when it has one.
+    #[prost(string, optional, tag="2")]
+    pub content_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// The part's own content type, as its header states it.
+    #[prost(string, optional, tag="3")]
+    pub content_type: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// XmlSource locates content in the XML source it was read from.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2693,6 +2715,13 @@ pub struct EmailParty {
     pub name: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, tag="2")]
     pub address: ::prost::alloc::string::String,
+    /// The party's address in the mail system's own form when that is not an
+    /// internet address (an Exchange legacy distinguished name), and the
+    /// address type the source names for it ("EX", "SMTP").
+    #[prost(string, optional, tag="3")]
+    pub native_address: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="4")]
+    pub address_type: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// EmailMeta is the typed message envelope of a mail source.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2724,6 +2753,21 @@ pub struct EmailMeta {
     pub sent: ::core::option::Option<::prost_types::Timestamp>,
     #[prost(string, optional, tag="11")]
     pub sent_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// Where replies go, when the message names it apart from `from`.
+    #[prost(message, repeated, tag="12")]
+    pub reply_to: ::prost::alloc::vec::Vec<EmailParty>,
+    /// Who submitted the message, when the message names a sender apart from
+    /// its authors in `from`.
+    #[prost(message, repeated, tag="13")]
+    pub sender: ::prost::alloc::vec::Vec<EmailParty>,
+    /// The delivery instant, with the same _raw twin as `sent`.
+    #[prost(message, optional, tag="14")]
+    pub received: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(string, optional, tag="15")]
+    pub received_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// The message's own top-level content type, as its header states it.
+    #[prost(string, optional, tag="16")]
+    pub content_type: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Hypothesis is one alternate reading a generative engine offered.
 #[derive(Clone, PartialEq, ::prost::Message)]
