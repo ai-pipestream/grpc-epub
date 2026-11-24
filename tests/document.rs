@@ -14,7 +14,6 @@ mod common;
 use grpc_epub::document_fold::integrity_errors;
 use grpc_epub::proto::document_v1 as doc;
 use grpc_epub::proto::v1 as pb;
-use prost_types::value::Kind;
 
 /// Options that ask for the projection and nothing else.
 fn with_document() -> pb::ParseOptions {
@@ -95,19 +94,17 @@ async fn the_document_matches_the_typed_events_it_was_folded_from() {
         "bytes stay on the typed stream; the Document is one bounded message"
     );
 
-    let cover = &document.pictures[0]
-        .meta
-        .as_ref()
-        .expect("picture meta")
-        .custom_fields;
     assert_eq!(
-        cover["epub.cover"].kind,
-        Some(Kind::BoolValue(true)),
+        document
+            .source_meta
+            .as_ref()
+            .and_then(|meta| meta.cover.as_ref())
+            .map(|cover| cover.r#ref.as_str()),
+        Some("#/pictures/0"),
         "info names the cover before the resource arrives, so the match works in one pass"
     );
 
-    // The metadata the OPF carried. What the schema types is on the typed
-    // field; the body group's custom fields hold only what it does not.
+    // The metadata the OPF carried, on the typed fields and nowhere else.
     let meta = document
         .body
         .as_ref()
@@ -124,12 +121,16 @@ async fn the_document_matches_the_typed_events_it_was_folded_from() {
         Some(info.language.as_str())
     );
     assert!(
-        !meta.custom_fields.contains_key("epub.language"),
-        "the language has a typed home, so it is not a string beside it too"
+        meta.custom_fields.is_empty(),
+        "no custom field bag on the body"
     );
     assert_eq!(
-        meta.custom_fields["epub.opf_href"].kind,
-        Some(Kind::StringValue(info.opf_href.clone()))
+        document
+            .source_meta
+            .as_ref()
+            .and_then(|meta| meta.epub.as_ref())
+            .and_then(|epub| epub.opf_href.as_deref()),
+        Some(info.opf_href.as_str())
     );
 }
 
