@@ -200,6 +200,13 @@ pub struct CollectorWarning {
     /// names the table the cell belongs to.
     #[prost(message, optional, tag="9")]
     pub cell: ::core::option::Option<GridCell>,
+    /// For a warning about a recording that was cut: how much of its timeline
+    /// is in the document and how long the media says it is, in milliseconds.
+    /// duration_total_ms is unset when the media states no length.
+    #[prost(uint64, optional, tag="10")]
+    pub duration_kept_ms: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag="11")]
+    pub duration_total_ms: ::core::option::Option<u64>,
 }
 /// TextAnalysis is one analyzer run over a window of the document's text
 /// stream: the stream ConvertDocumentResponse.text_offsets indexes, every text
