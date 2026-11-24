@@ -13,8 +13,8 @@
 //! What it projects is the **skeleton of the book**, and nothing below it:
 //!
 //! - the OPF metadata, typed into `Document.source_meta` and the body group's
-//!   `BaseMeta` wherever the schema types it, and the open-vocabulary
-//!   remainder of Dublin Core on the body group's `meta.custom_fields`;
+//!   `BaseMeta`, with only the open-vocabulary remainder of Dublin Core in
+//!   `DocumentMeta.extra`;
 //! - the book's own table of contents, as `Document.outline`, with each entry
 //!   pointing at the chapter group it names;
 //! - one `GROUP_LABEL_CHAPTER` group per spine item, in spine order, **with no
@@ -53,24 +53,17 @@
 //!
 //! Two caveats worth knowing at the call site:
 //!
-//! - **Root custom fields are first-writer-wins.** The `epub.*` keys live on
-//!   the *body* group's `meta.custom_fields`, and the coordinator does not
-//!   merge competing root metas: whichever collector's fragment lands first
-//!   keeps its keys. That is why everything with a typed home is written to
-//!   that home, in `Document.source_meta` and in `BaseMeta`'s own fields,
-//!   which the merge and the query layer understand, and to nothing else:
-//!   the string copies that used to sit beside them under `epub.*` are gone,
-//!   and what remains under those keys is the part of Dublin Core that is
-//!   genuinely open vocabulary.
+//! - **Root meta is first-writer-wins.** The coordinator does not merge
+//!   competing root metas: whichever collector's fragment lands first keeps
+//!   its `source_meta`. Everything is written to its typed home, and no item
+//!   carries a `custom_fields` bag.
 //! - **No provenance.** An EPUB is reflowable and has no pages and no
 //!   bounding boxes, so `prov` is left empty everywhere rather than filled
-//!   with invented coordinates. Source locators — spine index, href, manifest
-//!   id — go in `meta.custom_fields` instead.
+//!   with invented coordinates. Source locators are typed: a chapter's spine
+//!   facts on `GroupItem.spine`, a picture's manifest id on
+//!   `PictureMeta.source_id`, its href in `ImageRef.uri`.
 
 use std::collections::{HashMap, HashSet};
-
-use prost_types::value::Kind;
-use prost_types::{ListValue, Struct, Value};
 
 use crate::datetime;
 use crate::extract::EPUB_MIMETYPE;
@@ -212,11 +205,11 @@ impl DocumentFold {
     ///   deliberately not projected;
     /// - `navigation` is held until the chapter groups exist, then becomes
     ///   `Document.outline`;
-    /// - `media_overlay` contributes the narration's length; its cues stay on
-    ///   the chapter group that owns them;
-    /// - `status` is a receipt of counts already implied by the items above,
-    ///   so there is nothing to map. It is still fed in, because it is the
-    ///   signal that the fold is complete;
+    /// - `media_overlay` contributes the narration's length, and its cues go
+    ///   on the spine facts of the chapter group that owns them;
+    /// - `status` carries counts already implied by the items above, and its
+    ///   warnings, which become `Document.warnings`; it is also the signal
+    ///   that the fold is complete;
     /// - `document` is this fold's own output and is never folded again.
     pub fn consume(&mut self, event: &pb::parse_epub_response::Event) {
         match event {
@@ -233,8 +226,8 @@ impl DocumentFold {
             pb::parse_epub_response::Event::MediaOverlay(overlay) => {
                 self.overlays.push(overlay.clone());
             }
+            pb::parse_epub_response::Event::Status(status) => self.status(status),
             pb::parse_epub_response::Event::Resource(_)
-            | pb::parse_epub_response::Event::Status(_)
             | pb::parse_epub_response::Event::Document(_) => {}
         }
     }
@@ -301,9 +294,9 @@ impl DocumentFold {
     /// fragment *inside* a chapter, and this fold emits chapter groups with no
     /// children, so the items a `SourceType::Track` would hang on do not exist
     /// until the HTML collector contributes them downstream. Until then the
-    /// cues ride on the chapter group as the lossless tail, in the same shape
-    /// `epub.identifiers` uses, and the typed `media_overlay` event carries
-    /// them properly.
+    /// cues ride on the chapter group's `SpineItemMeta.overlay_cues`, typed.
+    /// An overlay whose chapter is not in the spine has no group to ride on,
+    /// and becomes a `SOURCE_REFERENCE_UNRESOLVED` warning instead.
     ///
     /// What the Document *can* say in a typed slot is how long the narration
     /// runs, which is `MediaMeta.duration_ms`.
@@ -322,36 +315,35 @@ impl DocumentFold {
             );
 
             let Some(group_ref) = self.chapter_refs.get(&overlay.chapter_href).cloned() else {
+                // The cues are on the typed `media_overlay` event; a reader
+                // of the Document alone learns they exist and why they are
+                // not here.
+                self.document.warnings.push(doc::CollectorWarning {
+                    source: Some(self.stamp()),
+                    message: format!(
+                        "media overlay {} narrates {}, which is not a spine item of this \
+                         book; its cues are on the media_overlay event only",
+                        overlay.source_href, overlay.chapter_href
+                    ),
+                    code: doc::WarningCode::SourceReferenceUnresolved as i32,
+                    count: u64::try_from(overlay.cues.len())
+                        .ok()
+                        .filter(|count| *count > 1),
+                    ..doc::CollectorWarning::default()
+                });
                 continue;
             };
-            let cues = list(
-                overlay
-                    .cues
-                    .iter()
-                    .map(|cue| {
-                        let mut entry = std::collections::BTreeMap::new();
-                        entry.insert("text_href".to_owned(), text(&cue.text_href));
-                        entry.insert("audio_href".to_owned(), text(&cue.audio_href));
-                        // A bound the overlay did not state readably is left
-                        // out, not written as zero.
-                        if let Some(start) = cue.start_time {
-                            entry.insert("start_time".to_owned(), number(start));
-                        }
-                        if let Some(end) = cue.end_time {
-                            entry.insert("end_time".to_owned(), number(end));
-                        }
-                        if !cue.identifier.is_empty() {
-                            entry.insert("id".to_owned(), text(&cue.identifier));
-                        }
-                        Value {
-                            kind: Some(Kind::StructValue(Struct { fields: entry })),
-                        }
-                    })
-                    .collect(),
-            );
-            if let Some(meta) = self.group_mut(&group_ref).meta.as_mut() {
-                meta.custom_fields
-                    .insert("epub.media_overlay_cues".to_owned(), cues);
+            let cues = overlay.cues.iter().map(|cue| doc::MediaOverlayCue {
+                text_href: cue.text_href.clone(),
+                audio_href: cue.audio_href.clone(),
+                // A bound the overlay did not state readably stays unset,
+                // not zero.
+                start_seconds: cue.start_time,
+                end_seconds: cue.end_time,
+                id: (!cue.identifier.is_empty()).then(|| cue.identifier.clone()),
+            });
+            if let Some(spine) = self.group_mut(&group_ref).spine.as_mut() {
+                spine.overlay_cues.extend(cues);
             }
         }
 
@@ -386,64 +378,6 @@ impl DocumentFold {
         });
         self.document.source_meta = Some(self.source_meta(info));
 
-        // The OPF facts that have no typed home, under `epub.` keys. A fact
-        // the schema types is NOT written here as well: the title, the
-        // creators, the language, the subjects and the two dates all have
-        // first-class slots now, and a string copy beside a typed field is a
-        // second answer that can disagree with the first. Empty fields are
-        // omitted rather than written as empty strings, so a reader can tell
-        // "the book did not say" from "the book said nothing useful".
-        let mut fields = HashMap::new();
-        insert_text(
-            &mut fields,
-            "epub.unique_identifier",
-            &info.unique_identifier,
-        );
-        insert_text(&mut fields, "epub.publisher", &info.publisher);
-        insert_text(&mut fields, "epub.description", &info.description);
-        insert_text(&mut fields, "epub.epub_version", &info.epub_version);
-        insert_text(&mut fields, "epub.opf_href", &info.opf_href);
-        insert_strings(&mut fields, "epub.contributors", &info.contributors);
-        if !info.identifiers.is_empty() {
-            fields.insert(
-                "epub.identifiers".to_owned(),
-                list(
-                    info.identifiers
-                        .iter()
-                        .map(|identifier| {
-                            let mut entry = std::collections::BTreeMap::new();
-                            entry.insert("value".to_owned(), text(&identifier.value));
-                            if !identifier.scheme.is_empty() {
-                                entry.insert("scheme".to_owned(), text(&identifier.scheme));
-                            }
-                            Value {
-                                kind: Some(Kind::StructValue(Struct { fields: entry })),
-                            }
-                        })
-                        .collect(),
-                ),
-            );
-        }
-
-        insert_text(&mut fields, "epub.nav_href", &info.nav_href);
-        insert_text(&mut fields, "epub.ncx_href", &info.ncx_href);
-        // The six Dublin Core elements the old allow-list dropped, plus the
-        // creator roles the EPUB 3 expression model carries. Nothing in the
-        // schema has a typed home for any of them.
-        for (key, element) in [
-            ("epub.rights", "rights"),
-            ("epub.source", "source"),
-            ("epub.type", "type"),
-            ("epub.format", "format"),
-            ("epub.coverage", "coverage"),
-            ("epub.relation", "relation"),
-        ] {
-            insert_text(&mut fields, key, first(info, element));
-        }
-        if let Some(credits) = credits(info) {
-            fields.insert("epub.creator_roles".to_owned(), credits);
-        }
-
         // `LanguageMetaField` and `KeywordsMetaField` are what the merge and
         // the query layer understand, and they are now the only place the
         // language and the subjects are written: the `epub.language` and
@@ -465,17 +399,17 @@ impl DocumentFold {
                 values: info.subjects.clone(),
                 custom_fields: HashMap::new(),
             }),
-            custom_fields: fields,
             ..doc::BaseMeta::default()
         });
     }
 
     /// The book's own account of itself, typed.
     ///
-    /// Everything with a first-class slot goes in one, and *only* in one.
-    /// `extra` is for what Dublin Core leaves genuinely open: a publisher, a
-    /// rights statement, a MARC relator code, a producer-invented `<meta>`
-    /// property. The schema says as much at the field itself, so a value that
+    /// Everything with a first-class slot goes in one, and *only* in one:
+    /// the publisher, the description, the identifiers, the credits with
+    /// their relator codes and sort names, the rights statement, the EPUB
+    /// version and the package's own files. `extra` is for what Dublin Core
+    /// leaves genuinely open: a source, a type, a coverage, a subtitle. The schema says as much at the field itself, so a value that
     /// has a typed home and is written here too would be a second answer with
     /// no tiebreaker.
     ///
@@ -495,16 +429,10 @@ impl DocumentFold {
             }
         }
 
-        record(&mut extra, "epub.publisher", &info.publisher);
-        record(&mut extra, "epub.description", &info.description);
-        record(
-            &mut extra,
-            "epub.unique_identifier",
-            &info.unique_identifier,
-        );
-        record(&mut extra, "epub.version", &info.epub_version);
-        record(&mut extra, "epub.opf_href", &info.opf_href);
-        for element in ["rights", "source", "type", "format", "coverage", "relation"] {
+        // The parts of Dublin Core with no typed slot: a source, a type, a
+        // format, a coverage and a relation are open vocabulary. Rights has
+        // a slot of its own, `LicenseMeta.statement`.
+        for element in ["source", "type", "format", "coverage", "relation"] {
             record(&mut extra, &format!("epub.{element}"), first(info, element));
         }
 
@@ -520,41 +448,6 @@ impl DocumentFold {
                 record(&mut extra, &format!("epub.title.{kind}"), &entry.value);
             }
         }
-        // Sort names and roles, keyed by the name they qualify, so a consumer
-        // can answer "who is the illustrator" without re-reading the OPF.
-        for entry in info.metadata.iter().filter(|entry| {
-            reads(entry) && matches!(entry.element.as_str(), "creator" | "contributor")
-        }) {
-            let role = refined(entry, "role");
-            let file_as = refined(entry, "file-as");
-            if !role.is_empty() {
-                record(&mut extra, &format!("epub.role.{}", entry.value), role);
-            }
-            if !file_as.is_empty() {
-                record(
-                    &mut extra,
-                    &format!("epub.file-as.{}", entry.value),
-                    file_as,
-                );
-            }
-        }
-        // One key per identifier, in document order, never one key holding all
-        // of them joined: a reader after the third identifier should not have
-        // to know this fold's separator, and an identifier is free to contain
-        // one. The scheme rides on its own key for the same reason.
-        for (index, identifier) in info.identifiers.iter().enumerate() {
-            record(
-                &mut extra,
-                &format!("epub.identifier.{index}"),
-                &identifier.value,
-            );
-            record(
-                &mut extra,
-                &format!("epub.identifier.{index}.scheme"),
-                &identifier.scheme,
-            );
-        }
-
         let created = declared_creation(info);
         let modified = info.modified.as_str();
 
@@ -579,6 +472,32 @@ impl DocumentFold {
             schema_location: None,
             created_raw: (!created.is_empty()).then(|| created.to_owned()),
             modified_raw: (!modified.is_empty()).then(|| modified.to_owned()),
+            identifiers: info
+                .identifiers
+                .iter()
+                .map(|identifier| doc::Identifier {
+                    kind: identifier.scheme.clone(),
+                    value: identifier.value.clone(),
+                    scope: None,
+                    id: non_empty(&identifier.id),
+                })
+                .collect(),
+            creators: creators(info),
+            publisher: non_empty(&info.publisher),
+            description: non_empty(&info.description),
+            // The EPUB version the package declares.
+            format_version: non_empty(&info.epub_version),
+            license: non_empty(first(info, "rights")).map(|statement| doc::LicenseMeta {
+                statement: Some(statement),
+                ..doc::LicenseMeta::default()
+            }),
+            epub: Some(doc::EpubPackageMeta {
+                opf_href: non_empty(&info.opf_href),
+                nav_href: non_empty(&info.nav_href),
+                ncx_href: non_empty(&info.ncx_href),
+                unique_identifier_id: unique_identifier_id(info),
+            })
+            .filter(|epub| *epub != doc::EpubPackageMeta::default()),
             extra,
             ..doc::DocumentMeta::default()
         }
@@ -588,27 +507,21 @@ impl DocumentFold {
     fn chapter(&mut self, chapter: &pb::Chapter) {
         let self_ref = format!("#/groups/{}", self.document.groups.len());
 
-        let mut fields = HashMap::new();
-        fields.insert("epub.idref".to_owned(), text(&chapter.idref));
-        fields.insert("epub.media_type".to_owned(), text(&chapter.media_type));
-        // `linear=false` marks auxiliary content a linear read should skip,
-        // which is a reading-order fact the group label cannot carry.
-        fields.insert("epub.linear".to_owned(), flag(chapter.linear));
-        fields.insert(
-            "epub.spine_index".to_owned(),
-            number(f64::from(chapter.spine_index)),
-        );
-        if !chapter.properties.is_empty() {
-            insert_strings(&mut fields, "epub.properties", &chapter.properties);
-        }
-        // Which chapters have a recorded reading is a manifest fact, so it is
-        // known whether or not the SMIL was parsed.
-        insert_text(
-            &mut fields,
-            "epub.media_overlay_href",
-            &chapter.media_overlay_href,
-        );
-        self.attribute(&mut fields);
+        let spine = doc::SpineItemMeta {
+            idref: chapter.idref.clone(),
+            media_type: chapter.media_type.clone(),
+            // `linear=false` marks auxiliary content a linear read should
+            // skip, which is a reading-order fact the group label cannot
+            // carry.
+            linear: chapter.linear,
+            spine_index: chapter.spine_index,
+            properties: chapter.properties.clone(),
+            // Which chapters have a recorded reading is a manifest fact, so
+            // it is known whether or not the SMIL was parsed. The cues are
+            // added at the end, from the overlay events.
+            overlay_href: non_empty(&chapter.media_overlay_href),
+            overlay_cues: Vec::new(),
+        };
 
         self.document.groups.push(doc::GroupItem {
             self_ref: self_ref.clone(),
@@ -617,10 +530,8 @@ impl DocumentFold {
             // docs.
             children: Vec::new(),
             content_layer: doc::ContentLayer::Body as i32,
-            meta: Some(doc::BaseMeta {
-                custom_fields: fields,
-                ..doc::BaseMeta::default()
-            }),
+            source: vec![self.stamp_source()],
+            spine: Some(spine),
             // The resolved archive path, which is the key the HTML collector's
             // items are matched back to.
             name: Some(chapter.href.clone()),
@@ -667,11 +578,11 @@ impl DocumentFold {
     fn add_picture(&mut self, parent_ref: &str, href: &str, manifest_id: &str, media_type: &str) {
         let self_ref = format!("#/pictures/{}", self.document.pictures.len());
 
-        let mut fields = HashMap::new();
-        fields.insert("epub.href".to_owned(), text(href));
-        fields.insert("epub.manifest_id".to_owned(), text(manifest_id));
         if !self.cover_href.is_empty() && href == self.cover_href {
-            fields.insert("epub.cover".to_owned(), flag(true));
+            // The book names its cover; the document says which picture it is.
+            if let Some(meta) = self.document.source_meta.as_mut() {
+                meta.cover = Some(reference(&self_ref));
+            }
         }
 
         self.document.pictures.push(doc::PictureItem {
@@ -690,11 +601,13 @@ impl DocumentFold {
                 uri: format!("{URI_SCHEME}{href}"),
                 ..doc::ImageRef::default()
             }),
-            meta: Some(doc::PictureMeta {
-                custom_fields: fields,
+            // The href is the image's own `uri`; the manifest id is the id
+            // the package gives the resource.
+            meta: non_empty(manifest_id).map(|id| doc::PictureMeta {
+                source_id: Some(id),
                 ..doc::PictureMeta::default()
             }),
-            source: vec![self.collector_source()],
+            source: vec![self.stamp_source()],
             ..doc::PictureItem::default()
         });
         self.link_child(parent_ref, &self_ref);
@@ -707,37 +620,56 @@ impl DocumentFold {
     /// walk of the OPF, so a confidence would be noise rather than
     /// information, and `raw_score` is the uncalibrated signal behind a
     /// confidence there is none of.
-    fn collector_source(&self) -> doc::SourceType {
-        doc::SourceType {
-            source: Some(doc::source_type::Source::Collector(doc::CollectorSource {
-                collector: COLLECTOR.to_owned(),
-                model: None,
-                version: Some(self.version.clone()),
-                confidence: None,
-                raw_score: None,
-                raw_score_kind: None,
-                ..doc::CollectorSource::default()
-            })),
+    fn stamp(&self) -> doc::CollectorSource {
+        doc::CollectorSource {
+            collector: COLLECTOR.to_owned(),
+            model: None,
+            version: Some(self.version.clone()),
+            confidence: None,
+            raw_score: None,
+            raw_score_kind: None,
+            ..doc::CollectorSource::default()
         }
     }
 
-    /// Attribute a *group* to this collector, through its custom fields.
-    ///
-    /// `GroupItem` has no `source` field in this schema — only text, picture
-    /// and table items do — so a chapter group cannot carry a `CollectorSource`
-    /// the way a picture does. Dropping the attribution would leave the one
-    /// kind of item this fold always produces unattributable, so it goes in
-    /// the group's own meta under `epub.collector` as `{collector, version}`.
-    fn attribute(&self, fields: &mut HashMap<String, Value>) {
-        let mut entry = std::collections::BTreeMap::new();
-        entry.insert("collector".to_owned(), text(COLLECTOR));
-        entry.insert("version".to_owned(), text(&self.version));
-        fields.insert(
-            "epub.collector".to_owned(),
-            Value {
-                kind: Some(Kind::StructValue(Struct { fields: entry })),
-            },
-        );
+    /// [`stamp`](Self::stamp) as one entry of an item's `source` list. A
+    /// chapter group carries it too, on `GroupItem.source`.
+    fn stamp_source(&self) -> doc::SourceType {
+        doc::SourceType {
+            source: Some(doc::source_type::Source::Collector(self.stamp())),
+        }
+    }
+
+    /// Copy the trailer's warnings into `Document.warnings`, so a consumer
+    /// that only takes the folded Document sees what the stream reported.
+    /// The wire code maps to the fleet code that says what a consumer can
+    /// rely on; the href, when there is one, is named in the message.
+    fn status(&mut self, status: &pb::ParseStatus) {
+        let stamp = self.stamp();
+        for warning in &status.warnings {
+            let message = if warning.href.is_empty() {
+                warning.message.clone()
+            } else {
+                format!("{}: {}", warning.message, warning.href)
+            };
+            self.document.warnings.push(doc::CollectorWarning {
+                source: Some(stamp.clone()),
+                message,
+                code: fleet_warning_code(
+                    pb::ParseWarningCode::try_from(warning.code).unwrap_or_default(),
+                ) as i32,
+                ..doc::CollectorWarning::default()
+            });
+        }
+        if status.warnings_dropped > 0 {
+            self.document.warnings.push(doc::CollectorWarning {
+                source: Some(stamp),
+                message: "further warnings were raised past the trailer's cap and not listed"
+                    .to_owned(),
+                count: Some(status.warnings_dropped),
+                ..doc::CollectorWarning::default()
+            });
+        }
     }
 
     /// The group a JSON Pointer names, falling back to the body.
@@ -809,41 +741,6 @@ fn root(self_ref: &str, layer: doc::ContentLayer) -> doc::GroupItem {
 fn reference(target: &str) -> doc::RefItem {
     doc::RefItem {
         r#ref: target.to_owned(),
-    }
-}
-
-/// A string `google.protobuf.Value`.
-fn text(value: &str) -> Value {
-    Value {
-        kind: Some(Kind::StringValue(value.to_owned())),
-    }
-}
-
-/// A boolean `google.protobuf.Value`.
-const fn flag(value: bool) -> Value {
-    Value {
-        kind: Some(Kind::BoolValue(value)),
-    }
-}
-
-/// A numeric `google.protobuf.Value`.
-const fn number(value: f64) -> Value {
-    Value {
-        kind: Some(Kind::NumberValue(value)),
-    }
-}
-
-/// A list `google.protobuf.Value`.
-fn list(values: Vec<Value>) -> Value {
-    Value {
-        kind: Some(Kind::ListValue(ListValue { values })),
-    }
-}
-
-/// Record a string field, skipping it when the book did not supply one.
-fn insert_text(fields: &mut HashMap<String, Value>, key: &str, value: &str) {
-    if !value.is_empty() {
-        fields.insert(key.to_owned(), text(value));
     }
 }
 
@@ -919,43 +816,80 @@ fn authors(info: &pb::EpubInfo) -> Vec<String> {
         .collect()
 }
 
-/// Creator and contributor credits as `{name, role, file_as}` structs.
+/// Every creator and contributor credit, in file order, with the relator
+/// code and the sort name the EPUB 3 expression model refines it with.
 ///
-/// Returns `None` when no credit carries a role or a sort name, so a book that
-/// said nothing beyond the names does not get an empty structure implying it
-/// did.
-fn credits(info: &pb::EpubInfo) -> Option<Value> {
+/// Each credit is its own entry, so two people with the same name stay two
+/// credits. A book whose metadata tail did not survive still has the scalar
+/// name lists, and they are the truth then.
+fn creators(info: &pb::EpubInfo) -> Vec<doc::Creator> {
     let entries: Vec<&pb::MetadataEntry> = info
         .metadata
         .iter()
         .filter(|entry| reads(entry) && matches!(entry.element.as_str(), "creator" | "contributor"))
-        .filter(|entry| !refined(entry, "role").is_empty() || !refined(entry, "file-as").is_empty())
         .collect();
     if entries.is_empty() {
+        return info
+            .creators
+            .iter()
+            .chain(&info.contributors)
+            .map(|name| doc::Creator {
+                name: name.clone(),
+                roles: Vec::new(),
+                file_as: None,
+            })
+            .collect();
+    }
+    entries
+        .into_iter()
+        .map(|entry| doc::Creator {
+            name: entry.value.clone(),
+            roles: entry
+                .refinements
+                .iter()
+                .filter(|refinement| refinement.property == "role" && !refinement.value.is_empty())
+                .map(|refinement| refinement.value.clone())
+                .collect(),
+            file_as: non_empty(refined(entry, "file-as")),
+        })
+        .collect()
+}
+
+/// The `id` of the identifier the package names as its own, when the
+/// package names one and an identifier carries it. A package whose
+/// `unique-identifier` names nothing is already a METADATA warning on the
+/// trailer.
+fn unique_identifier_id(info: &pb::EpubInfo) -> Option<String> {
+    if info.unique_identifier.is_empty() {
         return None;
     }
+    info.identifiers
+        .iter()
+        .find(|identifier| !identifier.id.is_empty() && identifier.value == info.unique_identifier)
+        .map(|identifier| identifier.id.clone())
+}
 
-    Some(list(
-        entries
-            .into_iter()
-            .map(|entry| {
-                let mut fields = std::collections::BTreeMap::new();
-                fields.insert("name".to_owned(), text(&entry.value));
-                fields.insert("element".to_owned(), text(&entry.element));
-                let role = refined(entry, "role");
-                if !role.is_empty() {
-                    fields.insert("role".to_owned(), text(role));
-                }
-                let file_as = refined(entry, "file-as");
-                if !file_as.is_empty() {
-                    fields.insert("file_as".to_owned(), text(file_as));
-                }
-                Value {
-                    kind: Some(Kind::StructValue(Struct { fields })),
-                }
-            })
-            .collect(),
-    ))
+/// `Some` of a non-empty string, `None` for an empty one: the book did not
+/// say.
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// The fleet code a wire warning code stands for: what a consumer of the
+/// Document can rely on when it sees one.
+const fn fleet_warning_code(code: pb::ParseWarningCode) -> doc::WarningCode {
+    match code {
+        pb::ParseWarningCode::Unspecified => doc::WarningCode::Unspecified,
+        // Left out by rule: an excluded kind, a nested archive, an
+        // obfuscated resource, an entry whose name is not a usable path.
+        pb::ParseWarningCode::ResourceKindExcluded
+        | pb::ParseWarningCode::NestedArchive
+        | pb::ParseWarningCode::ObfuscatedResource
+        | pb::ParseWarningCode::UnusableEntryName => doc::WarningCode::SourcePartIgnored,
+        pb::ParseWarningCode::MissingManifestEntry => doc::WarningCode::SourceReferenceUnresolved,
+        pb::ParseWarningCode::Metadata => doc::WarningCode::SourceMetadataUnreadable,
+        pb::ParseWarningCode::IncompleteStructure => doc::WarningCode::SourceStructureMalformed,
+    }
 }
 
 /// Map a BCP 47 tag onto the schema's language enum.
@@ -994,16 +928,6 @@ fn chapter_target(href: &str, chapters: &HashMap<String, String>) -> Option<doc:
         // has no text of its own.
         range: None,
     })
-}
-
-/// Record a repeated string field as a `ListValue`, skipping it when empty.
-fn insert_strings(fields: &mut HashMap<String, Value>, key: &str, values: &[String]) {
-    if !values.is_empty() {
-        fields.insert(
-            key.to_owned(),
-            list(values.iter().map(|value| text(value)).collect()),
-        );
-    }
 }
 
 /// Everything structurally wrong with `document`, as human-readable lines.
@@ -1252,14 +1176,43 @@ mod tests {
         fold.take()
     }
 
-    /// The string behind a custom field, for terse assertions.
-    fn field<'a>(fields: &'a HashMap<String, Value>, key: &str) -> &'a Kind {
-        fields
-            .get(key)
-            .unwrap_or_else(|| panic!("custom field {key:?} is missing"))
-            .kind
-            .as_ref()
-            .expect("a value with no kind is not a value")
+    /// Every item that carries a `custom_fields` bag, by self ref.
+    fn bags(document: &doc::Document) -> Vec<String> {
+        let groups = document
+            .body
+            .iter()
+            .chain(&document.groups)
+            .filter(|group| {
+                group
+                    .meta
+                    .as_ref()
+                    .is_some_and(|m| !m.custom_fields.is_empty())
+            })
+            .map(|group| group.self_ref.clone());
+        let pictures = document
+            .pictures
+            .iter()
+            .filter(|picture| {
+                picture
+                    .meta
+                    .as_ref()
+                    .is_some_and(|m| !m.custom_fields.is_empty())
+            })
+            .map(|picture| picture.self_ref.clone());
+        groups.chain(pictures).collect()
+    }
+
+    /// The collector stamp, the one source this fold writes.
+    fn stamp(source: &[doc::SourceType]) -> &doc::CollectorSource {
+        let [
+            doc::SourceType {
+                source: Some(doc::source_type::Source::Collector(collector)),
+            },
+        ] = source
+        else {
+            panic!("the only source is this collector: {source:?}");
+        };
+        collector
     }
 
     /// The body group of a folded document.
@@ -1281,53 +1234,39 @@ mod tests {
     }
 
     #[test]
-    fn opf_metadata_lands_in_body_custom_fields() {
+    fn opf_metadata_lands_in_typed_document_fields() {
         let document = fold(&default_book());
-        let fields = &body(&document)
-            .meta
-            .as_ref()
-            .expect("body meta")
-            .custom_fields;
-
+        assert_eq!(bags(&document), Vec::<String>::new(), "no custom field bag");
+        let meta = document.source_meta.as_ref().expect("source meta");
+        assert_eq!(meta.publisher.as_deref(), Some("Analytical Press"));
+        assert_eq!(meta.format_version.as_deref(), Some("3.0"));
         assert_eq!(
-            field(fields, "epub.publisher"),
-            &Kind::StringValue("Analytical Press".to_owned())
+            meta.identifiers,
+            [doc::Identifier {
+                kind: "ISBN".to_owned(),
+                value: "urn:isbn:9780000000000".to_owned(),
+                scope: None,
+                id: Some("bookid".to_owned()),
+            }]
         );
         assert_eq!(
-            field(fields, "epub.opf_href"),
-            &Kind::StringValue("OEBPS/content.opf".to_owned())
-        );
-        for typed in [
-            "epub.language",
-            "epub.subjects",
-            "epub.creators",
-            "epub.date",
-            "epub.modified",
-        ] {
-            assert!(
-                !fields.contains_key(typed),
-                "{typed} has a typed home now, so it is not a string here as well"
-            );
-        }
-
-        let Kind::ListValue(identifiers) = field(fields, "epub.identifiers") else {
-            panic!("identifiers is a list");
-        };
-        let Some(Kind::StructValue(first)) = identifiers.values[0].kind.as_ref() else {
-            panic!("an identifier is an object");
-        };
-        assert_eq!(
-            first.fields["value"].kind,
-            Some(Kind::StringValue("urn:isbn:9780000000000".to_owned()))
+            meta.epub,
+            Some(doc::EpubPackageMeta {
+                opf_href: Some("OEBPS/content.opf".to_owned()),
+                nav_href: None,
+                ncx_href: None,
+                unique_identifier_id: Some("bookid".to_owned()),
+            }),
+            "the package names its own identifier by id, among the identifiers"
         );
         assert_eq!(
-            first.fields["scheme"].kind,
-            Some(Kind::StringValue("ISBN".to_owned()))
-        );
-
-        assert!(
-            !fields.contains_key("epub.description"),
+            meta.description, None,
             "a field the book did not supply is absent, not empty"
+        );
+        assert_eq!(
+            meta.extra,
+            HashMap::new(),
+            "nothing typed is a string as well"
         );
     }
 
@@ -1348,17 +1287,15 @@ mod tests {
                 group.children.is_empty(),
                 "the XHTML is the HTML collector's to parse; the group is a socket"
             );
-
-            let fields = &group.meta.as_ref().expect("chapter meta").custom_fields;
+            assert!(group.meta.is_none(), "no custom field bag");
+            let spine = group.spine.as_ref().expect("the spine facts, typed");
             assert_eq!(
-                field(fields, "epub.spine_index"),
-                &Kind::NumberValue(f64::from(u32::try_from(index).expect("two chapters")))
+                spine.spine_index,
+                u32::try_from(index).expect("two chapters")
             );
-            assert_eq!(field(fields, "epub.linear"), &Kind::BoolValue(true));
-            assert_eq!(
-                field(fields, "epub.media_type"),
-                &Kind::StringValue("application/xhtml+xml".to_owned())
-            );
+            assert!(spine.linear);
+            assert_eq!(spine.media_type, "application/xhtml+xml");
+            assert_eq!(spine.overlay_href, None);
         }
 
         assert_eq!(
@@ -1370,13 +1307,13 @@ mod tests {
             Some("OEBPS/text/chap2.xhtml")
         );
         assert_eq!(
-            document.groups[0].meta.as_ref().unwrap().custom_fields["epub.idref"].kind,
-            Some(Kind::StringValue("ch1".to_owned()))
+            document.groups[0].spine.as_ref().map(|s| s.idref.as_str()),
+            Some("ch1")
         );
     }
 
     #[test]
-    fn the_cover_image_becomes_a_flagged_picture_pointing_at_the_stream() {
+    fn the_cover_image_becomes_the_documents_cover_picture_pointing_at_the_stream() {
         let document = fold(&default_book());
         assert_eq!(document.pictures.len(), 1);
         let picture = &document.pictures[0];
@@ -1390,16 +1327,22 @@ mod tests {
         assert_eq!(image.uri, "epub:OEBPS/images/cover.png");
         assert!(image.size.is_none(), "nothing here decodes an image");
 
-        let fields = &picture.meta.as_ref().expect("picture meta").custom_fields;
-        assert_eq!(field(fields, "epub.cover"), &Kind::BoolValue(true));
+        let meta = picture.meta.as_ref().expect("picture meta");
+        assert_eq!(meta.source_id.as_deref(), Some("res"), "the manifest id");
+        assert_eq!(meta.custom_fields, HashMap::new(), "no custom field bag");
         assert_eq!(
-            field(fields, "epub.href"),
-            &Kind::StringValue("OEBPS/images/cover.png".to_owned())
+            document
+                .source_meta
+                .as_ref()
+                .and_then(|meta| meta.cover.as_ref())
+                .map(|cover| cover.r#ref.as_str()),
+            Some("#/pictures/0"),
+            "the document names its cover"
         );
     }
 
     #[test]
-    fn a_picture_that_is_not_the_cover_is_not_flagged() {
+    fn a_picture_that_is_not_the_cover_is_not_named_as_it() {
         let mut events = default_book();
         events.insert(
             3,
@@ -1412,21 +1355,21 @@ mod tests {
         let document = fold(&events);
 
         assert_eq!(document.pictures.len(), 2);
-        let plate = &document.pictures[0].meta.as_ref().unwrap().custom_fields;
-        assert!(!plate.contains_key("epub.cover"));
-        let cover = &document.pictures[1].meta.as_ref().unwrap().custom_fields;
-        assert_eq!(field(cover, "epub.cover"), &Kind::BoolValue(true));
+        assert_eq!(
+            document
+                .source_meta
+                .as_ref()
+                .and_then(|meta| meta.cover.as_ref())
+                .map(|cover| cover.r#ref.as_str()),
+            Some("#/pictures/1")
+        );
     }
 
     #[test]
     fn items_carry_this_collector_and_its_version() {
         let document = fold(&default_book());
 
-        let source = &document.pictures[0].source;
-        assert_eq!(source.len(), 1);
-        let Some(doc::source_type::Source::Collector(collector)) = source[0].source.as_ref() else {
-            panic!("the only source is a collector");
-        };
+        let collector = stamp(&document.pictures[0].source);
         assert_eq!(collector.collector, "epub");
         assert_eq!(collector.version.as_deref(), Some("0.1.0"));
         assert!(collector.model.is_none(), "one engine, so no model");
@@ -1435,20 +1378,8 @@ mod tests {
             "a declarative mapping has no confidence to report"
         );
 
-        // Groups have no `source` field in this schema, so the same
-        // attribution rides in the group's meta.
-        let fields = &document.groups[0].meta.as_ref().unwrap().custom_fields;
-        let Kind::StructValue(stamp) = field(fields, "epub.collector") else {
-            panic!("the group stamp is an object");
-        };
-        assert_eq!(
-            stamp.fields["collector"].kind,
-            Some(Kind::StringValue("epub".to_owned()))
-        );
-        assert_eq!(
-            stamp.fields["version"].kind,
-            Some(Kind::StringValue("0.1.0".to_owned()))
-        );
+        // A chapter group carries the same stamp on its own `source`.
+        assert_eq!(stamp(&document.groups[0].source), collector);
     }
 
     #[test]
@@ -1705,22 +1636,47 @@ mod tests {
             "a package document declares no grammar for itself"
         );
 
-        // The six elements the old allow-list dropped, and the expression
-        // model's roles, in the untyped tail because nothing types them.
-        assert_eq!(meta.extra["epub.rights"], "Public domain");
-        assert_eq!(meta.extra["epub.source"], "urn:isbn:9781111111111");
-        assert_eq!(meta.extra["epub.type"], "monograph");
-        assert_eq!(meta.extra["epub.format"], "application/epub+zip");
-        assert_eq!(meta.extra["epub.coverage"], "England, 1843");
-        assert_eq!(meta.extra["epub.relation"], "urn:isbn:9782222222222");
+        assert_eq!(meta.publisher.as_deref(), Some("Analytical Press"));
         assert_eq!(
-            meta.extra["epub.title.subtitle"],
-            "Being an Account of Two Chapters"
+            meta.license.as_ref().and_then(|l| l.statement.as_deref()),
+            Some("Public domain"),
+            "dc:rights is a rights statement"
         );
-        assert_eq!(meta.extra["epub.role.Ada Lovelace"], "aut");
-        assert_eq!(meta.extra["epub.file-as.Ada Lovelace"], "Lovelace, Ada");
-        assert_eq!(meta.extra["epub.role.Charles Babbage"], "ill");
-        assert_eq!(meta.extra["epub.publisher"], "Analytical Press");
+        // Every credit, in file order, with its relator code and sort name
+        // typed: two creators with the same name no longer share a key.
+        assert_eq!(
+            meta.creators,
+            [
+                doc::Creator {
+                    name: "Charles Babbage".to_owned(),
+                    roles: vec!["ill".to_owned()],
+                    file_as: None,
+                },
+                doc::Creator {
+                    name: "Ada Lovelace".to_owned(),
+                    roles: vec!["aut".to_owned()],
+                    file_as: Some("Lovelace, Ada".to_owned()),
+                },
+            ]
+        );
+        // What Dublin Core leaves genuinely open, once each, in the open map.
+        let mut extra: Vec<(&str, &str)> = meta
+            .extra
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        extra.sort_unstable();
+        assert_eq!(
+            extra,
+            [
+                ("epub.coverage", "England, 1843"),
+                ("epub.format", "application/epub+zip"),
+                ("epub.relation", "urn:isbn:9782222222222"),
+                ("epub.source", "urn:isbn:9781111111111"),
+                ("epub.title.subtitle", "Being an Account of Two Chapters"),
+                ("epub.type", "monograph"),
+            ]
+        );
     }
 
     #[test]
@@ -1767,40 +1723,14 @@ mod tests {
     }
 
     #[test]
-    fn the_custom_fields_keep_only_what_the_schema_does_not_type() {
+    fn no_item_carries_a_custom_field_bag() {
         let mut fold = DocumentFold::new("0.1.0");
         fold.consume(&pb::parse_epub_response::Event::Info(expressive_info()));
-        let document = fold.take();
-        let fields = &body(&document)
-            .meta
-            .as_ref()
-            .expect("body meta")
-            .custom_fields;
-
-        // Open vocabulary, and the map is the honest type for it.
-        assert_eq!(
-            field(fields, "epub.rights"),
-            &Kind::StringValue("Public domain".to_owned())
-        );
-        let Kind::ListValue(credits) = field(fields, "epub.creator_roles") else {
-            panic!("creator roles is a list");
-        };
-        assert_eq!(credits.values.len(), 2);
-
-        // The facts that have a first-class slot are only in that slot.
-        for typed in [
-            "epub.language",
-            "epub.subjects",
-            "epub.creators",
-            "epub.date",
-            "epub.modified",
-            "epub.title",
-        ] {
-            assert!(
-                !fields.contains_key(typed),
-                "{typed} is typed, not a string"
-            );
+        for event in &default_book()[1..] {
+            fold.consume(event);
         }
+        let document = fold.take();
+        assert_eq!(bags(&document), Vec::<String>::new());
     }
 
     #[test]
@@ -1919,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn every_identifier_gets_its_own_key_rather_than_one_joined_string() {
+    fn every_identifier_is_its_own_typed_entry() {
         let mut fold = DocumentFold::new("0.1.0");
         fold.consume(&pb::parse_epub_response::Event::Info(pb::EpubInfo {
             identifiers: vec![
@@ -1936,18 +1866,28 @@ mod tests {
             ],
             ..Default::default()
         }));
-        let extra = fold.take().source_meta.expect("source meta").extra;
-
-        assert_eq!(extra["epub.identifier.0"], "urn:isbn:9780000000000");
-        assert_eq!(extra["epub.identifier.0.scheme"], "ISBN");
+        let meta = fold.take().source_meta.expect("source meta");
         assert_eq!(
-            extra["epub.identifier.1"], "urn:uuid:0000 0000",
-            "an identifier may contain a separator, which is why there is no separator"
+            meta.identifiers,
+            [
+                doc::Identifier {
+                    kind: "ISBN".to_owned(),
+                    value: "urn:isbn:9780000000000".to_owned(),
+                    scope: None,
+                    id: Some("bookid".to_owned()),
+                },
+                doc::Identifier {
+                    kind: String::new(),
+                    value: "urn:uuid:0000 0000".to_owned(),
+                    scope: None,
+                    id: None,
+                },
+            ]
         );
-        assert!(!extra.contains_key("epub.identifier.1.scheme"));
-        assert!(
-            !extra.contains_key("epub.identifiers"),
-            "the joined list is gone"
+        assert_eq!(
+            meta.extra,
+            HashMap::new(),
+            "no string keys built per identifier"
         );
     }
 
@@ -2071,37 +2011,141 @@ mod tests {
             "the narration runs to the end of the last cue"
         );
 
-        let fields = &document.groups[0]
-            .meta
-            .as_ref()
-            .expect("chapter meta")
-            .custom_fields;
+        let spine = document.groups[0].spine.as_ref().expect("spine facts");
         assert_eq!(
-            field(fields, "epub.media_overlay_href"),
-            &Kind::StringValue("OEBPS/overlays/ch1.smil".to_owned())
+            spine.overlay_href.as_deref(),
+            Some("OEBPS/overlays/ch1.smil")
         );
-        let Kind::ListValue(cues) = field(fields, "epub.media_overlay_cues") else {
-            panic!("cues are a list");
-        };
-        assert_eq!(cues.values.len(), 2);
-        let Some(Kind::StructValue(first)) = cues.values[0].kind.as_ref() else {
-            panic!("a cue is an object");
-        };
         assert_eq!(
-            first.fields["text_href"].kind,
-            Some(Kind::StringValue("OEBPS/text/chap1.xhtml#s1".to_owned()))
+            spine.overlay_cues,
+            [
+                doc::MediaOverlayCue {
+                    text_href: "OEBPS/text/chap1.xhtml#s1".to_owned(),
+                    audio_href: "OEBPS/audio/ch1.mp3".to_owned(),
+                    start_seconds: Some(0.0),
+                    end_seconds: Some(12.5),
+                    id: Some("p1".to_owned()),
+                },
+                doc::MediaOverlayCue {
+                    text_href: "OEBPS/text/chap1.xhtml#s2".to_owned(),
+                    audio_href: "OEBPS/audio/ch1.mp3".to_owned(),
+                    start_seconds: Some(12.5),
+                    end_seconds: Some(20.0),
+                    id: Some("p2".to_owned()),
+                },
+            ]
         );
-        assert_eq!(first.fields["end_time"].kind, Some(Kind::NumberValue(12.5)));
 
         // The second chapter is not narrated and says so by omission.
-        let second = &document.groups[1]
-            .meta
-            .as_ref()
-            .expect("chapter meta")
-            .custom_fields;
-        assert!(!second.contains_key("epub.media_overlay_href"));
-        assert!(!second.contains_key("epub.media_overlay_cues"));
+        let second = document.groups[1].spine.as_ref().expect("spine facts");
+        assert_eq!(second.overlay_href, None);
+        assert_eq!(second.overlay_cues, Vec::<doc::MediaOverlayCue>::new());
+        assert_eq!(document.warnings, Vec::<doc::CollectorWarning>::new());
         assert!(integrity_errors(&document).is_empty());
+    }
+
+    #[test]
+    fn an_overlay_for_a_chapter_the_spine_does_not_hold_is_a_warning() {
+        let mut events = default_book();
+        events.insert(
+            1,
+            pb::parse_epub_response::Event::MediaOverlay(pb::MediaOverlay {
+                source_href: "OEBPS/overlays/lost.smil".to_owned(),
+                chapter_href: "OEBPS/text/lost.xhtml".to_owned(),
+                cues: vec![
+                    pb::MediaOverlayCue {
+                        text_href: "OEBPS/text/lost.xhtml#s1".to_owned(),
+                        audio_href: "OEBPS/audio/lost.mp3".to_owned(),
+                        start_time: Some(0.0),
+                        end_time: Some(3.0),
+                        identifier: String::new(),
+                    };
+                    2
+                ],
+            }),
+        );
+        let document = fold(&events);
+        let [warning] = document.warnings.as_slice() else {
+            panic!("one warning: {:?}", document.warnings);
+        };
+        assert_eq!(
+            warning.code,
+            doc::WarningCode::SourceReferenceUnresolved as i32
+        );
+        assert_eq!(warning.count, Some(2), "how many cues have no home");
+        assert!(
+            warning.message.contains("OEBPS/overlays/lost.smil")
+                && warning.message.contains("OEBPS/text/lost.xhtml"),
+            "{}",
+            warning.message
+        );
+        assert_eq!(
+            warning.source.as_ref().map(|s| s.collector.as_str()),
+            Some(COLLECTOR)
+        );
+    }
+
+    #[test]
+    fn trailer_warnings_reach_the_document() {
+        let mut events = default_book();
+        let Some(pb::parse_epub_response::Event::Status(status)) = events.last_mut() else {
+            panic!("the trailer is last");
+        };
+        status.warnings = vec![
+            pb::ParseWarning {
+                code: pb::ParseWarningCode::MissingManifestEntry as i32,
+                message: "manifest item names a missing file".to_owned(),
+                href: "OEBPS/images/gone.png".to_owned(),
+            },
+            pb::ParseWarning {
+                code: pb::ParseWarningCode::Metadata as i32,
+                message: "unique-identifier names no dc:identifier".to_owned(),
+                href: String::new(),
+            },
+        ];
+        status.warnings_dropped = 5;
+        let document = fold(&events);
+        let found: Vec<(i32, &str, Option<u64>)> = document
+            .warnings
+            .iter()
+            .map(|w| (w.code, w.message.as_str(), w.count))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    doc::WarningCode::SourceReferenceUnresolved as i32,
+                    "manifest item names a missing file: OEBPS/images/gone.png",
+                    None
+                ),
+                (
+                    doc::WarningCode::SourceMetadataUnreadable as i32,
+                    "unique-identifier names no dc:identifier",
+                    None
+                ),
+                (
+                    doc::WarningCode::Unspecified as i32,
+                    "further warnings were raised past the trailer's cap and not listed",
+                    Some(5)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_wire_warning_code_has_a_fleet_code() {
+        for code in 1..=7 {
+            let wire = pb::ParseWarningCode::try_from(code).expect("a declared wire code");
+            assert_ne!(
+                fleet_warning_code(wire),
+                doc::WarningCode::Unspecified,
+                "{wire:?} maps to a fleet code"
+            );
+        }
+        assert!(
+            pb::ParseWarningCode::try_from(8).is_err(),
+            "a new wire code needs a fleet mapping here"
+        );
     }
 
     #[test]

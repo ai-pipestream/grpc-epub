@@ -73,12 +73,12 @@ What is mapped:
 
 | Event | Document |
 |---|---|
-| `info` | `Document.name` = title; `origin.mimetype` = `application/epub+zip`; `origin.binary_hash` = FNV-1a over the archive; `Document.source_meta` = `DocumentMeta{title, authors, created + created_raw, modified + modified_raw, language, keywords, extra}`; the body group's `BaseMeta.language` and `.keywords`; and the OPF fields that have no typed home under `epub.*` keys in the body group's `meta.custom_fields` (lists as `ListValue`, identifiers as `{value, scheme}` objects) |
+| `info` | `Document.name` = title; `origin.mimetype` = `application/epub+zip`; `origin.binary_hash` = FNV-1a over the archive; `Document.source_meta` = `DocumentMeta{title, authors, creators (name, relator roles, file-as), identifiers (scheme, value, id), publisher, description, license.statement (dc:rights), format_version (EPUB version), epub (opf, nav and ncx hrefs, the unique identifier's id), created + created_raw, modified + modified_raw, language, keywords, extra}`; the body group's `BaseMeta.language` and `.keywords`. No `custom_fields` anywhere |
 | `navigation` | `Document.outline`, one `OutlineEntry{title, level, target}` per nav point, depth-first in reading order; `target` is a `FineRef` at the chapter group the entry names, unset when the href resolves to no spine item |
-| `chapter` | one `GROUP_LABEL_CHAPTER` group under `#/body`, `name` = resolved href, meta `epub.idref` / `epub.media_type` / `epub.linear` / `epub.spine_index` / `epub.properties` / `epub.media_overlay_href` |
-| `media_overlay` | `Document.media.duration_ms` = where the last cue ends, and the cues on the narrated chapter's group as `epub.media_overlay_cues` |
-| `resource`, image | one `PictureItem` under `#/body`, `label = DOC_ITEM_LABEL_PICTURE`, `ImageRef{mimetype, uri = "epub:<href>"}`, meta `epub.href` / `epub.manifest_id` / `epub.cover` |
-| `status` | nothing; it is a receipt of counts the items already imply |
+| `chapter` | one `GROUP_LABEL_CHAPTER` group under `#/body`, `name` = resolved href, `source` = the collector stamp, `spine` = `SpineItemMeta{idref, media_type, linear, spine_index, properties, overlay_href}` |
+| `media_overlay` | `Document.media.duration_ms` = where the last cue ends, and the cues on the narrated chapter's `SpineItemMeta.overlay_cues`, typed; an overlay for a chapter not in the spine is a `SOURCE_REFERENCE_UNRESOLVED` warning in `Document.warnings` |
+| `resource`, image | one `PictureItem` under `#/body`, `label = DOC_ITEM_LABEL_PICTURE`, `ImageRef{mimetype, uri = "epub:<href>"}`, `PictureMeta.source_id` = the manifest id; the cover is `DocumentMeta.cover`, a ref to its picture |
+| `status` | each warning a `Document.warnings` entry with the fleet code its wire code stands for and the href in its message, plus one entry counting `warnings_dropped`; the counts stay on the stream |
 
 **Typed slots win, and the old keys are gone.** `dc:language`,
 `dc:subject`, the title, the creators and the dates once existed
@@ -117,21 +117,14 @@ written whenever the book stated a date at all, not only on failure: reading
 book never wrote, and the twin is what makes that reading reversible.
 
 **`extra` keeps the open vocabulary, and it is the right type for it.**
-`epub.publisher`, `epub.description`, `epub.rights`, `epub.source`,
-`epub.type`, `epub.format`, `epub.coverage`, `epub.relation`, the
-`epub.title.<title-type>` subtitles, the `epub.role.<name>` MARC relators and
-`epub.file-as.<name>` sort names, `epub.unique_identifier`, `epub.version` and
-`epub.opf_href` all stay. None of them has a typed field in the schema, and
-none of them should: a MARC relator list runs to hundreds of codes, a producer
-may invent any `<meta property="…">` it likes, and Dublin Core's
-`rights`/`source`/`type`/`format`/`coverage`/`relation` are prose by design.
-`epub.creator_roles` stays on the body group for the same reason.
-
-One thing did change shape inside `extra`. Every `dc:identifier` used to be
-squashed into a single space-joined `epub.identifiers` value; each now has its
-own key, `epub.identifier.<n>` with `epub.identifier.<n>.scheme` beside it,
-because an identifier is free to contain a space and a reader after the third
-one should not have to know this fold's separator.
+`epub.source`, `epub.type`, `epub.format`, `epub.coverage`, `epub.relation`
+and the `epub.title.<title-type>` subtitles stay, once each. Everything else
+the OPF states has a typed field now: the publisher, the description and the
+rights statement; every credit as a `Creator` with its MARC relator codes and
+sort name (so two people with the same name are two credits, not one key);
+every `dc:identifier` as an `Identifier` with its scheme and its own id; the
+EPUB version as `format_version`; and the package's own files and the id its
+`unique-identifier` names as `DocumentMeta.epub`.
 
 The Document also carries the schema identifier declared by the vendored
 schema, copied through verbatim:
@@ -178,7 +171,9 @@ even for the cover. `ImageRef.size` is left unset because nothing here decodes
 an image; a `Size` of 0x0 would be a claim rather than a gap.
 
 **Provenance.** No `prov` anywhere: an EPUB is reflowable and has no pages and
-no bounding boxes. Source locators go in `meta.custom_fields` instead.
+no bounding boxes. Source locators are typed: a chapter's spine facts on
+`GroupItem.spine`, a picture's manifest id on `PictureMeta.source_id`, its
+href in `ImageRef.uri`.
 
 **`DocumentOrigin.filename`.** The server is handed bytes on a gRPC stream and
 is never told what the file was called.
@@ -199,10 +194,12 @@ identifier}`) hangs on text items, a cue addresses a fragment *inside* a
 chapter, and this fold emits chapter groups with no children. Until the HTML
 collector contributes those items downstream, the Document carries the
 narration length in `MediaMeta.duration_ms` (a typed slot, a real fact) and the
-cues as the `epub.media_overlay_cues` tail on the chapter group. Which chapters
+cues on the chapter group's `SpineItemMeta.overlay_cues`. Which chapters
 have narration at all is a manifest fact and is reported either way, on
-`Chapter.media_overlay_href` and `epub.media_overlay_href`, whether or not the
-SMIL was parsed.
+`Chapter.media_overlay_href` and `SpineItemMeta.overlay_href`, whether or not
+the SMIL was parsed. An overlay naming a chapter the spine does not hold has
+no group to ride on; it becomes a `SOURCE_REFERENCE_UNRESOLVED` warning that
+names the overlay, the chapter and how many cues it holds.
 
 **Chapter to picture attribution.** Which chapter references an image is a fact
 about the XHTML, so pictures hang off the body rather than off a chapter group.
@@ -211,17 +208,13 @@ spine item's picture is the exception again: that image is the chapter.
 
 Two conventions worth restating:
 
-- `GroupItem` has no `source` field in this schema, so a chapter group cannot
-  carry a `CollectorSource` the way a picture does; the same attribution rides
-  in the group's meta under `epub.collector` as `{collector, version}`. In this
-  schema `source` exists only on `DocItem`, `NodeItem` forbids extra fields,
-  and namespaced custom meta fields are the sanctioned extension point, so this
-  is the intended shape, not a workaround. Keeping one group per spine item
+- A chapter group carries the collector stamp on `GroupItem.source`, the way
+  a picture carries it on its own `source`. Keeping one group per spine item
   also preserves chapter identity, which a fold into a single concatenated HTML
   string would lose. Pictures carry the real thing: `collector = "epub"`,
   `version` = the running build, no `model` (one engine) and no `confidence`
   (a declarative mapping has none to report).
-- The `epub.*` book metadata is on the body group, and root meta is
+- The book metadata is in `Document.source_meta`, and root meta is
   first-writer-wins in the coordinator's additive merge: if another collector's
   fragment lands first, those keys can be dropped. Per-item meta does not have
   that problem.

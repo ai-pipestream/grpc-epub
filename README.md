@@ -130,10 +130,14 @@ What it contains is the skeleton of the book:
 - The book's table of contents is `Document.outline` and, when the media
   overlays were parsed, the narration's length is `Document.media.duration_ms`.
 - One `GROUP_LABEL_CHAPTER` group per spine item, in spine order, named by its
-  resolved href, carrying `epub.idref`, `epub.media_type`, `epub.linear`,
-  `epub.spine_index` and `epub.properties`.
-- One `PictureItem` per emitted image resource, carrying `epub.href`,
-  `epub.manifest_id` and, for the cover, `epub.cover`.
+  resolved href, its spine facts typed in `GroupItem.spine` (`idref`,
+  `media_type`, `linear`, `spine_index`, `properties`, the overlay href and,
+  when the overlays were parsed, its cues) and the collector stamp on
+  `GroupItem.source`.
+- One `PictureItem` per emitted image resource, its manifest id in
+  `PictureMeta.source_id`; the cover is `DocumentMeta.cover`, a ref to it.
+- The stream's warnings in `Document.warnings`, each with a fleet
+  `WarningCode`.
 
 The chapter groups have no children, on purpose: chapter XHTML is not parsed
 here, and the groups exist so the HTML collector's items can merge into them
@@ -153,13 +157,13 @@ and leaves the typed field unset rather than being guessed at. The reader is
 library, and no timezone invented beyond the UTC default the profile itself
 specifies.
 
-`DocumentMeta.extra` and the body group's `meta.custom_fields` carry what
-Dublin Core leaves genuinely open, and only that: `epub.publisher`,
-`epub.rights`, `epub.source`, `epub.type`, `epub.format`, `epub.coverage`,
-`epub.relation`, `epub.description`, the MARC relator roles and sort names,
-subtitles by their `title-type`, and each `dc:identifier` on its own key. A
-fact the schema types is written to its typed field and nowhere else: a string
-copy beside a typed field is a second answer with no tiebreaker.
+The publisher, description, rights statement, identifiers (with their ids),
+credits (with relator codes and sort names), EPUB version and package files
+are typed `DocumentMeta` fields. `DocumentMeta.extra` carries only what Dublin
+Core leaves genuinely open: `epub.source`, `epub.type`, `epub.format`,
+`epub.coverage`, `epub.relation` and subtitles by their `title-type`. Nothing
+is written to a `custom_fields` bag, and a fact the schema types is written
+to its typed field and nowhere else.
 
 **No bytes go inside the Document.** A Document is one gRPC message and clients
 commonly cap receives at 4 MiB, so `ImageRef.uri` is a pointer, not a data URI:

@@ -13,7 +13,6 @@ mod common;
 
 use grpc_epub::document_fold::integrity_errors;
 use grpc_epub::proto::v1 as pb;
-use prost_types::value::Kind;
 
 /// Options that ask for the projection and nothing else.
 fn with_document() -> pb::ParseOptions {
@@ -357,10 +356,19 @@ async fn the_document_carries_the_books_own_metadata_typed() {
     assert_eq!(meta.language.as_deref(), Some("en-GB"));
     assert_eq!(meta.keywords, ["Computing"]);
 
-    // Dublin Core's open half, which no typed field claims.
-    assert_eq!(meta.extra["epub.publisher"], "Analytical Press");
-    assert_eq!(meta.extra["epub.identifier.0"], "urn:isbn:9780000000000");
-    assert_eq!(meta.extra["epub.identifier.0.scheme"], "ISBN");
+    // The publisher and the identifiers have typed slots now.
+    assert_eq!(meta.publisher.as_deref(), Some("Analytical Press"));
+    assert_eq!(meta.identifiers.len(), 1);
+    assert_eq!(meta.identifiers[0].value, "urn:isbn:9780000000000");
+    assert_eq!(meta.identifiers[0].kind, "ISBN");
+    assert!(
+        !meta
+            .extra
+            .keys()
+            .any(|key| key.starts_with("epub.identifier") || key == "epub.publisher"),
+        "and no string copy beside them: {:?}",
+        meta.extra
+    );
 
     let body = document
         .body
@@ -383,9 +391,12 @@ async fn the_document_carries_the_books_own_metadata_typed() {
         "epub.creators",
         "epub.date",
     ] {
-        assert!(!body.custom_fields.contains_key(typed), "{typed} is typed");
         assert!(!meta.extra.contains_key(typed), "{typed} is typed");
     }
+    assert!(
+        body.custom_fields.is_empty(),
+        "no custom field bag on the body"
+    );
 }
 
 #[tokio::test]
@@ -496,17 +507,13 @@ async fn a_narrated_chapter_says_so_without_the_overlay_being_parsed() {
     assert_eq!(chapters[1].media_overlay_href, "");
 
     let document = common::documents(&events)[0];
-    let fields = &document.groups[0]
-        .meta
-        .as_ref()
-        .expect("chapter meta")
-        .custom_fields;
+    let spine = document.groups[0].spine.as_ref().expect("spine facts");
     assert_eq!(
-        fields["epub.media_overlay_href"].kind,
-        Some(Kind::StringValue("OEBPS/overlays/chap1.smil".to_owned()))
+        spine.overlay_href.as_deref(),
+        Some("OEBPS/overlays/chap1.smil")
     );
     assert!(
-        !fields.contains_key("epub.media_overlay_cues"),
+        spine.overlay_cues.is_empty(),
         "no cues were read, so none are claimed"
     );
     assert!(document.media.is_none());
@@ -560,15 +567,13 @@ async fn asking_for_media_overlays_yields_cue_level_timings() {
             .expect("a duration"),
         20_000.0
     );
-    let fields = &document.groups[0]
-        .meta
+    let cues = &document.groups[0]
+        .spine
         .as_ref()
-        .expect("chapter meta")
-        .custom_fields;
-    let Some(Kind::ListValue(cues)) = fields["epub.media_overlay_cues"].kind.as_ref() else {
-        panic!("the cues are a list");
-    };
-    assert_eq!(cues.values.len(), 2);
+        .expect("spine facts")
+        .overlay_cues;
+    assert_eq!(cues.len(), 2);
+    assert_eq!(cues[1].end_seconds, Some(20.0));
     assert!(integrity_errors(document).is_empty());
 }
 
