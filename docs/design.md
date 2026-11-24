@@ -116,9 +116,13 @@ written whenever the book stated a date at all, not only on failure: reading
 `1843-10-01` as an instant means taking W3CDTF's UTC default for an offset the
 book never wrote, and the twin is what makes that reading reversible.
 
-**`extra` keeps the open vocabulary, and it is the right type for it.**
-`epub.source`, `epub.type`, `epub.format`, `epub.coverage`, `epub.relation`
-and the `epub.title.<title-type>` subtitles stay, once each. Everything else
+**Nothing goes in `extra`.** The titles beside the main one are
+`title_variants`, each with its `title-type` as a `TitleKind` (a kind EPUB does
+not name is `TITLE_KIND_OTHER` with the book's own word in `kind_raw`, and an
+EPUB 2 title with no kind that is not the main title is kept with none). The
+Dublin Core elements with no field of their own (source, type, format, coverage,
+relation) are `dublin_core` statements, every one in file order with its
+`opf:scheme`. Everything else
 the OPF states has a typed field now: the publisher, the description and the
 rights statement; every credit as a `Creator` with its MARC relator codes and
 sort name (so two people with the same name are two credits, not one key);

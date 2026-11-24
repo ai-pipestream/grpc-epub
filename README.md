@@ -159,10 +159,11 @@ specifies.
 
 The publisher, description, rights statement, identifiers (with their ids),
 credits (with relator codes and sort names), EPUB version and package files
-are typed `DocumentMeta` fields. `DocumentMeta.extra` carries only what Dublin
-Core leaves genuinely open: `epub.source`, `epub.type`, `epub.format`,
-`epub.coverage`, `epub.relation` and subtitles by their `title-type`. Nothing
-is written to a `custom_fields` bag, and a fact the schema types is written
+are typed `DocumentMeta` fields. So are the titles beside the main one
+(`title_variants`, each with its `title-type` as a `TitleKind`) and every
+`dc:source`, `dc:type`, `dc:format`, `dc:coverage` and `dc:relation`
+(`dublin_core`, in file order, with its `opf:scheme`). Nothing is written to
+`DocumentMeta.extra` or to a `custom_fields` bag, and a fact the schema types is written
 to its typed field and nowhere else.
 
 **No bytes go inside the Document.** A Document is one gRPC message and clients
