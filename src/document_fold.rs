@@ -352,9 +352,11 @@ impl DocumentFold {
                 duration_ms: Some(narration_ms),
                 // Who reads the book aloud is not something an overlay states;
                 // it aligns text with audio and names no voice. `codec` would
-                // mean decoding the audio, which nothing here does.
+                // mean decoding the audio, which nothing here does, and so
+                // would every stream fact (rate, channels, video).
                 speakers: Vec::new(),
                 codec: None,
+                ..doc::MediaMeta::default()
             });
         }
     }
