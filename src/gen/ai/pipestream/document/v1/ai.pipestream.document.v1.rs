@@ -101,7 +101,7 @@ pub struct Document {
     #[prost(message, repeated, tag="19")]
     pub meta_tags: ::prost::alloc::vec::Vec<MetaTag>,
     /// Machine-readable structured data blocks embedded in the source
-    /// (JSON-LD, microdata, OpenGraph), verbatim.
+    /// (JSON-LD, microdata, OpenGraph), decoded.
     #[prost(message, repeated, tag="20")]
     pub structured_data: ::prost::alloc::vec::Vec<StructuredData>,
     /// Media stream metadata for audio and video sources.
@@ -195,6 +195,18 @@ pub struct CollectorWarning {
     /// repeats of the same finding into it. Unset means one.
     #[prost(uint64, optional, tag="8")]
     pub count: ::core::option::Option<u64>,
+    /// The sheet cell the warning is about, when it is about one cell: the
+    /// sheet's name and the cell's zero-based row and column. item_ref still
+    /// names the table the cell belongs to.
+    #[prost(message, optional, tag="9")]
+    pub cell: ::core::option::Option<GridCell>,
+    /// For a warning about a recording that was cut: how much of its timeline
+    /// is in the document and how long the media says it is, in milliseconds.
+    /// duration_total_ms is unset when the media states no length.
+    #[prost(uint64, optional, tag="10")]
+    pub duration_kept_ms: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag="11")]
+    pub duration_total_ms: ::core::option::Option<u64>,
 }
 /// TextAnalysis is one analyzer run over a window of the document's text
 /// stream: the stream ConvertDocumentResponse.text_offsets indexes, every text
@@ -984,6 +996,12 @@ pub struct ProvenanceItem {
     /// half-open), for line-addressed sources.
     #[prost(message, optional, tag="8")]
     pub line_range: ::core::option::Option<LineSpan>,
+    /// How sure the reader is that the content at this location is what it
+    /// read, from 0 to 1, when the reader states it per location (a speech
+    /// recognizer's probability for one word, an OCR engine's for one line).
+    /// Unset when the reader gives none: unknown, not zero.
+    #[prost(double, optional, tag="9")]
+    pub confidence: ::core::option::Option<f64>,
 }
 /// LineSpan is a half-open 1-based source line range.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1031,6 +1049,11 @@ pub struct ImageRef {
     /// image held elsewhere.
     #[prost(bytes="vec", optional, tag="6")]
     pub data: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// The reference exactly as the source wrote it (an HTML src attribute
+    /// such as "../images/a.jpg"), when `uri` holds a resolved form of it.
+    /// Unset when `uri` is the source's own spelling.
+    #[prost(string, optional, tag="7")]
+    pub source_ref: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Size represents 2D dimensions (width and height).
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -1054,7 +1077,10 @@ pub struct DescriptionAnnotation {
     #[prost(string, tag="3")]
     pub provenance: ::prost::alloc::string::String,
 }
-/// MiscAnnotation holds arbitrary annotation data as a struct.
+/// MiscAnnotation holds arbitrary annotation data as a struct. It exists
+/// for the upstream dialect only and no producer in the fleet writes it: an
+/// annotation whose shape is known gets a typed arm on PictureAnnotation or
+/// TableAnnotation, as the barcode did.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MiscAnnotation {
     #[prost(string, tag="1")]
@@ -1108,7 +1134,8 @@ pub struct PictureTabularChartData {
     #[prost(message, optional, tag="3")]
     pub chart_data: ::core::option::Option<TableData>,
 }
-/// ChartLine represents a single line in a line chart.
+/// ChartLine represents a single line in a line chart. `label` is the name
+/// of the series the line draws.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChartLine {
     #[prost(string, tag="1")]
@@ -1151,6 +1178,12 @@ pub struct PictureBarChartData {
     pub y_axis_label: ::prost::alloc::string::String,
     #[prost(message, repeated, tag="5")]
     pub bars: ::prost::alloc::vec::Vec<ChartBar>,
+    /// The name of the series these bars belong to, as the source states it.
+    /// The message holds one series, so a chart with several series is one
+    /// annotation per series and this field tells them apart. Unset when the
+    /// source does not name the series.
+    #[prost(string, optional, tag="6")]
+    pub series_name: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// ChartStackedBar represents a stacked bar with multiple labeled segments.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1191,6 +1224,10 @@ pub struct PicturePieChartData {
     pub title: ::prost::alloc::string::String,
     #[prost(message, repeated, tag="3")]
     pub slices: ::prost::alloc::vec::Vec<ChartSlice>,
+    /// The name of the series these slices belong to, as on
+    /// PictureBarChartData.
+    #[prost(string, optional, tag="4")]
+    pub series_name: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// ChartPoint represents a single point in a scatter chart.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -1216,6 +1253,10 @@ pub struct PictureScatterChartData {
     pub y_axis_label: ::prost::alloc::string::String,
     #[prost(message, repeated, tag="5")]
     pub points: ::prost::alloc::vec::Vec<ChartPoint>,
+    /// The name of the series these points belong to, as on
+    /// PictureBarChartData.
+    #[prost(string, optional, tag="6")]
+    pub series_name: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// PictureAnnotation is a union of all annotation types that can appear on a picture.
 ///
@@ -1562,6 +1603,13 @@ pub struct TableData {
     /// What the table is, when it is not a table the source laid out.
     #[prost(enumeration="TableKind", tag="13")]
     pub kind: i32,
+    /// Where grid cell (0, 0) sits in the source's own grid, for a table cut
+    /// out of a larger one: a sheet whose used range starts at M50 has origin
+    /// row 49, col 12, and its grid holds the used range only. A cell's
+    /// position in the source is its grid position plus the origin. Unset
+    /// when the grid starts at the source's first row and column.
+    #[prost(message, optional, tag="14")]
+    pub origin: ::core::option::Option<GridCell>,
 }
 /// One named table declared by a workbook, preserving its own schema and bands.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2181,6 +2229,53 @@ pub struct DocumentMeta {
     /// What an EPUB package says about its own files.
     #[prost(message, optional, tag="50")]
     pub epub: ::core::option::Option<EpubPackageMeta>,
+    /// Titles the source states beside its main one (a subtitle, a short
+    /// title, the title of the collection it belongs to), each with its kind.
+    /// `title` stays the main title.
+    #[prost(message, repeated, tag="51")]
+    pub title_variants: ::prost::alloc::vec::Vec<TitleVariant>,
+    /// Dublin Core statements the source makes that have no field of their
+    /// own above (source, type, format, coverage, relation), one entry per
+    /// statement in source order. A statement that has a typed field (a
+    /// dc:creator is `creators`, a dc:publisher is `publisher`) goes there
+    /// and is not repeated here.
+    #[prost(message, repeated, tag="52")]
+    pub dublin_core: ::prost::alloc::vec::Vec<DublinCoreStatement>,
+}
+/// TitleVariant is one title a source states beside its main title.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TitleVariant {
+    #[prost(string, tag="1")]
+    pub value: ::prost::alloc::string::String,
+    #[prost(enumeration="TitleKind", tag="2")]
+    pub kind: i32,
+    /// The kind as the source spelled it, when it is none of the named ones
+    /// (kind is TITLE_KIND_OTHER then).
+    #[prost(string, optional, tag="3")]
+    pub kind_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// BCP 47 language tag of this title, when the source states one.
+    #[prost(string, optional, tag="4")]
+    pub language: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// DublinCoreStatement is one Dublin Core element a source states.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DublinCoreStatement {
+    #[prost(enumeration="DublinCoreElement", tag="1")]
+    pub element: i32,
+    #[prost(string, tag="2")]
+    pub value: ::prost::alloc::string::String,
+    /// The encoding scheme the source names for the value (opf:scheme,
+    /// xsi:type), when it names one.
+    #[prost(string, optional, tag="3")]
+    pub scheme: ::core::option::Option<::prost::alloc::string::String>,
+    /// BCP 47 language tag of the value, when the source states one.
+    #[prost(string, optional, tag="4")]
+    pub language: ::core::option::Option<::prost::alloc::string::String>,
+    /// The term as the source wrote it when it refines an element or lies
+    /// outside the fifteen ("dcterms:isPartOf"); `element` is then the
+    /// element it refines, or DUBLIN_CORE_ELEMENT_UNSPECIFIED.
+    #[prost(string, optional, tag="5")]
+    pub term: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// EpubPackageMeta names the files an EPUB package is built from, as paths
 /// inside the container.
@@ -2536,15 +2631,106 @@ pub struct MetaTag {
     #[prost(string, tag="2")]
     pub content: ::prost::alloc::string::String,
 }
-/// StructuredData is one machine-readable data block embedded in the source,
-/// verbatim.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+/// StructuredData is one machine-readable data block embedded in the source
+/// (a JSON-LD script, a microdata or RDFa scope), decoded into the things it
+/// describes. The block's own text is not repeated here: where the source
+/// holds it as text, `item_ref` names the document item that carries it.
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StructuredData {
-    /// The block's dialect: json-ld, microdata, opengraph, rdfa.
+    /// Superseded by `dialect` and `items`: the dialect as a free word and the
+    /// block as JSON text. A producer fills the typed fields; these two stay
+    /// for readers of documents written before them.
+    #[deprecated]
     #[prost(string, tag="1")]
     pub kind: ::prost::alloc::string::String,
+    #[deprecated]
     #[prost(string, tag="2")]
     pub json: ::prost::alloc::string::String,
+    /// The dialect the block is written in.
+    #[prost(enumeration="StructuredDataKind", tag="3")]
+    pub dialect: i32,
+    /// The things the block describes, in source order. Empty when the block
+    /// did not parse (WARNING_CODE_STRUCTURED_DATA_NOT_DECODED says so).
+    #[prost(message, repeated, tag="4")]
+    pub items: ::prost::alloc::vec::Vec<LinkedDataItem>,
+    /// The vocabularies the block declares for its terms (a JSON-LD @context
+    /// IRI such as "<https://schema.org",> an RDFa vocab), in source order.
+    #[prost(string, repeated, tag="5")]
+    pub contexts: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The self_ref of the document item that holds the block's own text (the
+    /// script element's text item), when there is one.
+    #[prost(string, optional, tag="6")]
+    pub item_ref: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// LinkedDataItem is one thing a structured data block describes: what it
+/// is, which identifier it has and what the block says about it. It is the
+/// model JSON-LD nodes, microdata items and RDFa subjects share.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinkedDataItem {
+    /// The item's identifier (a JSON-LD @id, a microdata itemid, an RDFa
+    /// about), when the source gives it one.
+    #[prost(string, optional, tag="1")]
+    pub id: ::core::option::Option<::prost::alloc::string::String>,
+    /// The item's types as the source wrote them (a JSON-LD @type, a
+    /// microdata itemtype, an RDFa typeof): "Article",
+    /// "<https://schema.org/Person".>
+    #[prost(string, repeated, tag="2")]
+    pub types: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// What the block says about the item, in source order.
+    #[prost(message, repeated, tag="3")]
+    pub properties: ::prost::alloc::vec::Vec<LinkedDataProperty>,
+}
+/// LinkedDataProperty is one named property of a LinkedDataItem with every
+/// value the source gives it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinkedDataProperty {
+    /// The property's name as the source wrote it ("headline",
+    /// "<https://schema.org/author",> "og:title").
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    /// The property's values, in source order. A property the source states
+    /// with no value (a JSON null) has none.
+    #[prost(message, repeated, tag="2")]
+    pub values: ::prost::alloc::vec::Vec<LinkedDataValue>,
+}
+/// LinkedDataValue is one value of a LinkedDataProperty, in the type the
+/// source gives it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinkedDataValue {
+    /// BCP 47 language tag of a text value, when the source states one
+    /// (a JSON-LD @language).
+    #[prost(string, optional, tag="7")]
+    pub language: ::core::option::Option<::prost::alloc::string::String>,
+    /// The datatype the source names for the value (a JSON-LD value object's
+    /// @type, an RDFa datatype), when it names one.
+    #[prost(string, optional, tag="8")]
+    pub datatype: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(oneof="linked_data_value::Kind", tags="1, 2, 3, 4, 5, 6")]
+    pub kind: ::core::option::Option<linked_data_value::Kind>,
+}
+/// Nested message and enum types in `LinkedDataValue`.
+pub mod linked_data_value {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(string, tag="1")]
+        Text(::prost::alloc::string::String),
+        /// A number the source writes with a fraction or an exponent.
+        #[prost(double, tag="2")]
+        Number(f64),
+        /// A number the source writes as an integer.
+        #[prost(int64, tag="3")]
+        Integer(i64),
+        #[prost(bool, tag="4")]
+        Boolean(bool),
+        /// A thing described in place.
+        #[prost(message, tag="5")]
+        Item(super::LinkedDataItem),
+        /// A thing named by its identifier alone and described elsewhere (a
+        /// JSON-LD object that holds only @id, a microdata itemref, an RDFa
+        /// resource).
+        #[prost(string, tag="6")]
+        Reference(::prost::alloc::string::String),
+    }
 }
 /// MediaMeta describes the media stream a transcript came from.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3271,6 +3457,10 @@ pub enum WarningCode {
     /// it names is not in the document, or its kind does not take the
     /// annotation); the result is not in the document.
     EnrichmentNotApplied = 46,
+    /// A structured data block embedded in the source (JSON-LD) does not
+    /// parse, so the document carries no items for it. The block's own text
+    /// is still in the document, at item_ref.
+    StructuredDataNotDecoded = 47,
     // -- Streams and archives --------------------------------------------
 
     /// A collector's stream ended before the collector said it was complete.
@@ -3325,6 +3515,13 @@ pub enum WarningCode {
     /// trailing record, a file shorter than its declared layout). What was
     /// complete is in the document.
     SourceInputIncomplete = 68,
+    /// The collector failed part way through reading one part of the source
+    /// (a shape, a cell, an embedded object) and went on with the next. What
+    /// it had read of that part is in the document and the rest of the part
+    /// is absent; item_ref, cell or page_no names the part where the
+    /// collector knows it. Unlike SOURCE_CONTENT_TRUNCATED no limit was
+    /// reached: the content after the part is in the document.
+    SourcePartReadFailed = 69,
 }
 impl WarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -3364,6 +3561,7 @@ impl WarningCode {
             Self::PayloadNotDecoded => "WARNING_CODE_PAYLOAD_NOT_DECODED",
             Self::PictureImagesSkipped => "WARNING_CODE_PICTURE_IMAGES_SKIPPED",
             Self::EnrichmentNotApplied => "WARNING_CODE_ENRICHMENT_NOT_APPLIED",
+            Self::StructuredDataNotDecoded => "WARNING_CODE_STRUCTURED_DATA_NOT_DECODED",
             Self::CollectorStreamIncomplete => "WARNING_CODE_COLLECTOR_STREAM_INCOMPLETE",
             Self::ArchiveTruncated => "WARNING_CODE_ARCHIVE_TRUNCATED",
             Self::CollectorCountMismatch => "WARNING_CODE_COLLECTOR_COUNT_MISMATCH",
@@ -3377,6 +3575,7 @@ impl WarningCode {
             Self::SourceStructureMalformed => "WARNING_CODE_SOURCE_STRUCTURE_MALFORMED",
             Self::SourceContentTruncated => "WARNING_CODE_SOURCE_CONTENT_TRUNCATED",
             Self::SourceInputIncomplete => "WARNING_CODE_SOURCE_INPUT_INCOMPLETE",
+            Self::SourcePartReadFailed => "WARNING_CODE_SOURCE_PART_READ_FAILED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3413,6 +3612,7 @@ impl WarningCode {
             "WARNING_CODE_PAYLOAD_NOT_DECODED" => Some(Self::PayloadNotDecoded),
             "WARNING_CODE_PICTURE_IMAGES_SKIPPED" => Some(Self::PictureImagesSkipped),
             "WARNING_CODE_ENRICHMENT_NOT_APPLIED" => Some(Self::EnrichmentNotApplied),
+            "WARNING_CODE_STRUCTURED_DATA_NOT_DECODED" => Some(Self::StructuredDataNotDecoded),
             "WARNING_CODE_COLLECTOR_STREAM_INCOMPLETE" => Some(Self::CollectorStreamIncomplete),
             "WARNING_CODE_ARCHIVE_TRUNCATED" => Some(Self::ArchiveTruncated),
             "WARNING_CODE_COLLECTOR_COUNT_MISMATCH" => Some(Self::CollectorCountMismatch),
@@ -3426,6 +3626,7 @@ impl WarningCode {
             "WARNING_CODE_SOURCE_STRUCTURE_MALFORMED" => Some(Self::SourceStructureMalformed),
             "WARNING_CODE_SOURCE_CONTENT_TRUNCATED" => Some(Self::SourceContentTruncated),
             "WARNING_CODE_SOURCE_INPUT_INCOMPLETE" => Some(Self::SourceInputIncomplete),
+            "WARNING_CODE_SOURCE_PART_READ_FAILED" => Some(Self::SourcePartReadFailed),
             _ => None,
         }
     }
@@ -4880,6 +5081,125 @@ impl ReferenceKind {
         }
     }
 }
+/// TitleKind names what a TitleVariant is to the main title. The values
+/// follow the EPUB 3 title-type vocabulary, which JATS (subtitle, alt-title)
+/// and MODS (titleInfo type) map onto.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TitleKind {
+    Unspecified = 0,
+    Subtitle = 1,
+    /// A shortened form of the title (a running head, an abbreviated title).
+    Short = 2,
+    /// The title of the series or collection the document belongs to.
+    Collection = 3,
+    /// The designation of this edition ("Second edition").
+    Edition = 4,
+    /// The complete title: main title, subtitle and the rest in one string.
+    Expanded = 5,
+    /// Any other kind; kind_raw holds the source's own word.
+    Other = 6,
+}
+impl TitleKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TITLE_KIND_UNSPECIFIED",
+            Self::Subtitle => "TITLE_KIND_SUBTITLE",
+            Self::Short => "TITLE_KIND_SHORT",
+            Self::Collection => "TITLE_KIND_COLLECTION",
+            Self::Edition => "TITLE_KIND_EDITION",
+            Self::Expanded => "TITLE_KIND_EXPANDED",
+            Self::Other => "TITLE_KIND_OTHER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TITLE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "TITLE_KIND_SUBTITLE" => Some(Self::Subtitle),
+            "TITLE_KIND_SHORT" => Some(Self::Short),
+            "TITLE_KIND_COLLECTION" => Some(Self::Collection),
+            "TITLE_KIND_EDITION" => Some(Self::Edition),
+            "TITLE_KIND_EXPANDED" => Some(Self::Expanded),
+            "TITLE_KIND_OTHER" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+/// DublinCoreElement is one of the fifteen elements of the Dublin Core
+/// Metadata Element Set, version 1.1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DublinCoreElement {
+    Unspecified = 0,
+    Contributor = 1,
+    Coverage = 2,
+    Creator = 3,
+    Date = 4,
+    Description = 5,
+    Format = 6,
+    Identifier = 7,
+    Language = 8,
+    Publisher = 9,
+    Relation = 10,
+    Rights = 11,
+    Source = 12,
+    Subject = 13,
+    Title = 14,
+    Type = 15,
+}
+impl DublinCoreElement {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "DUBLIN_CORE_ELEMENT_UNSPECIFIED",
+            Self::Contributor => "DUBLIN_CORE_ELEMENT_CONTRIBUTOR",
+            Self::Coverage => "DUBLIN_CORE_ELEMENT_COVERAGE",
+            Self::Creator => "DUBLIN_CORE_ELEMENT_CREATOR",
+            Self::Date => "DUBLIN_CORE_ELEMENT_DATE",
+            Self::Description => "DUBLIN_CORE_ELEMENT_DESCRIPTION",
+            Self::Format => "DUBLIN_CORE_ELEMENT_FORMAT",
+            Self::Identifier => "DUBLIN_CORE_ELEMENT_IDENTIFIER",
+            Self::Language => "DUBLIN_CORE_ELEMENT_LANGUAGE",
+            Self::Publisher => "DUBLIN_CORE_ELEMENT_PUBLISHER",
+            Self::Relation => "DUBLIN_CORE_ELEMENT_RELATION",
+            Self::Rights => "DUBLIN_CORE_ELEMENT_RIGHTS",
+            Self::Source => "DUBLIN_CORE_ELEMENT_SOURCE",
+            Self::Subject => "DUBLIN_CORE_ELEMENT_SUBJECT",
+            Self::Title => "DUBLIN_CORE_ELEMENT_TITLE",
+            Self::Type => "DUBLIN_CORE_ELEMENT_TYPE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DUBLIN_CORE_ELEMENT_UNSPECIFIED" => Some(Self::Unspecified),
+            "DUBLIN_CORE_ELEMENT_CONTRIBUTOR" => Some(Self::Contributor),
+            "DUBLIN_CORE_ELEMENT_COVERAGE" => Some(Self::Coverage),
+            "DUBLIN_CORE_ELEMENT_CREATOR" => Some(Self::Creator),
+            "DUBLIN_CORE_ELEMENT_DATE" => Some(Self::Date),
+            "DUBLIN_CORE_ELEMENT_DESCRIPTION" => Some(Self::Description),
+            "DUBLIN_CORE_ELEMENT_FORMAT" => Some(Self::Format),
+            "DUBLIN_CORE_ELEMENT_IDENTIFIER" => Some(Self::Identifier),
+            "DUBLIN_CORE_ELEMENT_LANGUAGE" => Some(Self::Language),
+            "DUBLIN_CORE_ELEMENT_PUBLISHER" => Some(Self::Publisher),
+            "DUBLIN_CORE_ELEMENT_RELATION" => Some(Self::Relation),
+            "DUBLIN_CORE_ELEMENT_RIGHTS" => Some(Self::Rights),
+            "DUBLIN_CORE_ELEMENT_SOURCE" => Some(Self::Source),
+            "DUBLIN_CORE_ELEMENT_SUBJECT" => Some(Self::Subject),
+            "DUBLIN_CORE_ELEMENT_TITLE" => Some(Self::Title),
+            "DUBLIN_CORE_ELEMENT_TYPE" => Some(Self::Type),
+            _ => None,
+        }
+    }
+}
 /// FrontMatterFormat is the syntax a front matter block was written in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -4975,6 +5295,42 @@ impl VerticalAlignment {
             "VERTICAL_ALIGNMENT_TOP" => Some(Self::Top),
             "VERTICAL_ALIGNMENT_MIDDLE" => Some(Self::Middle),
             "VERTICAL_ALIGNMENT_BOTTOM" => Some(Self::Bottom),
+            _ => None,
+        }
+    }
+}
+/// StructuredDataKind names the dialect of a StructuredData block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum StructuredDataKind {
+    Unspecified = 0,
+    JsonLd = 1,
+    Microdata = 2,
+    Rdfa = 3,
+    Opengraph = 4,
+}
+impl StructuredDataKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "STRUCTURED_DATA_KIND_UNSPECIFIED",
+            Self::JsonLd => "STRUCTURED_DATA_KIND_JSON_LD",
+            Self::Microdata => "STRUCTURED_DATA_KIND_MICRODATA",
+            Self::Rdfa => "STRUCTURED_DATA_KIND_RDFA",
+            Self::Opengraph => "STRUCTURED_DATA_KIND_OPENGRAPH",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "STRUCTURED_DATA_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "STRUCTURED_DATA_KIND_JSON_LD" => Some(Self::JsonLd),
+            "STRUCTURED_DATA_KIND_MICRODATA" => Some(Self::Microdata),
+            "STRUCTURED_DATA_KIND_RDFA" => Some(Self::Rdfa),
+            "STRUCTURED_DATA_KIND_OPENGRAPH" => Some(Self::Opengraph),
             _ => None,
         }
     }
