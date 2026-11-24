@@ -13,8 +13,9 @@
 //! What it projects is the **skeleton of the book**, and nothing below it:
 //!
 //! - the OPF metadata, typed into `Document.source_meta` and the body group's
-//!   `BaseMeta`, with only the open-vocabulary remainder of Dublin Core in
-//!   `DocumentMeta.extra`;
+//!   `BaseMeta`, with the titles beside the main one in
+//!   `DocumentMeta.title_variants` and the rest of Dublin Core in
+//!   `DocumentMeta.dublin_core`, and nothing in `DocumentMeta.extra`;
 //! - the book's own table of contents, as `Document.outline`, with each entry
 //!   pointing at the chapter group it names;
 //! - one `GROUP_LABEL_CHAPTER` group per spine item, in spine order, **with no
@@ -407,13 +408,13 @@ impl DocumentFold {
 
     /// The book's own account of itself, typed.
     ///
-    /// Everything with a first-class slot goes in one, and *only* in one:
-    /// the publisher, the description, the identifiers, the credits with
-    /// their relator codes and sort names, the rights statement, the EPUB
-    /// version and the package's own files. `extra` is for what Dublin Core
-    /// leaves genuinely open: a source, a type, a coverage, a subtitle. The schema says as much at the field itself, so a value that
-    /// has a typed home and is written here too would be a second answer with
-    /// no tiebreaker.
+    /// Everything goes in a typed slot, and *only* in one: the publisher, the
+    /// description, the identifiers, the credits with their relator codes and
+    /// sort names, the rights statement, the EPUB version, the package's own
+    /// files, the titles beside the main one (`title_variants`) and the
+    /// Dublin Core statements that have no field of their own
+    /// (`dublin_core`). Nothing is written to `extra`: a value written there
+    /// as well as in its slot would be a second answer with no tiebreaker.
     ///
     /// The two dates are the shape the schema asks for everywhere it carries
     /// one: the typed instant plus a `_raw` twin holding the source's own
@@ -423,33 +424,6 @@ impl DocumentFold {
     /// is what makes that choice reversible. A value that does not parse gets
     /// the twin and nothing else.
     fn source_meta(&self, info: &pb::EpubInfo) -> doc::DocumentMeta {
-        let mut extra: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        /// Record a key, skipping it when the book did not supply a value.
-        fn record(extra: &mut std::collections::HashMap<String, String>, key: &str, value: &str) {
-            if !value.is_empty() {
-                extra.insert(key.to_owned(), value.to_owned());
-            }
-        }
-
-        // The parts of Dublin Core with no typed slot: a source, a type, a
-        // format, a coverage and a relation are open vocabulary. Rights has
-        // a slot of its own, `LicenseMeta.statement`.
-        for element in ["source", "type", "format", "coverage", "relation"] {
-            record(&mut extra, &format!("epub.{element}"), first(info, element));
-        }
-
-        // Subtitles and the rest of the titles, which `title` can only hold
-        // one of.
-        for entry in info
-            .metadata
-            .iter()
-            .filter(|entry| reads(entry) && entry.element == "title")
-        {
-            let kind = refined(entry, "title-type");
-            if !kind.is_empty() && kind != "main" {
-                record(&mut extra, &format!("epub.title.{kind}"), &entry.value);
-            }
-        }
         let created = declared_creation(info);
         let modified = info.modified.as_str();
 
@@ -500,7 +474,8 @@ impl DocumentFold {
                 unique_identifier_id: unique_identifier_id(info),
             })
             .filter(|epub| *epub != doc::EpubPackageMeta::default()),
-            extra,
+            title_variants: title_variants(info),
+            dublin_core: dublin_core(info),
             ..doc::DocumentMeta::default()
         }
     }
@@ -754,6 +729,74 @@ fn reads(entry: &pb::MetadataEntry) -> bool {
     let vendor = entry.form == pb::MetadataForm::MetaName as i32
         || entry.form == pb::MetadataForm::OtherElement as i32;
     !vendor && entry.refines.is_empty()
+}
+
+/// The titles the book states beside its main one, each with its kind.
+///
+/// EPUB 3 names a title's kind with a `title-type` refinement. `main` is
+/// `DocumentMeta.title` already; a kind EPUB does not name is kept as the
+/// book spelled it. A title with no `title-type` is how an EPUB 2 book states
+/// every title: the one that is the main title is not repeated, and any
+/// other is a variant of no stated kind rather than a title dropped.
+fn title_variants(info: &pb::EpubInfo) -> Vec<doc::TitleVariant> {
+    info.metadata
+        .iter()
+        .filter(|entry| reads(entry) && entry.element == "title" && !entry.value.is_empty())
+        .filter_map(|entry| {
+            let spelled = refined(entry, "title-type");
+            let kind = match spelled {
+                "main" => return None,
+                "" if entry.value == info.title => return None,
+                "" => doc::TitleKind::Unspecified,
+                "subtitle" => doc::TitleKind::Subtitle,
+                "short" => doc::TitleKind::Short,
+                "collection" => doc::TitleKind::Collection,
+                "edition" => doc::TitleKind::Edition,
+                "expanded" => doc::TitleKind::Expanded,
+                _ => doc::TitleKind::Other,
+            };
+            Some(doc::TitleVariant {
+                value: entry.value.clone(),
+                kind: kind as i32,
+                kind_raw: (kind == doc::TitleKind::Other).then(|| spelled.to_owned()),
+                // The wire carries no `xml:lang` for a metadata entry.
+                language: None,
+            })
+        })
+        .collect()
+}
+
+/// The Dublin Core statements that have no typed field of their own, every
+/// one of them in file order.
+///
+/// A source, a type, a format, a coverage and a relation are open
+/// vocabulary, and a book may state any of them more than once. Every other
+/// element has a field: the title and its variants, the creators and
+/// contributors, the subjects, the description, the publisher, the date, the
+/// identifiers, the language and the rights statement.
+fn dublin_core(info: &pb::EpubInfo) -> Vec<doc::DublinCoreStatement> {
+    info.metadata
+        .iter()
+        .filter(|entry| reads(entry) && !entry.value.is_empty())
+        .filter_map(|entry| {
+            let element = match entry.element.as_str() {
+                "source" => doc::DublinCoreElement::Source,
+                "type" => doc::DublinCoreElement::Type,
+                "format" => doc::DublinCoreElement::Format,
+                "coverage" => doc::DublinCoreElement::Coverage,
+                "relation" => doc::DublinCoreElement::Relation,
+                _ => return None,
+            };
+            Some(doc::DublinCoreStatement {
+                element: element as i32,
+                value: entry.value.clone(),
+                scheme: non_empty(&entry.scheme),
+                // The wire carries no `xml:lang` for a metadata entry.
+                language: None,
+                term: None,
+            })
+        })
+        .collect()
 }
 
 /// The value of the first metadata entry with this element name, or `""`.
@@ -1590,6 +1633,14 @@ mod tests {
                     "Being an Account of Two Chapters",
                     &[("title-type", "subtitle")],
                 ),
+                entry(
+                    "title",
+                    "The Collected Chapters",
+                    &[("title-type", "collection")],
+                ),
+                entry("title", "Volume the First", &[("title-type", "volume")]),
+                // An EPUB 2 title states no kind at all.
+                entry("title", "Two Chapters", &[]),
                 // The illustrator is listed first, so file order and credit
                 // order disagree and the reading has to choose.
                 entry("creator", "Charles Babbage", &[("role", "ill")]),
@@ -1604,6 +1655,13 @@ mod tests {
                 entry("format", "application/epub+zip", &[]),
                 entry("coverage", "England, 1843", &[]),
                 entry("relation", "urn:isbn:9782222222222", &[]),
+                // A second relation is a second statement, not a correction
+                // of the first.
+                entry("relation", "urn:isbn:9783333333333", &[]),
+                pb::MetadataEntry {
+                    scheme: "DCMIType".to_owned(),
+                    ..entry("type", "Text", &[])
+                },
                 entry("dcterms:modified", "2026-08-25T00:00:00Z", &[]),
             ],
             ..Default::default()
@@ -1661,24 +1719,65 @@ mod tests {
                 },
             ]
         );
-        // What Dublin Core leaves genuinely open, once each, in the open map.
-        let mut extra: Vec<(&str, &str)> = meta
-            .extra
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect();
-        extra.sort_unstable();
+        // The titles beside the main one, each with its kind, and a kind
+        // EPUB does not name kept as the book spelled it.
+        let variant =
+            |value: &str, kind: doc::TitleKind, kind_raw: Option<&str>| doc::TitleVariant {
+                value: value.to_owned(),
+                kind: kind as i32,
+                kind_raw: kind_raw.map(str::to_owned),
+                language: None,
+            };
         assert_eq!(
-            extra,
+            meta.title_variants,
             [
-                ("epub.coverage", "England, 1843"),
-                ("epub.format", "application/epub+zip"),
-                ("epub.relation", "urn:isbn:9782222222222"),
-                ("epub.source", "urn:isbn:9781111111111"),
-                ("epub.title.subtitle", "Being an Account of Two Chapters"),
-                ("epub.type", "monograph"),
+                variant(
+                    "Being an Account of Two Chapters",
+                    doc::TitleKind::Subtitle,
+                    None
+                ),
+                variant("The Collected Chapters", doc::TitleKind::Collection, None),
+                variant("Volume the First", doc::TitleKind::Other, Some("volume")),
+                variant("Two Chapters", doc::TitleKind::Unspecified, None),
             ]
         );
+        // The Dublin Core statements with no field of their own, every one of
+        // them in file order, with the scheme the book named.
+        let statement = |element: doc::DublinCoreElement, value: &str, scheme: Option<&str>| {
+            doc::DublinCoreStatement {
+                element: element as i32,
+                value: value.to_owned(),
+                scheme: scheme.map(str::to_owned),
+                language: None,
+                term: None,
+            }
+        };
+        assert_eq!(
+            meta.dublin_core,
+            [
+                statement(
+                    doc::DublinCoreElement::Source,
+                    "urn:isbn:9781111111111",
+                    None
+                ),
+                statement(doc::DublinCoreElement::Type, "monograph", None),
+                statement(doc::DublinCoreElement::Format, "application/epub+zip", None),
+                statement(doc::DublinCoreElement::Coverage, "England, 1843", None),
+                statement(
+                    doc::DublinCoreElement::Relation,
+                    "urn:isbn:9782222222222",
+                    None
+                ),
+                statement(
+                    doc::DublinCoreElement::Relation,
+                    "urn:isbn:9783333333333",
+                    None
+                ),
+                statement(doc::DublinCoreElement::Type, "Text", Some("DCMIType")),
+            ]
+        );
+        // Every statement has a typed home, so the open map holds nothing.
+        assert_eq!(meta.extra, HashMap::new());
     }
 
     #[test]

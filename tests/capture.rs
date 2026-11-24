@@ -393,6 +393,8 @@ async fn the_document_carries_the_books_own_metadata_typed() {
     ] {
         assert!(!meta.extra.contains_key(typed), "{typed} is typed");
     }
+    // And every other statement has a typed home, so the open map is empty.
+    assert!(meta.extra.is_empty(), "{:?}", meta.extra);
     assert!(
         body.custom_fields.is_empty(),
         "no custom field bag on the body"
