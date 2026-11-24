@@ -169,8 +169,32 @@ pub struct CollectorWarning {
     /// The collector that raised it ("libreoffice", "calamine", "pdf", ...).
     #[prost(message, optional, tag="1")]
     pub source: ::core::option::Option<CollectorSource>,
+    /// The warning in words, for a person. A consumer that acts on a warning
+    /// reads the typed fields below, never this text.
     #[prost(string, tag="2")]
     pub message: ::prost::alloc::string::String,
+    /// What happened. WARNING_CODE_UNSPECIFIED on a warning that so far carries
+    /// words only: a collector's own free-text note, passed on verbatim.
+    #[prost(enumeration="WarningCode", tag="3")]
+    pub code: i32,
+    /// The 1-based page the warning is about, when it is about one page.
+    #[prost(int32, optional, tag="4")]
+    pub page_no: ::core::option::Option<i32>,
+    /// The self_ref of the item the warning is about ("#/tables/3"), when it
+    /// is about one item.
+    #[prost(string, optional, tag="5")]
+    pub item_ref: ::core::option::Option<::prost::alloc::string::String>,
+    /// For a warning about content that was cut: how many bytes were kept and
+    /// how many the source held. bytes_total is unset when the source's size
+    /// is not known (an archive that lost its framing part way through).
+    #[prost(uint64, optional, tag="6")]
+    pub bytes_kept: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag="7")]
+    pub bytes_total: ::core::option::Option<u64>,
+    /// How many occurrences this one entry stands for, when a collector folded
+    /// repeats of the same finding into it. Unset means one.
+    #[prost(uint64, optional, tag="8")]
+    pub count: ::core::option::Option<u64>,
 }
 /// TextAnalysis is one analyzer run over a window of the document's text
 /// stream: the stream ConvertDocumentResponse.text_offsets indexes, every text
@@ -297,6 +321,15 @@ pub struct DocumentOrigin {
     /// Extension beyond the upstream dialect.
     #[prost(message, repeated, tag="8")]
     pub field_sources: ::prost::alloc::vec::Vec<FieldSource>,
+    /// The character encoding the source's bytes were decoded with, as the
+    /// source declared it or the collector detected it (an IANA charset name).
+    #[prost(string, optional, tag="9")]
+    pub source_encoding: ::core::option::Option<::prost::alloc::string::String>,
+    /// The media type the caller declared for the source. It is the caller's
+    /// claim, kept apart from `mimetype`, which is what the producer settled
+    /// on.
+    #[prost(string, optional, tag="10")]
+    pub declared_mimetype: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// GroupItem represents a logical grouping of document elements.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -322,6 +355,18 @@ pub struct GroupItem {
     /// beyond the upstream dialect).
     #[prost(message, optional, tag="9")]
     pub sheet: ::core::option::Option<SheetMeta>,
+    /// Who produced this group, as items state it on their own `source`
+    /// (extension beyond the upstream dialect).
+    #[prost(message, repeated, tag="10")]
+    pub source: ::prost::alloc::vec::Vec<SourceType>,
+    /// Spine attributes when this group is one spine item of an EPUB
+    /// (extension beyond the upstream dialect).
+    #[prost(message, optional, tag="11")]
+    pub spine: ::core::option::Option<SpineItemMeta>,
+    /// Slide attributes when this group is a presentation slide (extension
+    /// beyond the upstream dialect).
+    #[prost(message, optional, tag="12")]
+    pub slide: ::core::option::Option<SlideMeta>,
 }
 /// RefItem is a JSON Pointer reference to another item in the document.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -458,7 +503,7 @@ pub struct CollectorClaim {
 /// SourceType is a union of possible source descriptors.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SourceType {
-    #[prost(oneof="source_type::Source", tags="1, 2, 3")]
+    #[prost(oneof="source_type::Source", tags="1, 2, 3, 4, 5")]
     pub source: ::core::option::Option<source_type::Source>,
 }
 /// Nested message and enum types in `SourceType`.
@@ -473,7 +518,60 @@ pub mod source_type {
         /// upstream dialect).
         #[prost(message, tag="3")]
         Generation(super::GenerationSource),
+        /// Where in an XML source the content came from (extension beyond the
+        /// upstream dialect).
+        #[prost(message, tag="4")]
+        Xml(super::XmlSource),
+        /// Which part of a MIME message the content came from (extension beyond
+        /// the upstream dialect).
+        #[prost(message, tag="5")]
+        MimePart(super::MimePartSource),
     }
+}
+/// MimePartSource locates content in the MIME message it was read from.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MimePartSource {
+    /// The part's position in the message's part tree ("1.2").
+    #[prost(string, tag="1")]
+    pub part_id: ::prost::alloc::string::String,
+    /// The part's Content-ID, without its angle brackets, when it has one.
+    #[prost(string, optional, tag="2")]
+    pub content_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// The part's own content type, as its header states it.
+    #[prost(string, optional, tag="3")]
+    pub content_type: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// XmlSource locates content in the XML source it was read from.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct XmlSource {
+    /// The element's path from the root, in the source's own element names.
+    #[prost(string, tag="1")]
+    pub path: ::prost::alloc::string::String,
+    /// The role the collector's dialect mapping gave the element (what it was
+    /// read as), in the dialect's own vocabulary.
+    #[prost(string, tag="2")]
+    pub role: ::prost::alloc::string::String,
+    /// The element's id attribute, when it has one.
+    #[prost(string, optional, tag="3")]
+    pub element_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// The element's position among the elements the collector read, in
+    /// document order.
+    #[prost(uint64, optional, tag="4")]
+    pub ordinal: ::core::option::Option<u64>,
+    /// True when the text came from a CDATA section.
+    #[prost(bool, tag="5")]
+    pub from_cdata: bool,
+    /// For an annotation that the source attaches to other elements (an XBRL
+    /// footnote): the ids of the elements it annotates.
+    #[prost(string, repeated, tag="6")]
+    pub annotates: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The link role the source gives that attachment (an XBRL footnote's
+    /// xlink:role).
+    #[prost(string, optional, tag="7")]
+    pub link_role: ::core::option::Option<::prost::alloc::string::String>,
+    /// The xml:lang in force on the element.
+    #[prost(string, optional, tag="8")]
+    pub language: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// BaseMeta contains metadata fields common to most document items.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -720,6 +818,10 @@ pub struct TextItemBase {
     /// Markup attributes in source order, including lexical presence and locations.
     #[prost(message, repeated, tag="26")]
     pub source_attributes: ::prost::alloc::vec::Vec<SourceAttribute>,
+    /// The source's named page style this item belongs to, for header and
+    /// footer text that repeats on every page of that style.
+    #[prost(string, optional, tag="27")]
+    pub page_style_name: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// A markup attribute's decoded value and source spelling. Presence distinguishes
 /// a bare attribute from an explicitly empty value without inventing source bytes.
@@ -923,6 +1025,12 @@ pub struct ImageRef {
     /// (20%, 5cm, 0.8 of the text width); `size` stays unset then.
     #[prost(string, optional, tag="5")]
     pub size_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// The image's own bytes, encoded as `mimetype` says, when the producer
+    /// holds them. A producer that has the bytes fills this field; it does not
+    /// spell them as a data: URI in `uri`, which is for a reference to an
+    /// image held elsewhere.
+    #[prost(bytes="vec", optional, tag="6")]
+    pub data: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 /// Size represents 2D dimensions (width and height).
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -1269,6 +1377,14 @@ pub struct PictureMeta {
     /// slot never has to hold two source strings.
     #[prost(string, optional, tag="12")]
     pub accessibility_title: ::core::option::Option<::prost::alloc::string::String>,
+    /// The source's alternative text for the picture (an HTML alt attribute),
+    /// verbatim.
+    #[prost(string, optional, tag="13")]
+    pub alt_text: ::core::option::Option<::prost::alloc::string::String>,
+    /// The id the source's own packaging gives the image resource (an EPUB
+    /// manifest item id, an office relationship id).
+    #[prost(string, optional, tag="14")]
+    pub source_id: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(map="string, message", tag="100")]
     pub custom_fields: ::std::collections::HashMap<::prost::alloc::string::String, ::prost_types::Value>,
 }
@@ -1437,6 +1553,15 @@ pub struct TableData {
     /// Named source table declarations, distinct from the sheet-wide cell grid.
     #[prost(message, repeated, tag="11")]
     pub declared_tables: ::prost::alloc::vec::Vec<DeclaredSheetTable>,
+    /// Cells the source holds for this table whose row and column could not be
+    /// resolved. They belong to the table but are in neither `table_cells` nor
+    /// `grid`; each keeps its text and, where the source names its cells, its
+    /// source_name.
+    #[prost(message, repeated, tag="12")]
+    pub unplaced_cells: ::prost::alloc::vec::Vec<TableCell>,
+    /// What the table is, when it is not a table the source laid out.
+    #[prost(enumeration="TableKind", tag="13")]
+    pub kind: i32,
 }
 /// One named table declared by a workbook, preserving its own schema and bands.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1502,6 +1627,10 @@ pub struct TableCell {
     pub align: ::core::option::Option<i32>,
     #[prost(enumeration="VerticalAlignment", optional, tag="17")]
     pub valign: ::core::option::Option<i32>,
+    /// The cell's own name in the source (a text table's "A1"), when the
+    /// source names its cells.
+    #[prost(string, optional, tag="18")]
+    pub source_name: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// KeyValueItem represents a key-value pair extracted from forms.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1663,7 +1792,9 @@ pub struct FieldItem {
     /// The field's span in the document's annotation space.
     #[prost(message, optional, tag="13")]
     pub span: ::core::option::Option<FineRef>,
-    /// Fieldmark parameters, a genuinely open per-field vocabulary.
+    /// Fieldmark parameters as text, a genuinely open per-field vocabulary.
+    /// A producer that knows each parameter's stored type fills
+    /// typed_parameters instead; this map then stays empty.
     #[prost(map="string, string", tag="14")]
     pub parameters: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     // The interactive state of the field, typed (extensions beyond the
@@ -1699,6 +1830,44 @@ pub struct FieldItem {
     /// PdfWidget.widget_description.
     #[prost(string, optional, tag="21")]
     pub description: ::core::option::Option<::prost::alloc::string::String>,
+    /// The field's parameters in the type the source stored each one in, in
+    /// source order. The names are the source's own open vocabulary; the
+    /// values are typed.
+    #[prost(message, repeated, tag="22")]
+    pub typed_parameters: ::prost::alloc::vec::Vec<FieldParameter>,
+}
+/// FieldParameter is one named parameter of a form field, in its stored
+/// type.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FieldParameter {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(oneof="field_parameter::Value", tags="2, 3, 4, 5, 6")]
+    pub value: ::core::option::Option<field_parameter::Value>,
+}
+/// Nested message and enum types in `FieldParameter`.
+pub mod field_parameter {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(bool, tag="2")]
+        BoolValue(bool),
+        #[prost(int64, tag="3")]
+        IntValue(i64),
+        #[prost(double, tag="4")]
+        DoubleValue(f64),
+        #[prost(string, tag="5")]
+        StringValue(::prost::alloc::string::String),
+        /// A list-of-text value (a dropdown's entries).
+        #[prost(message, tag="6")]
+        StringList(super::StringList),
+    }
+}
+/// StringList is a list of strings where a oneof needs one as a single
+/// arm.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StringList {
+    #[prost(string, repeated, tag="1")]
+    pub values: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// PageItem represents metadata about a single page in the document.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1858,6 +2027,12 @@ pub struct InlineSpan {
     /// Interlinear annotation over the run (ruby text).
     #[prost(string, optional, tag="16")]
     pub annotation: ::core::option::Option<::prost::alloc::string::String>,
+    /// The frame the link opens in, as the source states it ("_blank").
+    #[prost(string, optional, tag="17")]
+    pub hyperlink_target_frame: ::core::option::Option<::prost::alloc::string::String>,
+    /// The link's name as authored, when the source gives links names.
+    #[prost(string, optional, tag="18")]
+    pub hyperlink_name: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// DocumentMeta carries the metadata the source declares about itself.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1976,6 +2151,142 @@ pub struct DocumentMeta {
     pub company: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag="42")]
     pub manager: ::core::option::Option<::prost::alloc::string::String>,
+    /// Dated events in the source's own history (a journal article's received
+    /// and accepted dates). `created` and `modified` keep their meaning; this
+    /// list holds every dated event the source names, including those two
+    /// when the source lists them here.
+    #[prost(message, repeated, tag="43")]
+    pub history_dates: ::prost::alloc::vec::Vec<HistoryDate>,
+    /// The people and bodies credited with the work, each with the roles the
+    /// source gives. `authors` stays the plain list of names.
+    #[prost(message, repeated, tag="44")]
+    pub creators: ::prost::alloc::vec::Vec<Creator>,
+    /// The front matter block a markup source opens with (a Markdown or Org
+    /// file's YAML or TOML header), as a typed tree in source order, and the
+    /// syntax it was written in.
+    #[prost(enumeration="FrontMatterFormat", optional, tag="45")]
+    pub front_matter_format: ::core::option::Option<i32>,
+    #[prost(message, repeated, tag="46")]
+    pub front_matter: ::prost::alloc::vec::Vec<FrontMatterEntry>,
+    /// What an XML source is, beyond its namespaces and schema locations.
+    #[prost(message, optional, tag="47")]
+    pub xml: ::core::option::Option<XmlDocumentMeta>,
+    /// The publisher the source names.
+    #[prost(string, optional, tag="48")]
+    pub publisher: ::core::option::Option<::prost::alloc::string::String>,
+    /// The picture that is the work's cover (a book's cover image, an office
+    /// file's thumbnail), when the source marks one.
+    #[prost(message, optional, tag="49")]
+    pub cover: ::core::option::Option<RefItem>,
+    /// What an EPUB package says about its own files.
+    #[prost(message, optional, tag="50")]
+    pub epub: ::core::option::Option<EpubPackageMeta>,
+}
+/// EpubPackageMeta names the files an EPUB package is built from, as paths
+/// inside the container.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EpubPackageMeta {
+    /// The package document.
+    #[prost(string, optional, tag="1")]
+    pub opf_href: ::core::option::Option<::prost::alloc::string::String>,
+    /// The navigation document (EPUB 3) and the NCX table of contents
+    /// (EPUB 2), where the package has them.
+    #[prost(string, optional, tag="2")]
+    pub nav_href: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="3")]
+    pub ncx_href: ::core::option::Option<::prost::alloc::string::String>,
+    /// The id the package's unique-identifier attribute names: the
+    /// Identifier.id of the one entry in DocumentMeta.identifiers that the
+    /// package declares as its own.
+    #[prost(string, optional, tag="4")]
+    pub unique_identifier_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// HistoryDate is one dated event in a source's history.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HistoryDate {
+    /// The event as the source names it ("received", "accepted", "rev-recd").
+    #[prost(string, tag="1")]
+    pub kind: ::prost::alloc::string::String,
+    /// The date as a wall-clock value, for a source that states a date without
+    /// an instant; `instant` when it states one. `raw` keeps the source's own
+    /// spelling and is the only field set when the value does not parse.
+    #[prost(message, optional, tag="2")]
+    pub civil: ::core::option::Option<CivilDateTime>,
+    #[prost(message, optional, tag="3")]
+    pub instant: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(string, optional, tag="4")]
+    pub raw: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Creator is one person or body credited with the work.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Creator {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    /// The roles the source gives, as it writes them (MARC relator codes such
+    /// as "aut" and "edt").
+    #[prost(string, repeated, tag="2")]
+    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The name in its sorting form ("Austen, Jane"), when the source states
+    /// one.
+    #[prost(string, optional, tag="3")]
+    pub file_as: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// FrontMatterValue is one value of a front matter block, in the type the
+/// source's syntax gives it. It exists for front matter only: data whose
+/// shape the fleet knows gets its own typed field.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FrontMatterValue {
+    #[prost(oneof="front_matter_value::Kind", tags="1, 2, 3, 4, 5, 6, 7")]
+    pub kind: ::core::option::Option<front_matter_value::Kind>,
+}
+/// Nested message and enum types in `FrontMatterValue`.
+pub mod front_matter_value {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(string, tag="1")]
+        Text(::prost::alloc::string::String),
+        #[prost(double, tag="2")]
+        Number(f64),
+        #[prost(bool, tag="3")]
+        Boolean(bool),
+        #[prost(message, tag="4")]
+        Datetime(super::CivilDateTime),
+        #[prost(message, tag="5")]
+        List(super::FrontMatterList),
+        #[prost(message, tag="6")]
+        Map(super::FrontMatterMap),
+        #[prost(int64, tag="7")]
+        Integer(i64),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FrontMatterList {
+    #[prost(message, repeated, tag="1")]
+    pub values: ::prost::alloc::vec::Vec<FrontMatterValue>,
+}
+/// FrontMatterMap keeps its entries in source order.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FrontMatterMap {
+    #[prost(message, repeated, tag="1")]
+    pub entries: ::prost::alloc::vec::Vec<FrontMatterEntry>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FrontMatterEntry {
+    #[prost(string, tag="1")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="2")]
+    pub value: ::core::option::Option<FrontMatterValue>,
+}
+/// XmlDocumentMeta says what an XML source is.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct XmlDocumentMeta {
+    /// The dialect the collector read the source as ("jats", "uspto", "xbrl",
+    /// "doclang", "mets_gbs").
+    #[prost(string, optional, tag="1")]
+    pub dialect: ::core::option::Option<::prost::alloc::string::String>,
+    /// The namespace of the source's root element.
+    #[prost(string, optional, tag="2")]
+    pub root_namespace: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Identifier is one source-scoped identifier.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1988,6 +2299,11 @@ pub struct Identifier {
     /// The scope the source attaches (electronic vs print ISSN).
     #[prost(string, optional, tag="3")]
     pub scope: ::core::option::Option<::prost::alloc::string::String>,
+    /// The identifier's own id in the source (the id attribute of an EPUB
+    /// dc:identifier), when it has one, so another field can name this
+    /// identifier.
+    #[prost(string, optional, tag="4")]
+    pub id: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Classification is one classification code the source declares.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2060,7 +2376,7 @@ pub struct CellValue {
     /// whose display code is unavailable.
     #[prost(uint32, optional, tag="13")]
     pub number_format_id: ::core::option::Option<u32>,
-    #[prost(oneof="cell_value::Kind", tags="1, 2, 3, 4, 5")]
+    #[prost(oneof="cell_value::Kind", tags="1, 2, 3, 4, 5, 6, 7")]
     pub kind: ::core::option::Option<cell_value::Kind>,
 }
 /// Nested message and enum types in `CellValue`.
@@ -2082,7 +2398,26 @@ pub mod cell_value {
         /// failure marker).
         #[prost(string, tag="5")]
         Error(::prost::alloc::string::String),
+        /// An exact decimal the source states (a packed-decimal amount, a
+        /// monetary fact). A producer writes `number` only for a value the
+        /// source itself holds as floating point.
+        #[prost(message, tag="6")]
+        Decimal(super::ExactDecimal),
+        /// An exact integer the source states; a double holds integers exactly
+        /// only up to 2^53.
+        #[prost(int64, tag="7")]
+        Integer(i64),
     }
+}
+/// ExactDecimal is a decimal number with no rounding: unscaled * 10^-scale.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExactDecimal {
+    /// The signed integer digits without a decimal point ("-1234567"); it may
+    /// be longer than an int64 holds.
+    #[prost(string, tag="1")]
+    pub unscaled: ::prost::alloc::string::String,
+    #[prost(int32, tag="2")]
+    pub scale: i32,
 }
 /// CivilDateTime is a wall-clock date or datetime as the source wrote it,
 /// without inventing a timezone the source never stated.
@@ -2221,6 +2556,27 @@ pub struct MediaMeta {
     pub speakers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, optional, tag="3")]
     pub codec: ::core::option::Option<::prost::alloc::string::String>,
+    /// The audio stream's sample rate and channel count, as the container
+    /// states them. Unset when the stream was not probed: unknown, not zero.
+    #[prost(uint32, optional, tag="4")]
+    pub sample_rate_hz: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag="5")]
+    pub channels: ::core::option::Option<u32>,
+    /// Whether the container also holds a video stream. Unset when the
+    /// container was not probed.
+    #[prost(bool, optional, tag="6")]
+    pub has_video: ::core::option::Option<bool>,
+    /// The video stream's codec, when has_video is true and the probe names it.
+    #[prost(string, optional, tag="7")]
+    pub video_codec: ::core::option::Option<::prost::alloc::string::String>,
+    /// The duration the container declares, in the unit of duration_ms.
+    /// duration_ms is what was transcribed; a declared duration that is longer
+    /// means the transcript stops before the media does.
+    #[prost(double, optional, tag="8")]
+    pub declared_duration_ms: ::core::option::Option<f64>,
+    /// The number of tokens the transcription model produced for this media.
+    #[prost(uint64, optional, tag="9")]
+    pub token_count: ::core::option::Option<u64>,
 }
 /// GenerationSource attributes model-generated content to its generation.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2316,7 +2672,7 @@ pub struct OutlineEntry {
     pub target: ::core::option::Option<FineRef>,
 }
 /// ChangeRecord is one tracked change the source records.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChangeRecord {
     /// Stable id within the document, as the source names it.
     #[prost(string, tag="1")]
@@ -2339,6 +2695,14 @@ pub struct ChangeRecord {
     pub content: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag="7")]
     pub timestamp_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// The change this one supersedes, when the source nests changes (text
+    /// one author inserted and another then deleted). Its id and target are
+    /// unset where the source keeps only its kind, author, time and comment.
+    #[prost(message, optional, boxed, tag="8")]
+    pub successor: ::core::option::Option<::prost::alloc::boxed::Box<ChangeRecord>>,
+    /// The author's comment on the change.
+    #[prost(string, optional, tag="9")]
+    pub comment: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// NamedAnchor is one named position the source declares.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2372,6 +2736,13 @@ pub struct EmailParty {
     pub name: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, tag="2")]
     pub address: ::prost::alloc::string::String,
+    /// The party's address in the mail system's own form when that is not an
+    /// internet address (an Exchange legacy distinguished name), and the
+    /// address type the source names for it ("EX", "SMTP").
+    #[prost(string, optional, tag="3")]
+    pub native_address: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="4")]
+    pub address_type: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// EmailMeta is the typed message envelope of a mail source.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2403,6 +2774,21 @@ pub struct EmailMeta {
     pub sent: ::core::option::Option<::prost_types::Timestamp>,
     #[prost(string, optional, tag="11")]
     pub sent_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// Where replies go, when the message names it apart from `from`.
+    #[prost(message, repeated, tag="12")]
+    pub reply_to: ::prost::alloc::vec::Vec<EmailParty>,
+    /// Who submitted the message, when the message names a sender apart from
+    /// its authors in `from`.
+    #[prost(message, repeated, tag="13")]
+    pub sender: ::prost::alloc::vec::Vec<EmailParty>,
+    /// The delivery instant, with the same _raw twin as `sent`.
+    #[prost(message, optional, tag="14")]
+    pub received: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(string, optional, tag="15")]
+    pub received_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// The message's own top-level content type, as its header states it.
+    #[prost(string, optional, tag="16")]
+    pub content_type: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Hypothesis is one alternate reading a generative engine offered.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2607,6 +2993,23 @@ pub struct NamedRange {
     /// rectangle; `range` stays unset then.
     #[prost(string, optional, tag="6")]
     pub expression: ::core::option::Option<::prost::alloc::string::String>,
+    /// What the workbook uses the name for, each set only when the source
+    /// says so: a filter's criteria range, a print area, the column or row
+    /// headers to repeat on every printed page, and whether the name is hidden
+    /// from the user.
+    #[prost(bool, tag="7")]
+    pub filter_criteria: bool,
+    #[prost(bool, tag="8")]
+    pub print_area: bool,
+    #[prost(bool, tag="9")]
+    pub repeat_columns: bool,
+    #[prost(bool, tag="10")]
+    pub repeat_rows: bool,
+    #[prost(bool, tag="11")]
+    pub hidden: bool,
+    /// True when a database range keeps an auto filter on its header row.
+    #[prost(bool, tag="12")]
+    pub auto_filter: bool,
 }
 /// PivotSpec is one pivot table definition.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2657,6 +3060,20 @@ pub struct RecordLayoutMeta {
     /// Rows the producer's row cap dropped; zero means the table is complete.
     #[prost(uint64, optional, tag="6")]
     pub rows_truncated: ::core::option::Option<u64>,
+    /// The name of the record schema the table was decoded with (a copybook's
+    /// 01-level name).
+    #[prost(string, optional, tag="7")]
+    pub schema_name: ::core::option::Option<::prost::alloc::string::String>,
+    /// For a file that mixes record types: the selector value of the records
+    /// this table holds.
+    #[prost(string, optional, tag="8")]
+    pub selector: ::core::option::Option<::prost::alloc::string::String>,
+    /// How many records this table holds, before any row cap.
+    #[prost(uint64, optional, tag="9")]
+    pub rows: ::core::option::Option<u64>,
+    /// What the caller supplied the layout as.
+    #[prost(enumeration="RecordLayoutSource", tag="10")]
+    pub layout_source: i32,
 }
 /// BarcodeAnnotation is one decoded machine-readable code payload.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2670,6 +3087,348 @@ pub struct BarcodeAnnotation {
     /// The decoding engine.
     #[prost(string, tag="3")]
     pub provenance: ::prost::alloc::string::String,
+}
+/// SlideMeta carries a presentation slide's own attributes.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SlideMeta {
+    /// The slide's layout as the source identifies it: the authoring
+    /// application's own layout number, and the layout's name where the source
+    /// names its layouts. Zero is a real layout number, so it is
+    /// presence-tracked.
+    #[prost(int32, optional, tag="1")]
+    pub layout_id: ::core::option::Option<i32>,
+    #[prost(string, optional, tag="2")]
+    pub layout_name: ::core::option::Option<::prost::alloc::string::String>,
+    /// The master page the slide is based on.
+    #[prost(string, optional, tag="3")]
+    pub master_page_name: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// SpineItemMeta carries what an EPUB package says about one spine item.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SpineItemMeta {
+    /// The manifest item the spine entry names, and that item's media type.
+    #[prost(string, tag="1")]
+    pub idref: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub media_type: ::prost::alloc::string::String,
+    /// False when the package marks the item as outside the linear reading
+    /// order.
+    #[prost(bool, tag="3")]
+    pub linear: bool,
+    /// The item's position in the spine, from zero.
+    #[prost(uint32, tag="4")]
+    pub spine_index: u32,
+    /// The manifest item's properties, as written ("nav", "scripted").
+    #[prost(string, repeated, tag="5")]
+    pub properties: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The media overlay document that narrates this item, and its cues.
+    #[prost(string, optional, tag="6")]
+    pub overlay_href: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag="7")]
+    pub overlay_cues: ::prost::alloc::vec::Vec<MediaOverlayCue>,
+}
+/// MediaOverlayCue pairs one stretch of an EPUB's text with the audio clip
+/// that narrates it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MediaOverlayCue {
+    /// The text fragment and the audio file, as the overlay references them.
+    #[prost(string, tag="1")]
+    pub text_href: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub audio_href: ::prost::alloc::string::String,
+    /// The clip's start and end in the audio file, in seconds. Unset when the
+    /// overlay's clock value does not parse; zero is a real start.
+    #[prost(double, optional, tag="3")]
+    pub start_seconds: ::core::option::Option<f64>,
+    #[prost(double, optional, tag="4")]
+    pub end_seconds: ::core::option::Option<f64>,
+    /// The cue's own id in the overlay document.
+    #[prost(string, optional, tag="5")]
+    pub id: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// WarningCode names what a CollectorWarning reports, so a consumer can count
+/// or act on one kind of loss without matching message text. A warning is
+/// never a failure: the parse stands, and the code says what is missing from
+/// it or how it was produced. A warning with no typed meaning keeps
+/// WARNING_CODE_UNSPECIFIED and its words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WarningCode {
+    Unspecified = 0,
+    // -- Another path produced the document ------------------------------
+
+    /// A collector that was planned for this document failed, and another path
+    /// produced the body in its place (the PDF inspector failing, with the
+    /// in-process CV path reading the document instead). The document is
+    /// complete as that other path reads it; what only the failed collector
+    /// would have supplied is absent.
+    CollectorFallback = 1,
+    /// The PDF inspector classified the document (scanned, mixed, damaged
+    /// text layer) and the in-process CV path read it instead of the
+    /// inspector's own extraction. A routing decision, not a loss.
+    RoutedToCv = 2,
+    /// The request asked for the text layer as it is (pipeline NATIVE) and got
+    /// it, although the inspector's classification says recognition would
+    /// have read more. No layout, OCR or table-structure model ran.
+    TextLayerTakenAsIs = 3,
+    /// An option the request set does not apply to this input (form fields
+    /// asked of a file that is not a PDF) and had no effect.
+    OptionNotApplicable = 4,
+    // -- A pass that did not run -----------------------------------------
+
+    /// This deployment runs without the layout model, so no region of the
+    /// document carries a model-assigned label: no tables, pictures, headings
+    /// or formulas were told apart from plain text.
+    LayoutPassDisabled = 10,
+    /// This deployment runs without the table-structure model: table cells
+    /// come from line geometry alone.
+    TableStructurePassDisabled = 11,
+    /// This deployment runs without the figure classifier: pictures carry no
+    /// class.
+    FigureClassificationPassDisabled = 12,
+    /// No configured PDF backend can read form fields, so the document's
+    /// AcroForm widgets, if it has any, are absent. Different from a document
+    /// without a form, which raises nothing.
+    FormFieldsUnsupported = 13,
+    /// A PDF backend that reads form fields failed while reading this
+    /// document's; its widgets, if it has any, are absent.
+    FormFieldsUnreadable = 14,
+    // -- PDF backends ----------------------------------------------------
+
+    /// The PDF backend said it skipped or repaired content on page_no while
+    /// reading it (a damaged content stream, an object it could not decode).
+    /// The page holds what the backend could read.
+    BackendContentSkipped = 20,
+    /// The totals in the PDF backend's trailer do not match what arrived:
+    /// items were lost between the backend and this document.
+    BackendCountMismatch = 21,
+    /// A PDF backend configured for the consensus vote could not open the
+    /// document, or was taken out of the vote after repeated page failures.
+    /// Pages were decided by the backends that remained.
+    ConsensusBackendFailed = 22,
+    /// The backends configured for the consensus vote disagree on how many
+    /// pages the document has.
+    ConsensusPageCountDisagreement = 23,
+    /// page_no was decided by fewer backends than the vote was configured
+    /// with; with one backend left it is that backend's reading, unvoted.
+    ConsensusPageUndervoted = 24,
+    // -- Pages -----------------------------------------------------------
+
+    /// page_no was sent to a model service and no answer for it came back
+    /// before the stream ended. The page has no items from that service.
+    PageUnanswered = 30,
+    /// The model answered for page_no, but its output could not be mapped
+    /// into document items. The page has no items from that answer.
+    PageOutputUnmapped = 31,
+    /// The model returned nothing at all for page_no.
+    PageEmptyResponse = 32,
+    /// A model pass over page_no did not finish (one of several passes a
+    /// model makes over a page); the page holds what the finished passes
+    /// read.
+    PagePassIncomplete = 33,
+    /// The page image the request asked for could not be rendered for
+    /// page_no: Document.pages\[page_no\].image is absent.
+    PagePreviewFailed = 34,
+    /// The picture regions of page_no were to be recognized from a sharper
+    /// render of the page; that render failed, and they were recognized from
+    /// the page raster at its lower resolution.
+    PictureOcrAtPageResolution = 35,
+    /// An image crop that enrichment (code, formula, picture or chart
+    /// reading) needed could not be rendered, for page_no or for item_ref;
+    /// the item was enriched from its text alone, or not at all.
+    EnrichmentCropMissing = 36,
+    /// A page render handed to the in-process models could not be decoded or
+    /// was over the size cap; page_no was not read by them.
+    PageRenderUnreadable = 37,
+    /// The model call for page_no failed (the endpoint refused it, timed out
+    /// or returned an error), so there is no model output for the page at
+    /// all. The page has no items from that service.
+    PageModelCallFailed = 38,
+    // -- Items -----------------------------------------------------------
+
+    /// The table-structure model stopped before the end of the table at
+    /// item_ref. Cells past the cut-off were placed by line geometry, not by
+    /// the model.
+    TableStructureTruncated = 40,
+    /// The table at item_ref has more cells than the model service returned a
+    /// grid for; its grid is absent or partial.
+    TableGridOmitted = 41,
+    /// A second reader's cells for the sheet at item_ref were incomplete (its
+    /// stream failed, or it could not read the sheet), so they were not
+    /// adopted: the sheet keeps the first reader's cells.
+    SheetCellsNotAdopted = 42,
+    /// The payload behind item_ref was longer than the text kept from it:
+    /// bytes_kept of bytes_total. The item's text is the kept prefix and
+    /// nothing else.
+    PayloadTruncated = 43,
+    /// The payload behind item_ref is stored in an encoding that was not
+    /// decoded (a compressed HTTP body); the item carries no text from it.
+    PayloadNotDecoded = 44,
+    /// Pictures the source or model referred to carry no image bytes (on
+    /// page_no or at item_ref).
+    PictureImagesSkipped = 45,
+    /// An enrichment result for item_ref could not be applied to it (the item
+    /// it names is not in the document, or its kind does not take the
+    /// annotation); the result is not in the document.
+    EnrichmentNotApplied = 46,
+    // -- Streams and archives --------------------------------------------
+
+    /// A collector's stream ended before the collector said it was complete.
+    /// The document holds what arrived; what the collector had not yet sent
+    /// is absent.
+    CollectorStreamIncomplete = 50,
+    /// An archive lost its record framing after bytes_kept bytes; the records
+    /// before that point are in the document and the rest is absent.
+    ArchiveTruncated = 51,
+    /// What a collector's trailer says it produced does not match what
+    /// arrived from it.
+    CollectorCountMismatch = 52,
+    /// On a streamed parse, the event that reconciles the streamed pages with
+    /// the repaired whole document could not be produced. The pages already
+    /// sent stand unrepaired.
+    RepairEventSkipped = 53,
+    // -- What a collector reports about its source -----------------------
+    //
+    // A collector that carries its own warning codes on its service contract
+    // maps each to the value below that says what a consumer can rely on; the
+    // collector's exact finding stays in the message.
+
+    /// The source holds a construct the collector has no mapping for. Its text
+    /// is in the document; its structure is not.
+    SourceConstructUnmapped = 60,
+    /// A reference inside the source points at nothing the source holds (a
+    /// dangling id, a manifest entry with no file, an entity with no
+    /// declaration). The referring content is in the document; the link is
+    /// not.
+    SourceReferenceUnresolved = 61,
+    /// A part of the source was left out by rule: an external resource the
+    /// collector does not fetch, an archive member of a kind it does not read,
+    /// an obfuscated or nested resource. Nothing of that part is in the
+    /// document.
+    SourcePartIgnored = 62,
+    /// Bytes that are not valid in the source's encoding were replaced; the
+    /// text around them is intact.
+    SourceEncodingSubstitution = 63,
+    /// The source's text was repaired before it was read, so an offset into
+    /// the document's text need not match an offset into the source's bytes.
+    SourceTextRepaired = 64,
+    /// The source's metadata could not be read, in whole or in part; the
+    /// content is unaffected.
+    SourceMetadataUnreadable = 65,
+    /// The source breaks its own format and the collector recovered; the
+    /// document holds the collector's best reading of the broken part.
+    SourceStructureMalformed = 66,
+    /// The collector stopped at one of its own limits (a record or row cap);
+    /// the document holds the content up to the limit and nothing after it.
+    SourceContentTruncated = 67,
+    /// The source ends before its own structure says it should (a partial
+    /// trailing record, a file shorter than its declared layout). What was
+    /// complete is in the document.
+    SourceInputIncomplete = 68,
+}
+impl WarningCode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "WARNING_CODE_UNSPECIFIED",
+            Self::CollectorFallback => "WARNING_CODE_COLLECTOR_FALLBACK",
+            Self::RoutedToCv => "WARNING_CODE_ROUTED_TO_CV",
+            Self::TextLayerTakenAsIs => "WARNING_CODE_TEXT_LAYER_TAKEN_AS_IS",
+            Self::OptionNotApplicable => "WARNING_CODE_OPTION_NOT_APPLICABLE",
+            Self::LayoutPassDisabled => "WARNING_CODE_LAYOUT_PASS_DISABLED",
+            Self::TableStructurePassDisabled => "WARNING_CODE_TABLE_STRUCTURE_PASS_DISABLED",
+            Self::FigureClassificationPassDisabled => "WARNING_CODE_FIGURE_CLASSIFICATION_PASS_DISABLED",
+            Self::FormFieldsUnsupported => "WARNING_CODE_FORM_FIELDS_UNSUPPORTED",
+            Self::FormFieldsUnreadable => "WARNING_CODE_FORM_FIELDS_UNREADABLE",
+            Self::BackendContentSkipped => "WARNING_CODE_BACKEND_CONTENT_SKIPPED",
+            Self::BackendCountMismatch => "WARNING_CODE_BACKEND_COUNT_MISMATCH",
+            Self::ConsensusBackendFailed => "WARNING_CODE_CONSENSUS_BACKEND_FAILED",
+            Self::ConsensusPageCountDisagreement => "WARNING_CODE_CONSENSUS_PAGE_COUNT_DISAGREEMENT",
+            Self::ConsensusPageUndervoted => "WARNING_CODE_CONSENSUS_PAGE_UNDERVOTED",
+            Self::PageUnanswered => "WARNING_CODE_PAGE_UNANSWERED",
+            Self::PageOutputUnmapped => "WARNING_CODE_PAGE_OUTPUT_UNMAPPED",
+            Self::PageEmptyResponse => "WARNING_CODE_PAGE_EMPTY_RESPONSE",
+            Self::PagePassIncomplete => "WARNING_CODE_PAGE_PASS_INCOMPLETE",
+            Self::PagePreviewFailed => "WARNING_CODE_PAGE_PREVIEW_FAILED",
+            Self::PictureOcrAtPageResolution => "WARNING_CODE_PICTURE_OCR_AT_PAGE_RESOLUTION",
+            Self::EnrichmentCropMissing => "WARNING_CODE_ENRICHMENT_CROP_MISSING",
+            Self::PageRenderUnreadable => "WARNING_CODE_PAGE_RENDER_UNREADABLE",
+            Self::PageModelCallFailed => "WARNING_CODE_PAGE_MODEL_CALL_FAILED",
+            Self::TableStructureTruncated => "WARNING_CODE_TABLE_STRUCTURE_TRUNCATED",
+            Self::TableGridOmitted => "WARNING_CODE_TABLE_GRID_OMITTED",
+            Self::SheetCellsNotAdopted => "WARNING_CODE_SHEET_CELLS_NOT_ADOPTED",
+            Self::PayloadTruncated => "WARNING_CODE_PAYLOAD_TRUNCATED",
+            Self::PayloadNotDecoded => "WARNING_CODE_PAYLOAD_NOT_DECODED",
+            Self::PictureImagesSkipped => "WARNING_CODE_PICTURE_IMAGES_SKIPPED",
+            Self::EnrichmentNotApplied => "WARNING_CODE_ENRICHMENT_NOT_APPLIED",
+            Self::CollectorStreamIncomplete => "WARNING_CODE_COLLECTOR_STREAM_INCOMPLETE",
+            Self::ArchiveTruncated => "WARNING_CODE_ARCHIVE_TRUNCATED",
+            Self::CollectorCountMismatch => "WARNING_CODE_COLLECTOR_COUNT_MISMATCH",
+            Self::RepairEventSkipped => "WARNING_CODE_REPAIR_EVENT_SKIPPED",
+            Self::SourceConstructUnmapped => "WARNING_CODE_SOURCE_CONSTRUCT_UNMAPPED",
+            Self::SourceReferenceUnresolved => "WARNING_CODE_SOURCE_REFERENCE_UNRESOLVED",
+            Self::SourcePartIgnored => "WARNING_CODE_SOURCE_PART_IGNORED",
+            Self::SourceEncodingSubstitution => "WARNING_CODE_SOURCE_ENCODING_SUBSTITUTION",
+            Self::SourceTextRepaired => "WARNING_CODE_SOURCE_TEXT_REPAIRED",
+            Self::SourceMetadataUnreadable => "WARNING_CODE_SOURCE_METADATA_UNREADABLE",
+            Self::SourceStructureMalformed => "WARNING_CODE_SOURCE_STRUCTURE_MALFORMED",
+            Self::SourceContentTruncated => "WARNING_CODE_SOURCE_CONTENT_TRUNCATED",
+            Self::SourceInputIncomplete => "WARNING_CODE_SOURCE_INPUT_INCOMPLETE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WARNING_CODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "WARNING_CODE_COLLECTOR_FALLBACK" => Some(Self::CollectorFallback),
+            "WARNING_CODE_ROUTED_TO_CV" => Some(Self::RoutedToCv),
+            "WARNING_CODE_TEXT_LAYER_TAKEN_AS_IS" => Some(Self::TextLayerTakenAsIs),
+            "WARNING_CODE_OPTION_NOT_APPLICABLE" => Some(Self::OptionNotApplicable),
+            "WARNING_CODE_LAYOUT_PASS_DISABLED" => Some(Self::LayoutPassDisabled),
+            "WARNING_CODE_TABLE_STRUCTURE_PASS_DISABLED" => Some(Self::TableStructurePassDisabled),
+            "WARNING_CODE_FIGURE_CLASSIFICATION_PASS_DISABLED" => Some(Self::FigureClassificationPassDisabled),
+            "WARNING_CODE_FORM_FIELDS_UNSUPPORTED" => Some(Self::FormFieldsUnsupported),
+            "WARNING_CODE_FORM_FIELDS_UNREADABLE" => Some(Self::FormFieldsUnreadable),
+            "WARNING_CODE_BACKEND_CONTENT_SKIPPED" => Some(Self::BackendContentSkipped),
+            "WARNING_CODE_BACKEND_COUNT_MISMATCH" => Some(Self::BackendCountMismatch),
+            "WARNING_CODE_CONSENSUS_BACKEND_FAILED" => Some(Self::ConsensusBackendFailed),
+            "WARNING_CODE_CONSENSUS_PAGE_COUNT_DISAGREEMENT" => Some(Self::ConsensusPageCountDisagreement),
+            "WARNING_CODE_CONSENSUS_PAGE_UNDERVOTED" => Some(Self::ConsensusPageUndervoted),
+            "WARNING_CODE_PAGE_UNANSWERED" => Some(Self::PageUnanswered),
+            "WARNING_CODE_PAGE_OUTPUT_UNMAPPED" => Some(Self::PageOutputUnmapped),
+            "WARNING_CODE_PAGE_EMPTY_RESPONSE" => Some(Self::PageEmptyResponse),
+            "WARNING_CODE_PAGE_PASS_INCOMPLETE" => Some(Self::PagePassIncomplete),
+            "WARNING_CODE_PAGE_PREVIEW_FAILED" => Some(Self::PagePreviewFailed),
+            "WARNING_CODE_PICTURE_OCR_AT_PAGE_RESOLUTION" => Some(Self::PictureOcrAtPageResolution),
+            "WARNING_CODE_ENRICHMENT_CROP_MISSING" => Some(Self::EnrichmentCropMissing),
+            "WARNING_CODE_PAGE_RENDER_UNREADABLE" => Some(Self::PageRenderUnreadable),
+            "WARNING_CODE_PAGE_MODEL_CALL_FAILED" => Some(Self::PageModelCallFailed),
+            "WARNING_CODE_TABLE_STRUCTURE_TRUNCATED" => Some(Self::TableStructureTruncated),
+            "WARNING_CODE_TABLE_GRID_OMITTED" => Some(Self::TableGridOmitted),
+            "WARNING_CODE_SHEET_CELLS_NOT_ADOPTED" => Some(Self::SheetCellsNotAdopted),
+            "WARNING_CODE_PAYLOAD_TRUNCATED" => Some(Self::PayloadTruncated),
+            "WARNING_CODE_PAYLOAD_NOT_DECODED" => Some(Self::PayloadNotDecoded),
+            "WARNING_CODE_PICTURE_IMAGES_SKIPPED" => Some(Self::PictureImagesSkipped),
+            "WARNING_CODE_ENRICHMENT_NOT_APPLIED" => Some(Self::EnrichmentNotApplied),
+            "WARNING_CODE_COLLECTOR_STREAM_INCOMPLETE" => Some(Self::CollectorStreamIncomplete),
+            "WARNING_CODE_ARCHIVE_TRUNCATED" => Some(Self::ArchiveTruncated),
+            "WARNING_CODE_COLLECTOR_COUNT_MISMATCH" => Some(Self::CollectorCountMismatch),
+            "WARNING_CODE_REPAIR_EVENT_SKIPPED" => Some(Self::RepairEventSkipped),
+            "WARNING_CODE_SOURCE_CONSTRUCT_UNMAPPED" => Some(Self::SourceConstructUnmapped),
+            "WARNING_CODE_SOURCE_REFERENCE_UNRESOLVED" => Some(Self::SourceReferenceUnresolved),
+            "WARNING_CODE_SOURCE_PART_IGNORED" => Some(Self::SourcePartIgnored),
+            "WARNING_CODE_SOURCE_ENCODING_SUBSTITUTION" => Some(Self::SourceEncodingSubstitution),
+            "WARNING_CODE_SOURCE_TEXT_REPAIRED" => Some(Self::SourceTextRepaired),
+            "WARNING_CODE_SOURCE_METADATA_UNREADABLE" => Some(Self::SourceMetadataUnreadable),
+            "WARNING_CODE_SOURCE_STRUCTURE_MALFORMED" => Some(Self::SourceStructureMalformed),
+            "WARNING_CODE_SOURCE_CONTENT_TRUNCATED" => Some(Self::SourceContentTruncated),
+            "WARNING_CODE_SOURCE_INPUT_INCOMPLETE" => Some(Self::SourceInputIncomplete),
+            _ => None,
+        }
+    }
 }
 /// ContentLayer defines the semantic layer where content appears in the document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -2802,7 +3561,7 @@ pub enum DocItemLabel {
     FieldValue = 28,
     FieldHint = 29,
     Marker = 30,
-    /// The three below have no upstream name. Producers put them on the item
+    /// The ones below have no upstream name. Producers put them on the item
     /// type a consumer that does not know them still reads sensibly, and the
     /// canonical renderer writes the nearest upstream label.
     /// A stamp or seal impression; carried on a PictureItem, rendered as
@@ -2814,6 +3573,8 @@ pub enum DocItemLabel {
     /// An algorithm or pseudocode listing; carried on a CodeItem (or a
     /// TextItem), rendered as "code".
     Algorithm = 33,
+    /// A block quotation; carried on a TextItem, rendered as "text".
+    Quote = 34,
 }
 impl DocItemLabel {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2856,6 +3617,7 @@ impl DocItemLabel {
             Self::Seal => "DOC_ITEM_LABEL_SEAL",
             Self::Aside => "DOC_ITEM_LABEL_ASIDE",
             Self::Algorithm => "DOC_ITEM_LABEL_ALGORITHM",
+            Self::Quote => "DOC_ITEM_LABEL_QUOTE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2895,6 +3657,7 @@ impl DocItemLabel {
             "DOC_ITEM_LABEL_SEAL" => Some(Self::Seal),
             "DOC_ITEM_LABEL_ASIDE" => Some(Self::Aside),
             "DOC_ITEM_LABEL_ALGORITHM" => Some(Self::Algorithm),
+            "DOC_ITEM_LABEL_QUOTE" => Some(Self::Quote),
             _ => None,
         }
     }
@@ -3969,6 +4732,37 @@ impl HumanLanguageLabel {
         }
     }
 }
+/// TableKind tells a table the collector built from the source's data from
+/// one the source itself lays out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TableKind {
+    /// A table as the source lays it out.
+    Unspecified = 0,
+    /// One row per XBRL fact, built by the collector from the facts of an
+    /// XBRL instance.
+    XbrlFacts = 1,
+}
+impl TableKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TABLE_KIND_UNSPECIFIED",
+            Self::XbrlFacts => "TABLE_KIND_XBRL_FACTS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TABLE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "TABLE_KIND_XBRL_FACTS" => Some(Self::XbrlFacts),
+            _ => None,
+        }
+    }
+}
 /// GraphCellLabel defines the role of a cell in a key-value graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -4082,6 +4876,36 @@ impl ReferenceKind {
             "REFERENCE_KIND_FIGURE" => Some(Self::Figure),
             "REFERENCE_KIND_TABLE" => Some(Self::Table),
             "REFERENCE_KIND_EQUATION" => Some(Self::Equation),
+            _ => None,
+        }
+    }
+}
+/// FrontMatterFormat is the syntax a front matter block was written in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FrontMatterFormat {
+    Unspecified = 0,
+    Yaml = 1,
+    Toml = 2,
+}
+impl FrontMatterFormat {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FRONT_MATTER_FORMAT_UNSPECIFIED",
+            Self::Yaml => "FRONT_MATTER_FORMAT_YAML",
+            Self::Toml => "FRONT_MATTER_FORMAT_TOML",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FRONT_MATTER_FORMAT_UNSPECIFIED" => Some(Self::Unspecified),
+            "FRONT_MATTER_FORMAT_YAML" => Some(Self::Yaml),
+            "FRONT_MATTER_FORMAT_TOML" => Some(Self::Toml),
             _ => None,
         }
     }
@@ -4298,6 +5122,42 @@ impl Trapped {
             "TRAPPED_TRUE" => Some(Self::True),
             "TRAPPED_FALSE" => Some(Self::False),
             "TRAPPED_UNKNOWN" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+/// RecordLayoutSource names the form a fixed-record layout was supplied in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RecordLayoutSource {
+    Unspecified = 0,
+    /// A COBOL copybook.
+    Copybook = 1,
+    /// The collector's own typed layout message.
+    Layout = 2,
+    /// A layout written as a Docling JSON document.
+    DoclingJson = 3,
+}
+impl RecordLayoutSource {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "RECORD_LAYOUT_SOURCE_UNSPECIFIED",
+            Self::Copybook => "RECORD_LAYOUT_SOURCE_COPYBOOK",
+            Self::Layout => "RECORD_LAYOUT_SOURCE_LAYOUT",
+            Self::DoclingJson => "RECORD_LAYOUT_SOURCE_DOCLING_JSON",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "RECORD_LAYOUT_SOURCE_UNSPECIFIED" => Some(Self::Unspecified),
+            "RECORD_LAYOUT_SOURCE_COPYBOOK" => Some(Self::Copybook),
+            "RECORD_LAYOUT_SOURCE_LAYOUT" => Some(Self::Layout),
+            "RECORD_LAYOUT_SOURCE_DOCLING_JSON" => Some(Self::DoclingJson),
             _ => None,
         }
     }
